@@ -1,13 +1,16 @@
 import { t, withLanguage, resolveLanguage, command, helpLines, skillLabel, planLabel, priceLabel as formatPrice } from './i18n.js';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
-import { Client, catalogNames, isSkillName, isVersion } from './client.js';
+import { Client, catalogNames, findSkill, isSkillName, isVersion } from './client.js';
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies } from './skills.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory } from './skills.js';
+import { targetRoot } from './hosts.js';
+import { prepare, replaceAll } from './install.js';
 
 // 14 个命令全部在参数解析层合法；help/version/list/login/logout/status/publish 之外的执行逻辑随后续任务落地。
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
@@ -160,6 +163,59 @@ async function list(ctx) {
   return 0;
 }
 
+// 安装到单一目标（任务 6 子集）：免费版下载校验 → 事务替换。多宿主自动发现与链接共享属任务 7。
+async function install(ctx) {
+  const name = ctx.options.skill;
+  const { product, paid } = findSkill(ctx.catalog, name);
+  // 付费前置拦截（设计「分期计划」：一期付费=引导非购买）：不进 402/checkout 流程，exit 3 附商品页。
+  if (paid) {
+    const url = ctx.client.subscriptionUrl(name, product);
+    throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
+  }
+  // --to 单值：多目标（重复 --to）与自动发现留给任务 7，这里明确拒绝而不静默忽略。
+  if (ctx.options.to.length > 1) throw new CliError(t('wrongArgument'), 2, 'usage');
+  if (!ctx.options.to.length) {
+    const next = command('install', name, '--to', 'zcode');
+    throw new CliError(t('missingTarget', { next }), 2, 'missing_target',
+      { recommended_path: targetRoot('zcode'), recommended_command: next, next_command: next });
+  }
+  const root = targetRoot(ctx.options.to[0]);
+  const target = path.join(root, name);
+  const auto = !ctx.options.yes && !ctx.interactive;
+  if (!await ctx.confirm(t('confirmInstall', { name: skillLabel(name) }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
+    ctx.output.write({ cancelled: true }, [t('installCanceled')]);
+    return 0;
+  }
+  // 暂存前的第一重开发目录保护：跳过并解释，不动内容、不发起下载。
+  if (await isDevelopmentDirectory(target)) {
+    ctx.output.write({ installations: [], removed: [], skipped: [{ name, path: target, reason: 'development_directory' }], warnings: [] },
+      [t('developmentProtected', { path: target })]);
+    return 0;
+  }
+  const current = await inspectSkill(target, ctx.names);
+  const versions = await ctx.client.versions(ctx.catalog);
+  const release = versions[name];
+  const item = await prepare(ctx.client, name, release, ctx.token, paid, product, ctx.signal);
+  let warnings;
+  try {
+    warnings = await replaceAll([{ name, path: target, source: item.source,
+      previousName: current?.name === name ? name : null, previousVersion: current?.version || null }],
+      { signal: ctx.signal, names: ctx.names });
+  } finally {
+    await item.cleanup().catch(() => {});
+  }
+  // 复扫目标根：报告配对冲突等需要全目录视角的警告。
+  const installed = await scan(ctx.names, [root]);
+  warnings.push(...await conflicts(installed, ctx.catalog));
+  const installation = { name, path: target, previous: current?.name === name ? current.version || null : null, version: release.latest };
+  ctx.output.write({ installations: [installation], removed: [], skipped: [], warnings, ...(auto ? { auto_confirmed: true } : {}) },
+    [installation.previous && installation.previous !== installation.version
+      ? t('updated', { name: skillLabel(name), previous: installation.previous, version: installation.version, path: target })
+      : t('installed', { name: skillLabel(name), version: installation.version, path: target }),
+      ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
+  return 0;
+}
+
 // runtime 用于测试时注入时钟和终端交互；可执行入口不传测试选项。
 export const run = (argv, runtime = {}) => withLanguage(resolveLanguage(argv), () => runCommand(argv, runtime));
 
@@ -194,11 +250,12 @@ async function runCommand(argv, runtime) {
       confirm: runtime.confirm || confirm, ask: runtime.ask || ask };
     if (options.command === 'logout') return await logout(ctx);
     if (options.command === 'login') return await login(ctx, options.token);
-    if (options.command === 'status' || options.command === 'list') {
+    if (options.command === 'status' || options.command === 'list' || options.command === 'install') {
       // catalog 拉取一次并缓存进 ctx；status 扫描与 install/update 等后续命令复用。
       ctx.catalog = await ctx.client.catalog();
       ctx.names = catalogNames(ctx.catalog);
       if (options.command === 'status') return await status(ctx);
+      if (options.command === 'install') return await install(ctx);
       return await list(ctx);
     }
     if (options.command === 'publish') {

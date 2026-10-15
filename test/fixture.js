@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, copyFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { validateArchive } from '../src/archive.js';
+import { packSkill } from '../src/publish.js';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -64,6 +65,29 @@ const compareVersions = (a, b) => {
   return 0;
 };
 
+// 默认免费发布物（任务 6 前置，任务 2 审查登记）：给试点免费 skill 各备一个 0.1.0 的
+// tar.gz + sha256，versions 据此下发 download_url/sha256（免费版摘要必填）。
+// 与 state.published 分开存放，不影响 publish 幂等/409 语义；进程级缓存避免每个 fixture 重复打包。
+let seedCache = null;
+async function defaultReleases() {
+  if (seedCache) return seedCache;
+  seedCache = new Map();
+  const scratch = await mkdtemp(path.join(tmpdir(), 'hy-seed-'));
+  try {
+    for (const product of CATALOG) {
+      const name = product.free?.skill;
+      if (!name) continue;
+      const source = await writeSkill(scratch, name, '0.1.0');
+      const packed = await packSkill(source, name, '0.1.0', {});
+      try { seedCache.set(`${name}:0.1.0`, { body: await readFile(packed.archive), sha256: packed.sha256, size: packed.size, notes: '', published_at: '2026-10-15T08:00:00Z' }); }
+      finally { await packed.cleanup(); }
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+  return seedCache;
+}
+
 // 假商店：绑定 127.0.0.1 随机端口，提供 catalog/versions/publish/releases 与 device/token/me/logout/approve 端点（契约见设计「接口设计」）；
 // 请求全部记入 state.requests，目录与设备流数据可直接改写用于错误注入。
 export async function fixture(t) {
@@ -88,7 +112,10 @@ export async function fixture(t) {
     deviceCode: null, userCode: null, logoutFailure: false, revoked: new Set(), grants: new Map(),
     // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
     // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
-    publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false };
+    publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
+    // 下载端（任务 6）：releases 为免费默认发布物；badChecksum 让 versions 下发错误摘要、
+    // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载。
+    releases: await defaultReleases(), badChecksum: false, corruptBody: false, releaseDelay: 0 };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -134,7 +161,11 @@ export async function fixture(t) {
         const skills = {};
         for (const product of state.catalog) for (const type of ['free', 'paid']) {
           const name = typeof product[type] === 'string' ? product[type] : product[type]?.skill;
-          if (name) skills[name] = { latest: state.badVersions ? 'oops' : state.latest, published_at: '2026-10-15T08:00:00Z', history };
+          if (!name) continue;
+          // 免费默认发布物：latest 对上种子版本时下发 download_url + sha256（设计「数据模型」：免费版摘要必填）。
+          const seed = state.releases.get(`${name}:${state.latest}`);
+          skills[name] = { latest: state.badVersions ? 'oops' : state.latest, published_at: '2026-10-15T08:00:00Z', history,
+            ...(seed ? { download_url: `${base}/releases/${name}-${state.latest}.tar.gz`, sha256: state.badChecksum ? '0'.repeat(64) : seed.sha256 } : {}) };
         }
         // 已发布版本合并进版本表：latest 按语义版本提升、history 追加（供 --repo 对账与任务 6/7 安装闭环消费）。
         for (const [key, entry] of state.published) {
@@ -144,10 +175,12 @@ export async function fixture(t) {
           const merged = [...current.history.filter((item) => item.version !== version),
             { version, published_at: entry.published_at, notes: entry.notes || (english ? `${version}: Published with hy CLI.` : `${version}：经 hy CLI 发布。`) }]
             .sort((a, b) => -compareVersions(a.version, b.version));
-          // latest 仍是目录默认版本（发布的版本更低）时没有对应发布物，摘要字段省略。
+          // latest 仍是目录默认版本（发布的版本更低）时回退到种子发布物；两者都没有才省略摘要。
           const top = state.published.get(`${name}:${latest}`);
+          const seed = state.releases.get(`${name}:${latest}`);
+          const checksum = top ? top.sha256 : seed ? (state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
           skills[name] = { latest, published_at: entry.published_at, history: merged,
-            download_url: `${base}/releases/${name}-${latest}.tar.gz`, ...(top ? { sha256: top.sha256 } : {}) };
+            download_url: `${base}/releases/${name}-${latest}.tar.gz`, ...(checksum ? { sha256: checksum } : {}) };
         }
         return json(res, 200, { skills });
       }
@@ -183,15 +216,40 @@ export async function fixture(t) {
         state.published.set(`${name}:${version}`, { body: raw, sha256, size: raw.length, notes: decodeURIComponent(req.headers['x-notes'] || ''), published_at: new Date().toISOString() });
         return json(res, 200, { skill: name, version, sha256, size: raw.length, url: `${base}/releases/${name}-${version}.tar.gz` });
       }
+      if (req.method === 'GET' && url.pathname.startsWith('/api/store/download/')) {
+        // 下载端（契约：免费 302→公开附件不带令牌；付费 200 + X-Content-SHA256 + X-Skill-Version 走订阅鉴权）。
+        // 一期客户端对付费前置拦截不会走到这里，端点先备齐供任务 7/二期。
+        const name = decodeURIComponent(url.pathname.slice('/api/store/download/'.length));
+        const version = url.searchParams.get('version');
+        const product = state.catalog.find((p) => [p.free?.skill, p.paid?.skill].includes(name));
+        const entry = state.releases.get(`${name}:${version}`) || state.published.get(`${name}:${version}`);
+        if (!product || !entry || url.searchParams.get('format') !== 'tar.gz') return error(res, 404, 'not_found', '没有该版本。');
+        if (product.paid?.skill === name) {
+          if (!authenticate()) return;
+          if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
+          res.writeHead(200, { 'Content-Type': 'application/gzip', 'X-Content-SHA256': entry.sha256, 'X-Skill-Version': version });
+          return res.end(entry.body);
+        }
+        res.writeHead(302, { Location: `${base}/releases/${name}-${version}.tar.gz` });
+        return res.end();
+      }
       if (req.method === 'GET' && url.pathname.startsWith('/releases/')) {
         const match = url.pathname.match(/^\/releases\/(.+)-(\d+\.\d+\.\d+)\.tar\.gz$/);
         const name = match?.[1];
-        const entry = match ? state.published.get(`${name}:${match[2]}`) : null;
+        const entry = match ? state.releases.get(`${name}:${match[2]}`) || state.published.get(`${name}:${match[2]}`) : null;
         if (!entry) return error(res, 404, 'not_found', '没有该版本。');
         // 付费 skill 的发布物走订阅鉴权（与下载端语义一致，任务 6/7 铺垫）；免费与未入目录的保持公开。
         if (state.catalog.some((product) => product.paid?.skill === name)) {
           if (!authenticate()) return;
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
+        }
+        if (state.releaseDelay) await new Promise((resolve) => setTimeout(resolve, state.releaseDelay));
+        if (state.corruptBody) {
+          // 截断正文后断开：Content-Length 与实际字节不符，客户端读到不完整流（download 失败）。
+          // 等半截数据真正写进 socket 再 destroy，保证响应头先于连接重置到达客户端。
+          res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Length': String(entry.body.length) });
+          res.write(entry.body.subarray(0, Math.max(1, Math.floor(entry.body.length / 2))), () => res.destroy());
+          return;
         }
         res.writeHead(200, { 'Content-Type': 'application/gzip' });
         return res.end(entry.body);

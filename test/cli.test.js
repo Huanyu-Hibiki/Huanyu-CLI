@@ -10,7 +10,7 @@ const BIN = fileURLToPath(new URL('../bin/hy.js', import.meta.url));
 const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 const { version: VERSION } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
-// 任务 4 起 publish 已实现；仍待实现的命令保持 not_implemented。
+// 任务 4 起 publish、任务 6 起 install 已实现；仍待实现的命令保持 not_implemented。
 const PENDING = ['update', 'manage', 'product', 'unpublish', 'audit'];
 
 // 语言相关环境固定为确定值（默认中文）；extraEnv 在其后展开以便覆盖测试环境变量通道。
@@ -213,7 +213,8 @@ test('未实现命令执行时退出码 2，error 为 not_implemented 并使用�
     assert.match(data(result).message, /尚未实现/, name);
     assert.ok(data(result).message.includes(name), name);
   }
-  for (const args of [['install', 'demo-skill'], ['subscribe', 'demo-skill', '--plan', 'lifetime']]) {
+  // install（任务 6 起）会先拉 catalog，本测试不带假商店服务器，不能再当 not_implemented 样本。
+  for (const args of [['subscribe', 'demo-skill', '--plan', 'lifetime']]) {
     const result = await run([...args, '--json']);
     assert.equal(result.code, 2, args.join(' '));
     assert.equal(data(result).error, 'not_implemented', args.join(' '));

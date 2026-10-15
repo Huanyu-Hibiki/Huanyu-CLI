@@ -323,13 +323,30 @@ test('免费摘要 fail-closed：versions 缺 sha256 → missing_checksum，目�
   assert.equal(await exists(path.join(f.home, '.zcode')), null);
 });
 
+// 下载临时目录残留断言：系统 tmpdir 被并行测试文件的 CLI 子进程共享（它们同时在创建/清理
+// hy-download-*，前后快照相等会竞态误报）。把 os.tmpdir 指到本测试私有目录，断言才是确定性的。
+const withPrivateTmp = async (fn) => {
+  const scratch = await mkdtemp(path.join(tmpdir(), 'hy-unit-'));
+  const names = ['TMPDIR', 'TEMP', 'TMP'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) process.env[name] = scratch;
+  try { return await fn(); } finally {
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+    await rm(scratch, { recursive: true, force: true });
+  }
+};
+
 test('下载字节上限（与发布侧 100MB 对称）：超限即中止报 too_large，临时目录照常清理', async (t) => {
   const f = await fixture(t);
   await withClient(f, async (client) => {
     const release = await releaseOf(f);
-    const before = await downloadLeftovers();
-    await assert.rejects(prepare(client, 'ppt-design', release, null, false, null, undefined, { sizeLimitBytes: 16 }), { error: 'too_large' });
-    assert.deepEqual(await downloadLeftovers(), before);
+    await withPrivateTmp(async () => {
+      await assert.rejects(prepare(client, 'ppt-design', release, null, false, null, undefined, { sizeLimitBytes: 16 }), { error: 'too_large' });
+      assert.deepEqual(await downloadLeftovers(), []);
+    });
   });
 });
 
@@ -337,10 +354,11 @@ test('解压失败注入缝：runner 抛错 → extract 失败且目标不可达
   const f = await fixture(t);
   await withClient(f, async (client) => {
     const release = await releaseOf(f);
-    const before = await downloadLeftovers();
-    await assert.rejects(prepare(client, 'ppt-design', release, null, false, null, undefined,
-      { runner: async () => { throw new Error('tar boom'); } }), { error: 'extract' });
-    assert.deepEqual(await downloadLeftovers(), before);
+    await withPrivateTmp(async () => {
+      await assert.rejects(prepare(client, 'ppt-design', release, null, false, null, undefined,
+        { runner: async () => { throw new Error('tar boom'); } }), { error: 'extract' });
+      assert.deepEqual(await downloadLeftovers(), []);
+    });
   });
 });
 

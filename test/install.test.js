@@ -4,7 +4,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { fixture, writeSkill } from './fixture.js';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
 import { prepare, replaceAll } from '../src/install.js';
 import { Client } from '../src/client.js';
 import { targetRoot } from '../src/hosts.js';
@@ -16,7 +16,7 @@ const data = (result) => {
   return JSON.parse(result.stdout);
 };
 const exists = async (file) => { try { return await lstat(file); } catch { return null; } };
-const stageLeftovers = async (root) => (await readdir(root, { recursive: false })).filter((name) => name.startsWith('.hy-stage-'));
+const stageLeftovers = async (root) => (await readdir(root, { recursive: false }).catch((error) => error.code === 'ENOENT' ? [] : (() => { throw error; })())).filter((name) => name.startsWith('.hy-stage-'));
 // prepare 的单元注入位（sizeLimitBytes/runner）：测试进程直连假商店，HY_API 临时指向 fixture。
 const withClient = async (f, fn) => {
   const previous = process.env.HY_API;
@@ -147,16 +147,20 @@ test('corruptBody：下载正文截断 → download 失败，目标不可达', a
   assert.equal(await exists(path.join(f.home, '.zcode')), null);
 });
 
-test('目标是开发目录（含 .git）→ developmentProtected 跳过，不覆盖不下载', async (t) => {
+test('目标是开发目录（含 .git）→ 跳过并解释，不覆盖不下载', async (t) => {
   const f = await fixture(t);
   const root = path.join(f.home, '.zcode', 'skills');
   const target = await writeSkill(root, 'ppt-design', '0.0.1');
   await mkdir(path.join(target, '.git'));
-  const result = await f.run(['install', 'ppt-design', '--to', 'zcode']);
+  const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(result.code, 0, result.stdout + result.stderr);
-  assert.match(result.stdout, /开发目录，跳过：/);
+  const value = data(result);
+  assert.deepEqual(value.installations, []);
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: target, reason: 'development_directory' }]);
   assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /0\.0\.1/);
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '开发目录跳过时不应发起下载');
+  const human = await f.run(['install', 'ppt-design', '--to', 'zcode']);
+  assert.match(human.stdout, /ppt-design：开发目录，跳过（/);
 });
 
 test('下载期间目标变成开发目录 → rename 前双重保护拦截并回滚，原目录保留', async (t) => {
@@ -302,20 +306,26 @@ test('幂等：同版本安装两次 → 第二次成功且结果一致', async 
   assert.deepEqual(await stageLeftovers(path.dirname(target)), []);
 });
 
-test('重复 --to 属任务 7 的多目标语义：一期按用法错误拒绝，不静默忽略', async (t) => {
+test('--to 多值（重复值去重）：第一个目标放实体，其余链接', async (t) => {
   const f = await fixture(t);
-  const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--to', 'claude', '--json']);
-  assert.equal(result.code, 2);
-  assert.equal(data(result).error, 'usage');
-  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '不应发起下载');
+  const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--to', 'claude', '--to', 'zcode', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  const value = data(result);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: primary, previous: null, version: '0.1.0' }]);
+  assert.deepEqual(value.links, [{ name: 'ppt-design', path: path.join(f.home, '.claude', 'skills', 'ppt-design'), target: primary, existing: false, replaced_copy: false }]);
+  assert.equal(await readDirectoryLink(path.join(f.home, '.claude', 'skills', 'ppt-design')), primary);
 });
 
-test('交互模式拒绝确认 → installCanceled，退出码 0 且未动目标', async (t) => {
+test('交互模式先列出目标再确认；拒绝确认 → installCanceled，退出码 0 且未动目标', async (t) => {
   const f = await fixture(t);
+  await mkdir(path.join(f.home, '.zcode'), { recursive: true });
   const root = path.join(f.home, '.zcode', 'skills');
   const result = await f.run(['install', 'ppt-design', '--to', 'zcode'], {}, { interactive: true, answers: [false] });
   assert.equal(result.code, 0, result.stdout + result.stderr);
-  assert.equal(result.stdout, '已取消安装。\n');
+  assert.ok(result.stdout.endsWith('已取消安装。\n'), result.stdout);
+  assert.match(result.stdout, /安装位置：/);
+  assert.ok(result.stdout.includes(root));
   assert.equal(await exists(root), null);
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
 });
@@ -328,4 +338,217 @@ test('--to 显式路径（非宿主 id）：装到自定义目录', async (t) =>
   const target = path.join(custom, 'oracle-bone');
   assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /version: "0\.1\.0"/);
   assert.deepEqual(data(result).installations, [{ name: 'oracle-bone', path: target, previous: null, version: '0.1.0' }]);
+});
+
+// 任务 7：多宿主链接共享安装。
+
+// 三个宿主（zcode 最先），无 --to 自动发现。
+const threeHosts = async (f) => {
+  for (const host of ['.zcode', '.claude', '.trae']) await mkdir(path.join(f.home, host), { recursive: true });
+};
+
+test('多宿主自动发现：无 --to → 第一个宿主（zcode 优先）放实体，其余 junction/symlink 链接共享', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: primary, previous: null, version: '0.1.0' }]);
+  assert.deepEqual(value.links.map((item) => ({ path: item.path, target: item.target, existing: item.existing, replaced_copy: item.replaced_copy })),
+    ['.claude', '.trae'].map((host) => ({ path: path.join(f.home, host, 'skills', 'ppt-design'), target: primary, existing: false, replaced_copy: false })));
+  // 链接真实指向实体目录：win32 是 junction、POSIX 是目录 symlink，lstat/readlink 均可验。
+  assert.match(await readFile(path.join(primary, 'SKILL.md'), 'utf8'), /version: "0\.1\.0"/);
+  for (const host of ['.claude', '.trae']) {
+    const link = path.join(f.home, host, 'skills', 'ppt-design');
+    assert.ok((await lstat(link)).isSymbolicLink(), `${link} 应为目录链接`);
+    assert.equal(await readDirectoryLink(link), primary);
+    // 链接内容随实体：读到的就是实体里的新版本。
+    assert.match(await readFile(path.join(link, 'SKILL.md'), 'utf8'), /0\.1\.0/);
+  }
+  // status 复核链接关系：多宿主折叠为一份实体，无多副本警告。
+  const status = data(await f.run(['status', '--json']));
+  assert.equal(status.installations.length, 1);
+  assert.equal(status.installations[0].path, primary);
+  assert.equal(status.installations[0].current, '0.1.0');
+  assert.deepEqual(status.warnings, []);
+});
+
+test('其他宿主里的独立旧副本自动换成链接（replaced_copy），status 多副本警告消失', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const old = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
+  const renamed = await writeSkill(path.join(f.home, '.trae', 'skills'), 'ppt-design', '0.0.8', 'my-ppt');
+  let status = data(await f.run(['status', '--json']));
+  assert.equal(status.warnings.length, 1);
+  assert.match(status.warnings[0], /2 份独立副本/);
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  const value = data(result);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: primary, previous: null, version: '0.1.0' }]);
+  // 同名旧副本与改名副本都换成链接；旧副本位置标记 replaced_copy。
+  assert.deepEqual(value.links.map((item) => [item.path, item.existing, item.replaced_copy]).sort(),
+    [[old, false, true], [renamed, false, true], [path.join(f.home, '.trae', 'skills', 'ppt-design'), false, false]].sort());
+  for (const directory of [old, renamed]) assert.equal(await readDirectoryLink(directory), primary);
+  status = data(await f.run(['status', '--json']));
+  assert.deepEqual(status.warnings, []);
+  assert.equal(status.installations.length, 1);
+  assert.equal(status.installations[0].path, primary);
+});
+
+test('幂等：多宿主第二次安装 → 实体替换为同版本、已有链接 existing 保持、无错误', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  assert.equal((await f.run(['install', 'ppt-design', '--json'])).code, 0);
+  const second = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(second.code, 0, second.stdout + second.stderr);
+  const value = data(second);
+  assert.equal(value.auto_confirmed, true);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: primary, previous: '0.1.0', version: '0.1.0' }]);
+  assert.deepEqual(value.links, ['.claude', '.trae'].map((host) => ({ name: 'ppt-design', path: path.join(f.home, host, 'skills', 'ppt-design'), target: primary, existing: true })));
+  assert.deepEqual(value.warnings, []);
+  assert.match(await readFile(path.join(primary, 'SKILL.md'), 'utf8'), /0\.1\.0/);
+  assert.deepEqual(await stageLeftovers(path.dirname(primary)), []);
+  assert.deepEqual(await stageLeftovers(path.join(f.home, '.claude', 'skills')), []);
+});
+
+test('保护与解释：用户自建链接指向别处（开发目录）→ 实体顺延到下一宿主，被保护位置跳过并说明', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const elsewhere = path.join(f.temporary, 'elsewhere');
+  await mkdir(path.join(elsewhere, '.git'), { recursive: true });
+  const protectedLink = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(protectedLink), { recursive: true });
+  await linkDirectory(elsewhere, protectedLink);
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  const primary = path.join(f.home, '.claude', 'skills', 'ppt-design');
+  assert.deepEqual(value.installations.map((item) => item.path), [primary]);
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: protectedLink, reason: 'development_directory' }]);
+  // 被保护的自建链接原样保留，指向不变；只有最后一个宿主得到新链接。
+  assert.equal(await readDirectoryLink(protectedLink), elsewhere);
+  assert.deepEqual(value.links.map((item) => item.path), [path.join(f.home, '.trae', 'skills', 'ppt-design')]);
+  const human = await f.run(['install', 'ppt-design']);
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.match(human.stdout, /ppt-design：开发目录，跳过（/);
+});
+
+test('开发目录作为主安装 → 跳过并解释，其他宿主直接链到开发目录，不下载也不改动', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const repository = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.1');
+  await mkdir(path.join(repository, '.git'));
+  const before = await readFile(path.join(repository, 'SKILL.md'), 'utf8');
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.installations, []);
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: repository, reason: 'development_directory' }]);
+  for (const host of ['.claude', '.trae']) assert.equal(await readDirectoryLink(path.join(f.home, host, 'skills', 'ppt-design')), repository);
+  assert.equal(await readFile(path.join(repository, 'SKILL.md'), 'utf8'), before);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '开发目录跳过时不应发起下载');
+});
+
+test('未知占用目录（链接宿主里无关内容占着同名位置）→ occupied 拒绝替换，已完成目标一并回滚', async (t) => {
+  const f = await fixture(t);
+  for (const host of ['.zcode', '.claude']) await mkdir(path.join(f.home, host), { recursive: true });
+  const unknown = path.join(f.home, '.claude', 'skills', 'ppt-design');
+  await mkdir(unknown, { recursive: true });
+  await writeFile(path.join(unknown, 'unrelated.txt'), 'keep me');
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'occupied');
+  assert.equal(await readFile(path.join(unknown, 'unrelated.txt'), 'utf8'), 'keep me');
+  // 整批回滚：实体目标不留安装，无暂存残留。
+  assert.equal(await exists(path.join(f.home, '.zcode', 'skills', 'ppt-design')), null);
+  assert.deepEqual(await stageLeftovers(path.join(f.home, '.zcode', 'skills')), []);
+  // 占用预检在下载之前（任务 6 审查语义在多目标下延续）。
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '占用预检应在下载之前');
+});
+
+test('检测不到宿主：非交互 exit 2；交互输入路径后装到该处，空回答 noTarget', async (t) => {
+  const f = await fixture(t);
+  const nonInteractive = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(nonInteractive.code, 2);
+  assert.equal(data(nonInteractive).error, 'missing_target');
+  assert.equal(nonInteractive.trace.questions.length, 0);
+  const custom = path.join(f.cwd, 'custom-skills');
+  const prompted = await f.run(['install', 'ppt-design'], {}, { interactive: true, answers: [custom, ''] });
+  assert.equal(prompted.code, 0, prompted.stdout + prompted.stderr);
+  assert.match(await readFile(path.join(custom, 'ppt-design', 'SKILL.md'), 'utf8'), /version: "0\.1\.0"/);
+  assert.equal(prompted.trace.questions.length, 2);
+  const empty = await f.run(['install', 'oracle-bone'], {}, { interactive: true, answers: [''] });
+  assert.equal(empty.code, 2);
+  assert.match(empty.stderr, /未选择安装位置/);
+  assert.equal((await exists(path.join(f.cwd, 'custom-skills', 'oracle-bone'))), null);
+});
+
+test('交互模式列出自动发现的目标（实体 + 链接行）后回车确认安装', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const result = await f.run(['install', 'ppt-design'], {}, { interactive: true, answers: [''] });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /安装位置：/);
+  assert.ok(result.stdout.includes(path.join(f.home, '.zcode', 'skills')));
+  assert.ok(result.stdout.includes(`${path.join(f.home, '.claude', 'skills')}（链接到上面这份）`));
+  assert.equal(result.trace.questions.length, 1);
+  assert.match(result.trace.questions[0], /\[Y\/n\]/);
+  assert.ok((await lstat(path.join(f.home, '.claude', 'skills', 'ppt-design'))).isSymbolicLink());
+  assert.ok((await lstat(path.join(f.home, '.trae', 'skills', 'ppt-design'))).isSymbolicLink());
+});
+
+test('多目标事务（renameFile 注入第 2 动作失败）：实体与已换链接的旧副本全部还原', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-multi-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const rootA = path.join(base, 'a'), rootB = path.join(base, 'b');
+  await mkdir(rootA); await mkdir(rootB);
+  const primary = await writeSkill(rootA, 'ppt-skill', '0.0.1');
+  const copy = await writeSkill(rootB, 'ppt-skill', '0.0.2');
+  const incoming = await mkdtemp(path.join(tmpdir(), 'hy-incoming-'));
+  t.after(() => rm(incoming, { recursive: true, force: true }));
+  const source = await writeSkill(incoming, 'ppt-skill', '0.1.0');
+  const actions = [
+    { name: 'ppt-skill', path: primary, source, previousName: 'ppt-skill', previousVersion: '0.0.1' },
+    { name: 'ppt-skill', path: copy, link: primary, previousName: 'ppt-skill', previousVersion: '0.0.2' },
+  ];
+  let calls = 0;
+  const renameFile = async (from, to) => { if (++calls === 3) throw new Error('injected'); return (await import('node:fs/promises')).rename(from, to); };
+  const error = await replaceAll(actions, { renameFile, names: ['ppt-skill'] }).catch((error) => error);
+  assert.equal(error.error, 'replace');
+  assert.match(await readFile(path.join(primary, 'SKILL.md'), 'utf8'), /0\.0\.1/);
+  assert.match(await readFile(path.join(copy, 'SKILL.md'), 'utf8'), /0\.0\.2/);
+  assert.ok(!(await lstat(copy)).isSymbolicLink(), '旧副本不应残留半成品链接');
+  assert.deepEqual(await stageLeftovers(rootA), []);
+  assert.deepEqual(await stageLeftovers(rootB), []);
+});
+
+test('多目标事务（链接已创建后后续动作失败）：已创建链接被清理，实体与两个旧副本全部还原', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-multi-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const rootA = path.join(base, 'a'), rootB = path.join(base, 'b'), rootC = path.join(base, 'c');
+  for (const root of [rootA, rootB, rootC]) await mkdir(root);
+  const primary = await writeSkill(rootA, 'ppt-skill', '0.0.1');
+  const copy1 = await writeSkill(rootB, 'ppt-skill', '0.0.2');
+  const copy2 = await writeSkill(rootC, 'ppt-skill', '0.0.3');
+  const incoming = await mkdtemp(path.join(tmpdir(), 'hy-incoming-'));
+  t.after(() => rm(incoming, { recursive: true, force: true }));
+  const source = await writeSkill(incoming, 'ppt-skill', '0.1.0');
+  const actions = [
+    { name: 'ppt-skill', path: primary, source, previousName: 'ppt-skill', previousVersion: '0.0.1' },
+    { name: 'ppt-skill', path: copy1, link: primary, previousName: 'ppt-skill', previousVersion: '0.0.2' },
+    { name: 'ppt-skill', path: copy2, link: primary, previousName: 'ppt-skill', previousVersion: '0.0.3' },
+  ];
+  let calls = 0;
+  // 第 4 次 rename 是第二个链接动作的旧副本挪备份：此时第一个链接已创建，回滚必须把它清掉。
+  const renameFile = async (from, to) => { if (++calls === 4) throw new Error('injected'); return (await import('node:fs/promises')).rename(from, to); };
+  const error = await replaceAll(actions, { renameFile, names: ['ppt-skill'] }).catch((error) => error);
+  assert.equal(error.error, 'replace');
+  for (const [directory, version] of [[primary, '0.0.1'], [copy1, '0.0.2'], [copy2, '0.0.3']]) {
+    assert.match(await readFile(path.join(directory, 'SKILL.md'), 'utf8'), new RegExp(version.replace(/\./g, '\\.')));
+    assert.ok(!(await lstat(directory)).isSymbolicLink(), `${directory} 不应残留链接`);
+  }
+  for (const root of [rootA, rootB, rootC]) assert.deepEqual(await stageLeftovers(root), []);
 });

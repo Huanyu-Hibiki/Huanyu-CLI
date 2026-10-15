@@ -126,6 +126,13 @@ export const dictionary = {
   installCanceled: ['已取消安装。', 'Installation canceled.'],
   installed: ['已安装 {name} {version}：{path}', 'Installed {name} {version}: {path}'],
   updated: ['已更新 {name}：{previous} → {version}（{path}）', 'Updated {name}: {previous} → {version} ({path})'],
+  // 多宿主链接共享族（任务 7）
+  askTarget: ['安装到哪个 skills 目录？请输入宿主名（zcode、claude、codex、agents、cursor、opencode、trae、qwenwork、workbuddy）或路径：', 'Which skills directory should be used? Enter a host name (zcode, claude, codex, agents, cursor, opencode, trae, qwenwork, workbuddy) or a path: '],
+  noTarget: ['未选择安装位置，请用 --to 指定，例如：{next}', 'No location selected. Use --to to choose one, for example: {next}'],
+  targets: ['安装位置：', 'Install locations:'],
+  targetLink: ['{path}（链接到上面这份）', '{path} (links to the copy above)'],
+  linked: ['{name} 已链接：{path} → {target}', '{name} linked: {path} → {target}'],
+  skipped: ['{name}：开发目录，跳过（{path}）', '{name}: development directory, skipped ({path})'],
   occupied: ['目标目录里有其他文件，已保留：{path}', 'The target directory contains other files and has been preserved: {path}'],
   changed: ['原目录已变化，请重试：{path}', 'The original directory changed. Please retry: {path}'],
   developmentProtected: ['开发目录，跳过：{path}', 'Development directory, skipped: {path}'],

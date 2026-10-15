@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, copyFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readlink, realpath, rm, symlink, copyFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { validateArchive } from '../src/archive.js';
 import { packSkill } from '../src/publish.js';
@@ -18,6 +18,12 @@ export const TOKEN2 = 'hy_Other0123456789abcdefghijklmnopqrstuv';
 export const EMAIL = 'test@example.com';
 // Windows 的模式位不区分 owner/group/others；用户隔离由目录 ACL 提供。
 export const configMode = process.platform === 'win32' ? 0o666 : 0o600;
+// 测试侧造目录链接与读回目标（win32 junction 的 readlink 可能带 \\?\ 前缀，归一后再比）。
+export const linkDirectory = (target, directory) => symlink(target, directory, process.platform === 'win32' ? 'junction' : 'dir');
+export const readDirectoryLink = async (directory) => {
+  const target = await readlink(directory);
+  return process.platform === 'win32' ? path.resolve(target.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '')) : target;
+};
 
 // 试点商品集（对齐设计「数据模型」）：ppt-design 免费版 + 付费配对预留（买断定价）；oracle-bone 纯免费。
 // summaryEn 仅供假商店按 Accept-Language 切换文案，不作为字段下发。

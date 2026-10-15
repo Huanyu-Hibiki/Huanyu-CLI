@@ -8,8 +8,9 @@ import { Client, catalogNames, findSkill, isSkillName, isVersion } from './clien
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory } from './skills.js';
-import { targetRoot } from './hosts.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory } from './skills.js';
+import { targetRoot, installationRoots } from './hosts.js';
+import { directoryKey, sameDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
 
 // 14 个命令全部在参数解析层合法；help/version/list/login/logout/status/publish 之外的执行逻辑随后续任务落地。
@@ -91,6 +92,17 @@ const duplicateLines = (copies) => copies.map((item) => t('duplicateCopies', { n
 // （与词条 historyWarning 文案里的「20 条」耦合，改动需同步）。
 const HISTORY_LIMIT = 20;
 
+// install/update 共用的输出小件（任务 7）：跳过原因行与链接行。
+const skippedInstallation = (item) => ({ name: item.name, path: item.path, reason: 'development_directory' });
+const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
+const linkedLines = (links) => links.map((item) => t('linked', { name: skillLabel(item.name), path: item.path, target: item.target }));
+async function lstatOrNull(file) {
+  try { return await lstat(file); }
+  catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null; throw error; }
+}
+// 安装本身是链接时，更新它指向的真实目录，不把链接换成一份独立副本。
+const realInstallation = async (item) => (await lstatOrNull(item.path))?.isSymbolicLink() ? item.real_path : item.path;
+
 // 扫描九宿主的用户级目录报告已装商店 skill：版本、可更新、警告（配对冲突/多副本/历史截断）；未登录也可用。
 async function status(ctx) {
   await loadAuth(ctx);
@@ -163,9 +175,27 @@ async function list(ctx) {
   return 0;
 }
 
-// 安装到单一目标（任务 6 子集）：免费版下载校验 → 事务替换。多宿主自动发现与链接共享属任务 7。
-async function install(ctx) {
-  const name = ctx.options.skill;
+// 批量应用：按 Skill 名去重只准备（下载校验）一次，replaceAll 单事务覆盖全部目标——
+// 多动作共享备份与整批回滚（设计「错误处理」）。remove/link 动作不需要下载源。
+// 二期的付费清理（addFreeReplacements）在此接入 remove 动作；一期付费只有入口拦截。
+async function apply(ctx, actions, versions) {
+  const prepared = new Map();
+  try {
+    for (const name of new Set(actions.filter((action) => !action.remove && !action.link).map((action) => action.name))) {
+      const { product, paid } = findSkill(ctx.catalog, name);
+      prepared.set(name, await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal));
+    }
+    return await replaceAll(actions.map((action) => ({ ...action, source: action.remove || action.link ? undefined : prepared.get(action.name).source })),
+      { signal: ctx.signal, names: ctx.names });
+  } finally {
+    for (const item of prepared.values()) await item.cleanup().catch(() => {});
+  }
+}
+
+// 多目标安装（任务 7 完整版，机制对齐 template）：--to 可多次（第一个目标放实体，其余链接）；
+// 无 --to 时按宿主表优先序自动发现已存在的宿主（zcode 最先）。其他目标里的同名/改名独立旧副本
+// 自动换成链接，已有正确链接幂等跳过；被保护位置跳过并解释原因。
+async function install(ctx, name = ctx.options.skill) {
   const { product, paid } = findSkill(ctx.catalog, name);
   // 付费前置拦截（设计「分期计划」：一期付费=引导非购买）：不进 402/checkout 流程，exit 3 附商品页。
   // 闸门先于 --to 校验：一期语义下付费 skill 无论参数对错都应先得到购买引导，而不是用法报错。
@@ -173,55 +203,80 @@ async function install(ctx) {
     const url = ctx.client.subscriptionUrl(name, product);
     throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
   }
-  // --to 单值：多目标（重复 --to）与自动发现留给任务 7，这里明确拒绝而不静默忽略。
-  if (ctx.options.to.length > 1) throw new CliError(t('wrongArgument'), 2, 'usage');
-  if (!ctx.options.to.length) {
+  let roots = ctx.options.to.length ? [...new Set(ctx.options.to.map((value) => targetRoot(value)))] : await installationRoots();
+  if (!roots.length) {
     const next = command('install', name, '--to', 'zcode');
-    throw new CliError(t('missingTarget', { next }), 2, 'missing_target',
-      { recommended_path: targetRoot('zcode'), recommended_command: next, next_command: next });
+    const details = { recommended_path: targetRoot('zcode'), recommended_command: next, next_command: next };
+    if (!ctx.interactive) throw new CliError(t('missingTarget', { next }), 2, 'missing_target', details);
+    const answer = await ctx.ask(t('askTarget'), ctx.signal);
+    if (!answer) throw new CliError(t('noTarget', { next }), 2, 'missing_target', details);
+    roots = [targetRoot(answer)];
   }
-  const root = targetRoot(ctx.options.to[0]);
-  const target = path.join(root, name);
+  roots = await uniqueDirectories(roots);
+  const found = (await scan(ctx.names, roots)).filter((item) => item.name === name);
+  // 第一个能放下这个 Skill 的目录放真实的一份，其余宿主用链接共享，更新一次全部生效。
+  // 同名位置被别的东西占着（例如用户自建的链接指向别处）时顺延，不让其他宿主链到错误的内容上。
+  let primaryIndex = 0;
+  for (let i = 0; i < roots.length; i++) {
+    const directory = path.join(roots[i], name);
+    if (found.some((item) => sameDirectory(item.root, roots[i])) || !await lstatOrNull(directory) || (await inspectSkill(directory, ctx.names))?.name === name) { primaryIndex = i; break; }
+  }
+  const primaryRoot = roots[primaryIndex], linkRoots = roots.filter((root, index) => index !== primaryIndex);
   const auto = !ctx.options.yes && !ctx.interactive;
+  if (ctx.interactive) ctx.output.write({ event: 'targets', paths: roots, primary: primaryRoot, links: linkRoots },
+    [t('targets'), primaryRoot, ...linkRoots.map((root) => t('targetLink', { path: root }))]);
   if (!await ctx.confirm(t('confirmInstall', { name: skillLabel(name) }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
     ctx.output.write({ cancelled: true }, [t('installCanceled')]);
     return 0;
   }
-  // 暂存前的第一重开发目录保护：跳过并解释，不动内容、不发起下载。
-  if (await isDevelopmentDirectory(target)) {
-    ctx.output.write({ installations: [], removed: [], skipped: [{ name, path: target, reason: 'development_directory' }], warnings: [] },
-      [t('developmentProtected', { path: target })]);
+  const actions = [], skipped = [], links = [];
+  const primaries = found.filter((item) => sameDirectory(item.root, primaryRoot));
+  const candidates = primaries.length ? primaries : [{ name, path: path.join(primaryRoot, name), version: null }];
+  const target = path.resolve((candidates.find((item) => path.basename(item.path) === name) || candidates[0]).path);
+  for (const item of candidates) {
+    // 暂存前的第一重开发目录保护：跳过并解释，不动内容、不发起下载。
+    if (await isDevelopmentDirectory(item.path)) { skipped.push(skippedInstallation(item)); continue; }
+    actions.push({ name, path: primaries.length ? await realInstallation(item) : item.path, previousName: primaries.length ? name : null, previousVersion: item.version });
+  }
+  const targetKey = directoryKey(await canonicalDirectory(target));
+  for (const root of linkRoots) {
+    // 同名文件夹之外，别的文件夹名里装着同一个 Skill 的独立副本也换成链接。
+    const directories = [...new Set([path.join(root, name), ...found.filter((item) => sameDirectory(item.root, root)).map((item) => item.path)])];
+    for (const directory of directories) {
+      const info = await lstatOrNull(directory);
+      // 已是正确的链接（解析到同一实体）→ 幂等跳过，不重建。
+      if (info && directoryKey(await canonicalDirectory(directory)) === targetKey) { links.push({ name, path: directory, target, existing: true }); continue; }
+      if (info && await isDevelopmentDirectory(directory)) { skipped.push(skippedInstallation({ name, path: directory })); continue; }
+      const current = info ? await inspectSkill(directory, ctx.names) : null;
+      actions.push({ name, path: directory, link: target, previousName: current?.name === name ? name : null, previousVersion: current?.version || null });
+    }
+  }
+  if (!actions.length) {
+    ctx.output.write({ installations: [], links, removed: [], skipped, warnings: [] }, [...linkedLines(links), ...skippedLines(skipped)]);
     return 0;
   }
-  // 占用预检前移：无关内容或别的 skill 占着目标时，下载整包之前就失败；
-  // replaceAll 内的同名双检保留，作下载期间的竞态防线。
-  const info = await lstat(target).catch((error) => {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  });
-  const current = info ? await inspectSkill(target, ctx.names) : null;
-  if (info && (!current || current.name !== name)) throw new CliError(t('occupied', { path: target }), 1, 'occupied', { path: target });
-  const versions = await ctx.client.versions(ctx.catalog);
-  const release = versions[name];
-  const item = await prepare(ctx.client, name, release, ctx.token, paid, product, ctx.signal);
-  let warnings;
-  try {
-    warnings = await replaceAll([{ name, path: target, source: item.source,
-      // previousVersion 任务 7 消费（updated 行的前版本展示）；单目标路径经 current 直接读取。
-      previousName: current?.name === name ? name : null, previousVersion: current?.version || null }],
-      { signal: ctx.signal, names: ctx.names });
-  } finally {
-    await item.cleanup().catch(() => {});
+  // 占用预检前移（任务 6 审查语义在多目标下延续）：整批任一目标被无关内容占用时，下载整包之前
+  // 就失败，不给重定向目标任何被请求的机会；replaceAll 内的同名双检保留，作下载期间的竞态防线。
+  for (const action of actions) {
+    const info = await lstatOrNull(action.path);
+    const current = info ? await inspectSkill(action.path, ctx.names) : null;
+    if (info && (!current || current.name !== action.previousName)) throw new CliError(t('occupied', { path: action.path }), 1, 'occupied', { path: action.path });
+    if (!info && action.previousName) throw new CliError(t('changed', { path: action.path }), 1, 'changed', { path: action.path });
   }
-  // 复扫目标根：报告配对冲突等需要全目录视角的警告。
-  const installed = await scan(ctx.names, [root]);
+  const versions = await ctx.client.versions(ctx.catalog);
+  const warnings = await apply(ctx, actions, versions);
+  // 复扫全部根：报告配对冲突/多副本等需要全目录视角的警告（多副本提示带精确的合并命令）。
+  const installed = await scan(ctx.names, roots);
   warnings.push(...await conflicts(installed, ctx.catalog));
-  const installation = { name, path: target, previous: current?.name === name ? current.version || null : null, version: release.latest };
-  ctx.output.write({ installations: [installation], removed: [], skipped: [], warnings, ...(auto ? { auto_confirmed: true } : {}) },
-    [installation.previous && installation.previous !== installation.version
-      ? t('updated', { name: skillLabel(name), previous: installation.previous, version: installation.version, path: target })
-      : t('installed', { name: skillLabel(name), version: installation.version, path: target }),
-      ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
+  warnings.push(...duplicateLines(duplicateCopies(installed)));
+  const installations = actions.filter((action) => !action.remove && !action.link).map((action) => ({ name, path: action.path,
+    previous: action.previousName === name ? action.previousVersion : null, version: versions[name].latest }));
+  links.push(...actions.filter((action) => action.link).map((action) => ({ name, path: action.path, target: action.link, existing: false, replaced_copy: action.previousName === name })));
+  ctx.output.write({ installations, links, removed: [], skipped, warnings, ...(auto ? { auto_confirmed: true } : {}) },
+    [...installations.map((item) => item.previous && item.previous !== item.version
+      ? t('updated', { name: skillLabel(item.name), previous: item.previous, version: item.version, path: item.path })
+      : t('installed', { name: skillLabel(item.name), version: item.version, path: item.path })),
+      ...linkedLines(links), ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
   return 0;
 }
 

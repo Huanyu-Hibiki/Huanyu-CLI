@@ -124,7 +124,7 @@ test('参数缺值与重复参数全部退出码 2', async () => {
     [['status', '--lang'], 'missing_argument', '--lang'],
     [['install', 'demo-skill', '--to'], 'missing_argument', '--to'],
     [['login', '--token', '--json'], 'missing_argument', '--token'],
-    [['login', '--token', 'a', '--token', 'b'], 'usage', '--token'],
+    [['login', '--token', 'hy_first', '--token', 'hy_second'], 'usage', '--token'],
     [['status', '--lang', 'en', '--lang', 'zh'], 'usage', '--lang'],
   ]) {
     const result = await run([...args, '--json']);
@@ -133,7 +133,7 @@ test('参数缺值与重复参数全部退出码 2', async () => {
     assert.ok(data(result).message.includes(fragment), `${args.join(' ')}: ${data(result).message}`);
   }
   assert.match((await run(['status', '--lang'])).stderr, /--lang 缺少值。/);
-  assert.match((await run(['login', '--token', 'a', '--token', 'b', '--lang', 'en'])).stderr, /--token can only be used once\./);
+  assert.match((await run(['login', '--token', 'hy_first', '--token', 'hy_second', '--lang', 'en'])).stderr, /--token can only be used once\./);
 });
 
 test('--version 与其他参数混用报用法错误并退出码 2', async () => {

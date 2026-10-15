@@ -48,7 +48,7 @@ test('command() 拼出可复制命令，特殊字符按平台引用', () => {
   assert.equal(command('help'), `${COMMAND} help`);
   assert.equal(formatCommand(['install', 'demo-skill']), `${COMMAND} install demo-skill`);
   assert.equal(formatCommand(['install', 'demo skill'], 'win32'), `${COMMAND} install 'demo skill'`);
-  assert.equal(formatCommand(['install', "it's"], 'win32'), `${COMMAND} install 'it'''`);
+  assert.equal(formatCommand(['install', "it's"], 'win32'), `${COMMAND} install 'it''s'`);
   assert.equal(formatCommand(['install', "it's"], 'linux'), `${COMMAND} install 'it'\\''s'`);
 });
 

@@ -1,0 +1,13 @@
+# 参考实现（含其自身 .git，永不提交）
+template/
+
+# 真实密钥（MCP API keys）
+.zcode/config.json
+
+# Node
+node_modules/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

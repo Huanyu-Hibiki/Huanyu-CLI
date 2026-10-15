@@ -227,26 +227,33 @@ test('X-Skill-Version 头不匹配注入 → version_mismatch 拒绝，目标不
   assert.equal(await exists(path.join(f.home, '.zcode')), null, '头校验失败时目标不可达');
 });
 
-test('未购付费 skill：exit 3 inactive + subscribe_command/subscription_url，不发下载', async (t) => {
+// 任务 5 语义改造：未购付费 skill 不再 exit 3 引导，而是内联进入购买流程（一条命令完成购买+安装）。
+// 购买未完成（60 秒预算耗尽）才 exit 3 payment_pending，目标不可达且不发起下载。
+test('未购付费 skill：install 内联进入购买（checkout+付款页），60 秒未付款 exit 3 payment_pending 且不下载；解锁后重跑一条命令完成', async (t) => {
   const f = await fixture(t);
   await publishPaid(f);
   f.state.grants.set(TOKEN, []);
+  f.state.checkoutActiveAfter = Infinity;
   const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(result.code, 3);
-  const value = data(result);
-  assert.equal(value.ok, false);
-  assert.equal(value.error, 'inactive');
-  assert.equal(value.subscribe_command, command('subscribe', 'ppt-design-pro'));
-  assert.equal(value.subscription_url, `${f.base}/store/ppt-design-pro/`);
-  assert.match(value.message, new RegExp(`尚未购买 ppt-design-pro。请运行 ${command('subscribe', 'ppt-design-pro').replaceAll('.', '\\.')}，或打开 ${f.base}/store/ppt-design-pro/`));
-  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '未购不应进入付费下载');
-  const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN });
-  assert.equal(human.code, 3);
-  assert.match(human.stderr, /尚未购买 ppt-design-pro/);
-  assert.ok(human.stderr.includes(`${f.base}/store/ppt-design-pro/`));
+  const output = result.stdout.trim().split('\n').map(JSON.parse);
+  assert.deepEqual(output.map((event) => event.event), ['checkout', undefined]);
+  const pending = output.at(-1);
+  assert.equal(pending.ok, false);
+  assert.equal(pending.error, 'payment_pending');
+  assert.equal(pending.skill, 'ppt-design-pro');
+  assert.equal(pending.purchase_url, output[0].url);
+  assert.equal(pending.next_command, `${command('install', 'ppt-design-pro', '--to', 'zcode', '--json')}`);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '未完成购买不应进入下载');
+  assert.equal(await exists(path.join(f.home, '.zcode')), null, '购买未完成时目标不可达');
+  // 付款解锁（轮询到点）后重跑：权益闸门经 me 放行，一条命令完成安装。
+  f.state.checkoutActiveAfter = 2;
+  const second = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(second.code, 0, second.stdout + second.stderr);
+  assert.deepEqual(data(second).installations, [{ name: 'ppt-design-pro', path: path.join(f.home, '.zcode', 'skills', 'ppt-design-pro'), previous: null, version: '0.2.0' }]);
 });
 
-test('订阅状态表驱动：五种有效状态逐一放行；未知/失效状态 fail-closed 视为未购', async (t) => {
+test('订阅状态表驱动：五种有效状态逐一放行（不进购买）；未知/失效状态 fail-closed 视为未购进入内联购买', async (t) => {
   const f = await fixture(t);
   await publishPaid(f);
   f.state.grants.set(TOKEN, ['ppt-design-pro']);
@@ -256,15 +263,20 @@ test('订阅状态表驱动：五种有效状态逐一放行；未知/失效状�
     assert.equal(result.code, 0, `${status}: ${result.stdout + result.stderr}`);
     assert.equal(data(result).installations[0].version, '0.2.0', status);
   }
+  assert.equal(f.state.checkoutRequests, 0, '已购状态不得进入购买流程');
   const downloadsAfterPositive = f.state.requests.filter((r) => r.path.startsWith('/api/store/download')).length;
+  // 失效状态 = 未购：进入内联购买；注入让购买在 60 秒内无法完成（会话状态不履约），验证 fail-closed。
+  f.state.checkoutActiveAfter = Infinity;
+  f.state.checkoutStatusResponse = { status: 'open', paid: false, entitled: false };
   for (const status of ['canceled', 'expired', 'unknown-status']) {
     f.state.subscriptionStatus = status;
     const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
     assert.equal(result.code, 3, status);
-    assert.equal(data(result).error, 'inactive', status);
+    const pending = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.equal(pending.error, 'payment_pending', status);
   }
   assert.equal(f.state.requests.filter((r) => r.path.startsWith('/api/store/download')).length, downloadsAfterPositive,
-    '失效订阅不应进入付费下载');
+    '未完成购买不应进入付费下载');
 });
 
 test('me 订阅条目形状校验：null 条目/缺 status/非对象/空 skill → invalid_response（fail-closed）', async (t) => {

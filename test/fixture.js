@@ -166,7 +166,9 @@ export async function fixture(t) {
     releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0, versionsDelay: 0,
     // 付费下载（二期任务 3）：badDownloadVersion 让下载端点回错误的 X-Skill-Version（头校验正例）；
     // badDownloadChecksum 回错误的 X-Content-SHA256、dropDownloadChecksum 省略该头（摘要负例）。
-    badDownloadVersion: false, badDownloadChecksum: false, dropDownloadChecksum: false };
+    // downloadInactiveCount（二期任务 5）：前 N 次付费下载先清空授权再判权——模拟「me 已列但
+    // 服务端扣款/履约竞态未生效」的 402 窗口（install/update 的内联购买重试路径，template 同款）。
+    badDownloadVersion: false, badDownloadChecksum: false, dropDownloadChecksum: false, downloadInactiveCount: 0 };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -356,6 +358,8 @@ export async function fixture(t) {
         if (state.yanked.has(`${name}:${version}`)) return error(res, 404, 'not_found', '该版本已下架。');
         if (product.paid?.skill === name) {
           if (!authenticate()) return;
+          // 402 竞态注入：授权被清空后按订阅判定，本次下载返回 402（购买后重试即恢复）。
+          if (state.downloadInactiveCount > 0) { state.downloadInactiveCount--; state.grants.set(token, []); }
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
           // X-Skill-Version 声明所发内容的版本：badDownloadVersion 注入不匹配值（客户端头校验正例）。
           // X-Content-SHA256 是付费信道的摘要权威：badDownloadChecksum 注入错误值、dropDownloadChecksum 省略头。

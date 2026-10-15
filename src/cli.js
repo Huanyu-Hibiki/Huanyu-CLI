@@ -10,7 +10,7 @@ import { login, loadAuth, requireLogin } from './auth.js';
 import { requirePurchase } from './purchase.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo, reconcileRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked } from './skills.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked, sameAgentRoots, freeReplacements } from './skills.js';
 import { targetRoot, installationRoots, nearestHostId } from './hosts.js';
 import { directoryKey, sameDirectory, resolveDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
@@ -145,8 +145,11 @@ const HISTORY_LIMIT = 20;
 
 // install/update 共用的输出小件（任务 7）：跳过原因行与链接行。
 const skippedInstallation = (item) => ({ name: item.name, path: item.path, reason: 'development_directory' });
-const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink', all_yanked: 'skippedYanked' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
+const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink', unrecognized_skill: 'skippedUnrecognizedSkill', all_yanked: 'skippedYanked' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
 const linkedLines = (links) => links.map((item) => t('linked', { name: skillLabel(item.name), path: item.path, target: item.target }));
+// 免费版清理输出（任务 5）：被移除的免费版 = 独立 remove 动作 + 原位替换（replacesFree）的安装动作。
+const removedActions = (actions) => actions.filter((action) => action.remove || action.replacesFree);
+const removedLines = (actions) => removedActions(actions).map((action) => t('removedFree', { name: skillLabel(action.previousName), path: action.path }));
 async function lstatOrNull(file) {
   try { return await lstat(file); }
   catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null; throw error; }
@@ -239,20 +242,75 @@ async function list(ctx) {
 
 // 批量应用：按 Skill 名去重只准备（下载校验）一次，replaceAll 单事务覆盖全部目标——
 // 多动作共享备份与整批回滚（设计「错误处理」）。remove/link 动作不需要下载源。
-// 付费 skill 在入口已过 requireEntitlement，这里的令牌下载（200 直连 + 响应头校验）得以激活；
-// 二期的付费清理（addFreeReplacements，任务 5）在此接入 remove 动作。
-async function apply(ctx, actions, versions) {
+// 付费 skill 在入口已过权益闸门（requireEntitlement），这里的令牌下载（200 直连 + 响应头校验）
+// 得以激活；下载期 402（requireEntitlement 快照过时、竞态窗口、或服务端刚扣款未生效）按
+// purchaseOnInactive 内联进购买流程后重试一次（任务 5）——一条命令完成购买+安装/更新。
+async function apply(ctx, actions, versions, { purchaseOnInactive = false } = {}) {
   const prepared = new Map();
   try {
     for (const name of new Set(actions.filter((action) => !action.remove && !action.link).map((action) => action.name))) {
       const { product, paid } = findSkill(ctx.catalog, name);
-      prepared.set(name, await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal));
+      let item;
+      try { item = await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal); }
+      catch (error) {
+        // 402 不是终点：requirePurchase(force) 重核并完成购买（会话恢复 / 409 already_active 都算已购），
+        // 失效快照后重试一次下载；再失败按原错误透出——重试的 402 不会触发第二次购买。
+        if (!purchaseOnInactive || !paid || !(error instanceof CliError) || (error.details.http_status !== 402 && error.error !== 'inactive')) throw error;
+        await requirePurchase(ctx, name, { force: true, plan: ctx.options.plan });
+        invalidateAccount(ctx);
+        item = await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal);
+      }
+      prepared.set(name, item);
     }
     return await replaceAll(actions.map((action) => ({ ...action, source: action.remove || action.link ? undefined : prepared.get(action.name).source })),
       { signal: ctx.signal, names: ctx.names, onStage: ctx.observeStage, renameFile: ctx.renameFile });
   } finally {
     for (const item of prepared.values()) await item.cleanup().catch(() => {});
   }
+}
+
+// 免费版配对清理（任务 5，template addFreeReplacements 移植 + 数据驱动化）：安装/更新任何
+// free+paid 配对商品的付费版时，把同宿主（sameAgentRoots 归属，含项目级根；template 对
+// 'oil-ui-pro' 的特判在此改为对全部配对商品生效——设计「领域层重组」③的最后一环）的免费版
+// 目录并入整批事务移除。remove 动作共享备份与回滚，不单独删除；某宿主组的付费动作全部落在
+// 受保护位置时整组不清理（不因装不进付费版而误删免费版）；付费动作恰好落在免费版目录上时
+// 原位替换（replacesFree）。返回 skipped（受保护位置的清理跳过）与扫描过的根（供复扫）。
+async function addFreeReplacements(ctx, actions, targets = actions) {
+  const groups = new Map(), skipped = [];
+  for (const target of targets) {
+    const { product, paid } = findSkill(ctx.catalog, target.name);
+    if (!paid || !product.free) continue;
+    const roots = await sameAgentRoots(path.dirname(target.path));
+    const key = [product.free.skill, ...[...new Set(await Promise.all(roots.map(async (root) => directoryKey(await canonicalDirectory(root)))))].sort()].join('\0');
+    const group = groups.get(key) || { name: product.free.skill, paid: target.name, roots: [], targets: [] };
+    group.roots.push(...roots);
+    group.targets.push(target);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    const { name } = group;
+    const found = await freeReplacements(name, group.roots);
+    skipped.push(...found.skipped);
+    // 受保护位置上已规划的动作一并撤下（例如付费版要装的位置被保护链接占着）。
+    for (const item of found.skipped) {
+      const index = actions.findIndex((action) => sameDirectory(action.path, item.path));
+      if (index >= 0) actions.splice(index, 1);
+    }
+    if (group.targets.every((target) => found.skipped.some((item) => sameDirectory(item.path, target.path)))) continue;
+    for (const item of found.removable) {
+      const index = actions.findIndex((action) => sameDirectory(action.path, item.path));
+      const replacement = actions[index];
+      if (replacement?.name === group.paid) {
+        replacement.previousName = name;
+        replacement.replacesFree = true;
+        replacement.protectSymlinks = true;
+      } else {
+        if (index >= 0) actions.splice(index, 1);
+        actions.push({ name, path: item.path, previousName: name, remove: true, protectSymlinks: true });
+      }
+    }
+  }
+  return { skipped, roots: [...groups.values()].flatMap((group) => group.roots) };
 }
 
 // roots 解析：--to 多值（第一个目标放实体、其余链接）或按宿主表优先序自动发现已存在宿主（zcode 最先）；
@@ -309,21 +367,23 @@ async function planActions(ctx, name, roots) {
   return { actions, skipped, links, primaryRoot, linkRoots };
 }
 
-// 付费权益闸门（install/update 共用，二期任务 3）：免费 skill 直接放行；付费先 requireLogin，
-// 再以 me().subscriptions 判定——已购（状态有效）放行令牌下载，未购 exit 3 'inactive' 附
-// subscribe_command/subscription_url（与下载端 402 同语义、同词条，任务 5 在此接内联购买）。
-// 订阅快照缓存在 ctx.account：混合批量逐 skill 判定只查一次账号；缓存失效经 invalidateAccount。
+// 付费权益闸门 + 内联购买（install/update 共用；二期任务 3 建立、任务 5 接线）：免费 skill 直接
+// 放行；付费先 requireLogin，再以 me().subscriptions 判定——已购（状态有效）或本进程已确认购买
+//（unlockedSkills 旁通）放行令牌下载。未购不再 exit 3 引导 subscribe，而是直接进入内联购买
+//（requirePurchase：已购静默通过，未购走 checkout 会话与浏览器付款、非交互 60 秒预算），一条命令
+// 完成购买+安装/更新；subscribe 保持自己的入口（先购买后询问安装）。购买成功后失效订阅快照
+//（invalidateAccount）：同进程内后续的权益判定必须重新拉 me，不按旧快照拦截。
 async function requireEntitlement(ctx, name) {
-  const { product, paid } = findSkill(ctx.catalog, name);
+  const { paid } = findSkill(ctx.catalog, name);
   // 本进程已确认购买（requirePurchase 的 unlockedSkills 缓存）直接放行：409 already_active 等
   // me 暂未列出授权的履约窗口里，接续安装不必（也不能）再按订阅快照拦截。
   if (!paid || ctx.unlockedSkills?.has(name)) return true;
   await requireLogin(ctx);
   if (!ctx.account) ctx.account = await ctx.client.me(ctx.token);
   if (ctx.account.subscriptions.some((item) => item.skill === name && SUBSCRIPTION_STATUSES.includes(item.status))) return true;
-  const url = ctx.client.subscriptionUrl(name, product);
-  const next = command('subscribe', name);
-  throw new CliError(t('inactive', { name: skillLabel(name), next, url }), 3, 'inactive', { subscribe_command: next, subscription_url: url });
+  await requirePurchase(ctx, name, { plan: ctx.options.plan });
+  invalidateAccount(ctx);
+  return true;
 }
 
 // 订阅快照失效（任务 5 契约）：购买成功后必须调用——否则同进程内后续的权益判定仍按旧快照放行/拦截。
@@ -372,7 +432,8 @@ async function assertReplaceable(ctx, actions) {
 // 交互列目标并确认 → 预检（互相包含/占用/变化全部在下载之前）→ apply 批量事务 → 复扫与输出。
 async function install(ctx, name = ctx.options.skill) {
   // 权益闸门先于 --to 校验（quality-M2 抽取自此处与 update）：付费 skill 无论参数对错都先得到
-  // 登录/购买引导（未登录走设备码、未购 exit 3 inactive），而不是用法报错；免费 skill 直接放行。
+  // 登录/购买引导（未登录走设备码、未购直接进入内联购买——任务 5 语义），而不是用法报错；
+  // 免费 skill 直接放行。
   await requireEntitlement(ctx, name);
   const roots = await resolveRoots(ctx);
   const { actions, skipped, links, primaryRoot, linkRoots } = await planActions(ctx, name, roots);
@@ -399,27 +460,32 @@ async function install(ctx, name = ctx.options.skill) {
       if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) throw new CliError(t('overlappingTargets'), 2, 'overlapping_targets');
     }
   }
+  // 免费版配对清理（任务 5）：同宿主免费版目录并入整批事务移除；受保护位置跳过并解释。
+  // 占用预检随后对含 remove 动作的全集执行（replacesFree 原位替换动作的 previousName 在此已改写）。
+  const cleanup = await addFreeReplacements(ctx, actions);
+  skipped.push(...cleanup.skipped.filter((item) => !skipped.some((existing) => sameDirectory(existing.path, item.path))));
   // 占用预检（quality-M1 抽取为 assertReplaceable，update 复用）：整批任一目标被无关内容
   // 占用时，下载整包之前就失败；replaceAll 内的同名双检保留，作下载期间的竞态防线。
   await assertReplaceable(ctx, actions);
   // 纯链接路径（无实体动作，如主安装是开发目录）：不下载，也不打版本表。
   const downloads = actions.some((action) => !action.remove && !action.link);
   const versions = downloads ? await ctx.client.versions(ctx.catalog) : {};
-  const warnings = await apply(ctx, actions, versions);
-  // 复扫全部根：报告配对冲突/多副本等需要全目录视角的警告（多副本提示带精确的合并命令）。
-  // 与 update 的复扫段成对语义（quality-M3）：update 按发现根复扫、--path 定点不报多副本；
-  // 两段需同步改动，抽取窗口留任务 7 收尾。
-  const installed = await scan(ctx.names, roots);
+  const warnings = await apply(ctx, actions, versions, { purchaseOnInactive: true });
+  // 复扫全部根（含清理扫描过的同宿主根）：报告配对冲突/多副本等需要全目录视角的警告
+  //（多副本提示带精确的合并命令）。与 update 的复扫段成对语义（quality-M3）：update 按发现根
+  // 复扫、--path 定点不报多副本；两段需同步改动，抽取窗口留任务 7 收尾。
+  const installed = await scan(ctx.names, [...roots, ...cleanup.roots]);
   warnings.push(...await conflicts(installed, ctx.catalog));
   warnings.push(...duplicateLines(duplicateCopies(installed)));
   const installations = actions.filter((action) => !action.remove && !action.link).map((action) => ({ name, path: action.path,
     previous: action.previousName === name ? action.previousVersion : null, version: versions[name].latest }));
   links.push(...actions.filter((action) => action.link).map((action) => ({ name, path: action.path, target: action.link, existing: false, replaced_copy: action.previousName === name })));
-  ctx.output.write({ installations, links, removed: [], skipped, warnings, ...(auto ? { auto_confirmed: true } : {}) },
+  const removed = removedActions(actions).map((action) => action.path);
+  ctx.output.write({ installations, links, removed, skipped, warnings, ...(auto ? { auto_confirmed: true } : {}) },
     [...installations.map((item) => item.previous && item.previous !== item.version
       ? t('updated', { name: skillLabel(item.name), previous: item.previous, version: item.version, path: item.path })
       : t('installed', { name: skillLabel(item.name), version: item.version, path: item.path })),
-      ...linkedLines(links), ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
+      ...linkedLines(links), ...removedLines(actions), ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
   return 0;
 }
 
@@ -427,8 +493,8 @@ async function install(ctx, name = ctx.options.skill) {
 // 按 real_path 去重（链接安装只更新真实目标一次，链接保持指向、新版本即刻生效）→ apply 整批
 // 事务替换 → 复扫冲突/多副本警告。`update <skill>` 只更新指定；`--path <目录>` 定点（拒绝未知
 // 目录/与 --skill 不匹配）。开发目录跳过并解释；交互确认更新数量，非交互 auto_confirmed 警示沿用。
-// 付费 Skill 逐个过权益闸门（二期任务 3）：已购令牌下载更新；批量里任一未购付费 skill
-// exit 3 指向该 skill——整批原子，免费目标也不装一半。
+// 付费 Skill 逐个过权益闸门（二期任务 3，任务 5 接内联购买）：已购令牌下载更新；未购的直接进入
+// 购买流程——购买未完成整批原子（免费目标也不装一半、免费版不被清理）。
 async function update(ctx) {
   if (ctx.options.skill) findSkill(ctx.catalog, ctx.options.skill);
   let all;
@@ -465,31 +531,38 @@ async function update(ctx) {
   skipped.push(...eligible.filter((item) => updateDue(item) && latestYanked(versions[item.name]))
     .map((item) => ({ name: item.name, path: item.path, reason: 'all_yanked' })));
   const actions = await Promise.all(pending.map(async (item) => ({ name: item.name, path: await realInstallation(item), previousName: item.name, previousVersion: item.version })));
-  // 付费权益闸门（quality-M2 抽取，与 install 共用 requireEntitlement）：过期才有动作，已最新的
-  // 付费安装不触发闸门；逐 skill 判定，任一未购即 exit 3——整批未开始，免费目标也不装一半。
-  for (const action of actions) await requireEntitlement(ctx, action.name);
+  // 免费版配对清理（任务 5，template 移植 + 数据驱动化）：targets=eligible 全量——已最新的付费
+  // 安装也清理同宿主的遗留免费版（不按名字特判，对全部 free+paid 配对商品生效）。
+  const cleanup = await addFreeReplacements(ctx, actions, eligible);
+  skipped.push(...cleanup.skipped.filter((item) => !skipped.some((existing) => sameDirectory(existing.path, item.path))));
+  const replacements = actions.filter((action) => !action.remove);
+  // 付费权益闸门 + 内联购买（quality-M2 抽取，与 install 共用 requireEntitlement）：过期才有动作，
+  // 已最新的付费安装不触发闸门；未购的直接进购买流程（任务 5）——购买未完成整批不动
+  //（免费目标也不装一半、免费版不被清理）。
+  for (const action of replacements) await requireEntitlement(ctx, action.name);
   // --yes 是用户显式确认；auto_confirmed 只标记「非交互静默确认」——与 install 同语义，
-  // 但仅在实际有动作被静默确认时标记（up_to_date 无动作就不打提示行）。
-  const auto = actions.length > 0 && !ctx.options.yes && !ctx.interactive;
-  if (actions.length && !await ctx.confirm(t('confirmUpdate', { count: actions.length }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
+  // 但仅在实际有替换动作被静默确认时标记（纯清理/up_to_date 无更新就不打提示行）。
+  const auto = replacements.length > 0 && !ctx.options.yes && !ctx.interactive;
+  if (replacements.length && !await ctx.confirm(t('confirmUpdate', { count: replacements.length }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
     ctx.output.write({ cancelled: true, removed: [], skipped, ...counts, updated_count: 0, status: 'cancelled' }, [t('updateCanceled'), ...skippedLines(skipped)]);
     return 0;
   }
   // 下载前占用/变更预检（quality-M1，与 install 共用 assertReplaceable）：scan 与执行之间
-  // 目标被第三方改动时，在下载整包之前失败。
+  // 目标被第三方改动时，在下载整包之前失败（含清理并入的 remove 动作）。
   await assertReplaceable(ctx, actions);
-  const warnings = await apply(ctx, actions, versions);
-  // 复扫原发现范围（--path 定点只看那个根）：冲突警告需要全目录视角；多副本只在非定点时报告。
-  // 与 install 的复扫段成对语义（quality-M3）：install 按 --to/发现根复扫、始终报多副本；
-  // 两段需同步改动，抽取窗口留任务 7 收尾。
-  const after = await scan(ctx.names, all.map((item) => item.root));
+  const warnings = await apply(ctx, actions, versions, { purchaseOnInactive: true });
+  // 复扫原发现范围 + 清理扫描过的同宿主根（--path 定点只看那个根）：冲突警告需要全目录视角；
+  // 多副本只在非定点时报告。与 install 的复扫段成对语义（quality-M3）：install 按 --to/发现根
+  // 复扫、始终报多副本；两段需同步改动，抽取窗口留任务 7 收尾。
+  const after = await scan(ctx.names, [...all.map((item) => item.root), ...cleanup.roots]);
   warnings.push(...await conflicts(after, ctx.catalog));
   if (!ctx.options.path) warnings.push(...duplicateLines(duplicateCopies(after.filter((item) => !ctx.options.skill || item.name === ctx.options.skill))));
-  const installations = actions.map((item) => ({ name: item.name, path: item.path, previous: item.previousVersion, version: versions[item.name].latest }));
-  ctx.output.write({ installations, removed: [], skipped, warnings, ...counts, updated_count: installations.length,
+  const installations = replacements.map((item) => ({ name: item.name, path: item.path, previous: item.previousVersion, version: versions[item.name].latest }));
+  const removed = removedActions(actions).map((action) => action.path);
+  ctx.output.write({ installations, removed, skipped, warnings, ...counts, updated_count: installations.length,
     status: installations.length ? 'updated' : 'up_to_date', ...(auto ? { auto_confirmed: true } : {}) },
     [...(installations.length ? installations.map((item) => t('updated', { name: skillLabel(item.name), previous: item.previous || t('unknownVersion'), version: item.version, path: item.path })) : [t('upToDate')]),
-      ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedUpdate')] : [])]);
+      ...removedLines(actions), ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedUpdate')] : [])]);
   return 0;
 }
 

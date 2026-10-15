@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN } from './fixture.js';
 import { command } from '../src/i18n.js';
 
@@ -12,6 +12,7 @@ const data = (result) => {
   return JSON.parse(result.stdout);
 };
 const exists = async (file) => { try { return await lstat(file); } catch { return null; } };
+const absent = (directory) => assert.rejects(access(directory), { code: 'ENOENT' });
 const stageLeftovers = async (root) => (await readdir(root, { recursive: false }).catch((error) => error.code === 'ENOENT' ? [] : (() => { throw error; })())).filter((name) => name.startsWith('.hy-stage-'));
 const versionOf = async (directory) => ((await readFile(path.join(directory, 'SKILL.md'), 'utf8')).match(/version: "([^"]+)"/) || [])[1];
 
@@ -174,15 +175,21 @@ test('下载前占用预检：scan 与执行之间目标被换成无关内容 �
   assert.deepEqual(await stageLeftovers(path.dirname(target)), []);
 });
 
-test('conflicts 复扫判别例：同宿主根装 ppt-design + ppt-design-pro 跑 update → warnings 含 conflict 行', async (t) => {
+// 任务 5 后同宿主的免费版会被配对清理（冲突随之消失）；冲突复扫的判别例改用受保护的开发目录
+// 免费版——共存持续存在，update 前后都提示 conflict，且 up_to_date 复扫同样报告。
+test('conflicts 复扫判别例：同宿主受保护的免费版与付费版共存 → update 后仍提示 conflict 行', async (t) => {
   const f = await fixture(t);
   const free = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  await mkdir(path.join(free, '.git'));
   // 付费版已最新（0.1.0）：不进 pending，也就不触发付费闸门，纯当冲突警告的另一半存在。
   await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design-pro', '0.1.0');
-  const result = await f.run(['update', '--json']);
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(result.code, 0, result.stdout + result.stderr);
   const value = data(result);
-  assert.equal(await versionOf(free), '0.1.0');
+  assert.equal(await versionOf(free), '0.0.9', '开发目录内容不动');
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: free, reason: 'development_directory' }]);
+  assert.deepEqual(value.removed, [], '受保护的免费版不清理');
+  assert.equal(value.status, 'up_to_date');
   assert.equal(value.warnings.length, 1);
   assert.match(value.warnings[0], /ppt-design 和 ppt-design-pro 两个版本同时装/);
   // up_to_date 的复扫同样报告冲突（警告不依赖是否有动作发生）。
@@ -307,23 +314,37 @@ test('已购付费 skill 过期：update 令牌直连下载更新成功，全程
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/releases/')), '付费下载不得 302 到公开附件');
 });
 
-test('混合批量：免费过期 + 未购付费过期 → exit 3 指向未购付费 skill，免费未被安装（整批原子）', async (t) => {
+// 任务 5 语义改造：未购付费 skill 不再 exit 3 指引 subscribe，而是内联购买（一条命令完成）。
+// 购买未完成时整批原子（免费目标也不装一半、免费版不被清理）；解锁后重跑购买+全部更新+清理。
+test('混合批量：免费过期 + 未购付费过期 → 内联购买后全部更新+清理同宿主免费版；购买未完成整批不动', async (t) => {
   const f = await fixture(t);
   const paid = await publishPaid(f);
-  const free = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
+  const paired = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.1.0');
+  const free = await writeSkill(path.join(f.home, '.claude', 'skills'), 'oracle-bone', '0.0.9');
   f.state.grants.set(TOKEN, []);
-  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
-  assert.equal(result.code, 3);
-  const value = data(result);
-  assert.equal(value.ok, false);
-  assert.equal(value.error, 'inactive');
-  assert.equal(value.subscribe_command, command('subscribe', 'ppt-design-pro'));
-  assert.equal(value.subscription_url, `${f.base}/store/ppt-design-pro/`);
-  assert.match(value.message, /尚未购买 ppt-design-pro/);
+  f.state.checkoutActiveAfter = Infinity;
+  const blocked = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(blocked.code, 3);
+  const pending = JSON.parse(blocked.stdout.trim().split('\n').at(-1));
+  assert.equal(pending.error, 'payment_pending');
+  assert.equal(pending.skill, 'ppt-design-pro');
   // 整批未开始：付费与免费目标都保持原版本，且没有发生任何下载。
   assert.equal(await versionOf(paid), '0.0.9', '付费目标不应被更新');
   assert.equal(await versionOf(free), '0.0.9', '免费目标不应装一半');
-  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '权益拦截不应进入下载');
+  assert.ok(await exists(paired), '购买未完成不应清理同宿主免费版');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '购买未完成不应进入下载');
+  // 付款解锁后重跑：购买 + 全部更新 + 同宿主免费版清理，一条命令完成。
+  f.state.checkoutActiveAfter = 2;
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.equal(value.updated_count, 2);
+  assert.deepEqual(value.installations.map((item) => [item.name, item.path]).sort(),
+    [['ppt-design-pro', paid], ['oracle-bone', free]].sort());
+  assert.deepEqual(value.removed, [paired]);
+  assert.equal(await versionOf(paid), '0.2.0');
+  assert.equal(await versionOf(free), '0.1.0');
+  await absent(paired);
 });
 
 test('交互确认更新数量；拒绝 → updateCanceled（exit 0）且未动目标', async (t) => {

@@ -154,6 +154,9 @@ export const dictionary = {
   targetLink: ['{path}（链接到上面这份）', '{path} (links to the copy above)'],
   linked: ['{name} 已链接：{path} → {target}', '{name} linked: {path} → {target}'],
   skipped: ['{name}：开发目录，跳过（{path}）', '{name}: development directory, skipped ({path})'],
+  // 免费版配对清理族（二期任务 5）：跳过原因行与移除行。
+  skippedUnrecognizedSkill: ['{name}：SKILL.md 无法识别为此 Skill，跳过（{path}）', '{name}: SKILL.md does not identify this skill, skipped ({path})'],
+  removedFree: ['已移除同一 Agent 里的 {name}：{path}', 'Removed {name} from the same Agent: {path}'],
   askTargetTypo: ['提示：“{typed}” 疑似宿主 {suggestion} 的拼写误差，已按路径 {typed} 处理。', 'Hint: "{typed}" looks like a misspelling of host {suggestion}; treating it as the path {typed}.'],
   interruptBackups: ['已强制退出；如回滚未完成，备份目录可能保留在：{paths}', 'Forced exit; if rollback did not finish, backups may remain at: {paths}'],
   occupied: ['目标目录里有其他文件，已保留：{path}', 'The target directory contains other files and has been preserved: {path}'],

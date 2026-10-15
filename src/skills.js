@@ -152,6 +152,47 @@ async function hasDirectoryLink(directories) {
 }
 export const isLinkedInstallation = (directory) => hasDirectoryLink([directory, ...installationParents(path.dirname(directory))]);
 
+// 免费版配对清理的扫描面（任务 5，template 移植）：与版本扫描分开——不能因 real_path 去重而漏报
+// 软链接或未知同名目录。removable = 可以安全并入事务移除的免费版目录；skipped = 受保护的位置
+//（链接目录本身、被链接指向的真实目标、开发目录、无法识别的目录），各附原因供输出解释。
+export async function freeReplacements(name, roots) {
+  const candidates = [], skipped = [], linkedTargets = new Set(), seenRoots = new Set();
+  for (const root of [...new Set(roots)]) {
+    // 普通路径别名去重，但软链接作用域必须保留，才能保护它指向的真实安装。
+    const linkedRoot = await hasDirectoryLink(installationParents(root));
+    const resolved = directoryKey(await canonicalDirectory(root));
+    if (!linkedRoot && seenRoots.has(resolved)) continue;
+    if (!linkedRoot) seenRoots.add(resolved);
+    let entries;
+    try { entries = await readdir(root, { withFileTypes: true }); }
+    catch (error) {
+      if (['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
+      throw new CliError(t('scanRead', { path: root }), 1, 'skill_read');
+    }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const directory = path.join(root, entry.name);
+      const item = await inspectSkill(directory, [name]);
+      if (!item && (process.platform === 'win32' ? entry.name.toLowerCase() : entry.name) !== name) continue;
+      const candidate = item || { name, path: directory };
+      if (await isLinkedInstallation(directory)) {
+        if (item) linkedTargets.add(directoryKey(item.real_path));
+        skipped.push({ name, path: directory, reason: 'symbolic_link' });
+      } else if (item?.development || (!item && await isDevelopmentDirectory(directory))) {
+        skipped.push({ name, path: directory, reason: 'development_directory' });
+      } else if (!item) skipped.push({ name, path: directory, reason: 'unrecognized_skill' });
+      else candidates.push(candidate);
+    }
+  }
+  // 候选里被保护链接指向的真实目标同样保留：扫描去重不能成为保护漏洞。
+  const removable = candidates.filter((item) => {
+    if (!linkedTargets.has(directoryKey(item.real_path))) return true;
+    skipped.push({ name, path: item.path, reason: 'symbolic_link' });
+    return false;
+  });
+  return { removable, skipped };
+}
+
 function agentRootGroups(env = process.env, platform = process.platform, cwd = process.cwd()) {
   return HOSTS.map((host) => [targetRoot(host.id, env, platform, cwd), ...projectRootsOf(host.id, env, platform, cwd)]);
 }

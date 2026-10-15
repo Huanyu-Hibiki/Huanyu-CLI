@@ -68,3 +68,21 @@ export function projectRootsOf(hostId, env = process.env, platform = process.pla
   const host = hostById(hostId), paths = pathsFor(platform);
   return host?.project ? [paths.resolve(cwd, ...host.project)] : [];
 }
+
+// 编辑距离（小 DP；宿主 id 最长 8 字符，无需剪枝）。
+function editDistance(a, b) {
+  const rows = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) rows[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) {
+    rows[i][j] = Math.min(rows[i - 1][j] + 1, rows[i][j - 1] + 1, rows[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  }
+  return rows[a.length][b.length];
+}
+
+// askTarget 的拼写提示：与某个宿主 id 编辑距离恰为 1 的输入视为手滑，返回该 id；否则 null。
+// 输入本身仍按路径语义处理，提示不改变行为（比较前先 trim，生产端 ask 已 trim、测试端未 trim）。
+export function nearestHostId(value, ids = HOSTS.map((host) => host.id)) {
+  const typed = String(value ?? '').trim().toLowerCase();
+  if (!typed || ids.includes(typed)) return null;
+  return ids.find((id) => editDistance(typed, id) === 1) ?? null;
+}

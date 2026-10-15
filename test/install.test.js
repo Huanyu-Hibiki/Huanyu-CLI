@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
+import { interruptBackups } from '../src/cli.js';
+import { isSkillName } from '../src/skills.js';
 import { prepare, replaceAll } from '../src/install.js';
 import { Client } from '../src/client.js';
 import { targetRoot } from '../src/hosts.js';
@@ -272,19 +274,19 @@ test('changed：下载期间目标被删除 → changed 保护，不误装新目
   assert.deepEqual(await stageLeftovers(root), []);
 });
 
-test('missingTarget：不带 --to → exit 2 + 推荐命令与真实路径', async (t) => {
+test('missingTarget：不带 --to → exit 2 + 推荐命令（保留 --json/--lang 等原始标志）与真实路径', async (t) => {
   const f = await fixture(t);
   const result = await f.run(['install', 'ppt-design', '--json']);
   assert.equal(result.code, 2);
   const value = data(result);
   assert.equal(value.error, 'missing_target');
-  const expected = command('install', 'ppt-design', '--to', 'zcode');
+  const expected = `${command('install', 'ppt-design', '--json')} --to zcode`;
   assert.equal(value.recommended_command, expected);
   assert.equal(value.next_command, expected);
   assert.equal(value.recommended_path, targetRoot('zcode', f.env));
   const human = await f.run(['install', 'ppt-design']);
   assert.equal(human.code, 2);
-  assert.ok(human.stderr.includes(expected), human.stderr);
+  assert.ok(human.stderr.includes(`${command('install', 'ppt-design')} --to zcode`), human.stderr);
 });
 
 test('幂等：同版本安装两次 → 第二次成功且结果一致', async (t) => {
@@ -387,9 +389,10 @@ test('其他宿主里的独立旧副本自动换成链接（replaced_copy），s
   const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design');
   const value = data(result);
   assert.deepEqual(value.installations, [{ name: 'ppt-design', path: primary, previous: null, version: '0.1.0' }]);
-  // 同名旧副本与改名副本都换成链接；旧副本位置标记 replaced_copy。
-  assert.deepEqual(value.links.map((item) => [item.path, item.existing, item.replaced_copy]).sort(),
-    [[old, false, true], [renamed, false, true], [path.join(f.home, '.trae', 'skills', 'ppt-design'), false, false]].sort());
+  // 同名旧副本与改名副本都换成链接；旧副本位置标记 replaced_copy（显式按路径排序对齐两侧）。
+  const byPath = (a, b) => a[0].localeCompare(b[0], 'en');
+  assert.deepEqual(value.links.map((item) => [item.path, item.existing, item.replaced_copy]).sort(byPath),
+    [[old, false, true], [renamed, false, true], [path.join(f.home, '.trae', 'skills', 'ppt-design'), false, false]].sort(byPath));
   for (const directory of [old, renamed]) assert.equal(await readDirectoryLink(directory), primary);
   status = data(await f.run(['status', '--json']));
   assert.deepEqual(status.warnings, []);
@@ -450,6 +453,8 @@ test('开发目录作为主安装 → 跳过并解释，其他宿主直接链到
   for (const host of ['.claude', '.trae']) assert.equal(await readDirectoryLink(path.join(f.home, host, 'skills', 'ppt-design')), repository);
   assert.equal(await readFile(path.join(repository, 'SKILL.md'), 'utf8'), before);
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '开发目录跳过时不应发起下载');
+  // 纯链接路径（无实体动作）：连版本表都不打。
+  assert.ok(!f.state.requests.some((r) => r.path === '/api/store/versions'), '纯链接路径不打版本表');
 });
 
 test('未知占用目录（链接宿主里无关内容占着同名位置）→ occupied 拒绝替换，已完成目标一并回滚', async (t) => {
@@ -551,4 +556,144 @@ test('多目标事务（链接已创建后后续动作失败）：已创建链�
     assert.ok(!(await lstat(directory)).isSymbolicLink(), `${directory} 不应残留链接`);
   }
   for (const root of [rootA, rootB, rootC]) assert.deepEqual(await stageLeftovers(root), []);
+});
+
+// 三路审查修复（任务 7 补丁轮）。
+
+test('overlap 预检前移：--to 目标互相包含 → 下载之前报 overlappingTargets，目标不可达', async (t) => {
+  const f = await fixture(t);
+  const outer = path.join(f.cwd, 'skills'), nested = path.join(outer, 'ppt-design');
+  const result = await f.run(['install', 'ppt-design', '--to', outer, '--to', nested, '--json']);
+  assert.equal(result.code, 2);
+  assert.equal(data(result).error, 'overlapping_targets');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '预检应在下载之前');
+  assert.equal(await exists(nested), null, '不应创建嵌套目标');
+  assert.deepEqual(await stageLeftovers(outer), []);
+});
+
+test('realInstallation：主安装位置是用户自建链接指向同名 skill 的普通目录 → 实体更新真实目标，自建链接保留', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.1');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.installations.map((item) => [item.path, item.previous, item.version]), [[real, '0.0.1', '0.1.0']]);
+  assert.match(await readFile(path.join(real, 'SKILL.md'), 'utf8'), /0\.1\.0/);
+  // 自建链接原样保留；其余宿主链接到主安装位置（经它解析到同一实体）。
+  assert.ok((await lstat(linked)).isSymbolicLink());
+  assert.equal(await readDirectoryLink(linked), real);
+  for (const host of ['.claude', '.trae']) assert.equal(await readDirectoryLink(path.join(f.home, host, 'skills', 'ppt-design')), linked);
+  const status = data(await f.run(['status', '--json']));
+  assert.equal(status.installations.length, 1);
+  assert.equal(status.installations[0].real_path, await realpath(real));
+});
+
+test('链接宿主位的悬空 symlink → occupied 整批失败（fail-closed），悬空链接原样保留且不下载', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const dangling = path.join(f.home, '.claude', 'skills', 'ppt-design');
+  const missing = path.join(f.temporary, 'missing');
+  await mkdir(path.dirname(dangling), { recursive: true });
+  await linkDirectory(missing, dangling);
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'occupied');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '占用预检应在下载之前');
+  assert.ok((await lstat(dangling)).isSymbolicLink(), '悬空链接应原样保留');
+  assert.equal(await readDirectoryLink(dangling), missing);
+  assert.equal(await exists(path.join(f.home, '.zcode', 'skills', 'ppt-design')), null, '整批失败不留安装');
+});
+
+test('多目标事务（linkDirectory 注入失败）：旧副本完整还原、无链接残留、stage 清空', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-multi-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const rootA = path.join(base, 'a'), rootB = path.join(base, 'b');
+  await mkdir(rootA); await mkdir(rootB);
+  const primary = await writeSkill(rootA, 'ppt-skill', '0.0.1');
+  const copy = await writeSkill(rootB, 'ppt-skill', '0.0.2');
+  const incoming = await mkdtemp(path.join(tmpdir(), 'hy-incoming-'));
+  t.after(() => rm(incoming, { recursive: true, force: true }));
+  const source = await writeSkill(incoming, 'ppt-skill', '0.1.0');
+  const actions = [
+    { name: 'ppt-skill', path: primary, source, previousName: 'ppt-skill', previousVersion: '0.0.1' },
+    { name: 'ppt-skill', path: copy, link: primary, previousName: 'ppt-skill', previousVersion: '0.0.2' },
+  ];
+  const linkDirectory = async () => { throw Object.assign(new Error('injected'), { code: 'EPERM' }); };
+  const error = await replaceAll(actions, { linkDirectory, names: ['ppt-skill'] }).catch((error) => error);
+  assert.equal(error.error, 'replace');
+  assert.match(await readFile(path.join(primary, 'SKILL.md'), 'utf8'), /0\.0\.1/);
+  assert.match(await readFile(path.join(copy, 'SKILL.md'), 'utf8'), /0\.0\.2/);
+  assert.ok(!(await lstat(copy)).isSymbolicLink(), '旧副本位置不应残留链接');
+  assert.deepEqual(await stageLeftovers(rootA), []);
+  assert.deepEqual(await stageLeftovers(rootB), []);
+});
+
+test('askTarget 拼写提示：输入与宿主 id 编辑距离 1 → 提示建议 id，本次仍按路径处理', async (t) => {
+  const f = await fixture(t);
+  const result = await f.run(['install', 'ppt-design'], {}, { interactive: true, answers: ['zcod', ''] });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /疑似宿主 zcode 的拼写误差/);
+  assert.ok(result.stdout.includes('zcod'), '提示里带用户输入的原样路径');
+  // 输入按路径语义处理：装到 ./zcod（不误当 zcode 宿主）。
+  assert.match(await readFile(path.join(f.cwd, 'zcod', 'ppt-design', 'SKILL.md'), 'utf8'), /version: "0\.1\.0"/);
+  assert.equal(await exists(path.join(f.home, '.zcode')), null, '不应误建 zcode 宿主目录');
+});
+
+test('replaceAll 观察位 onStage：事务期间上报暂存目录，供二次中断时定位备份', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-multi-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const rootA = path.join(base, 'a'), rootB = path.join(base, 'b');
+  await mkdir(rootA); await mkdir(rootB);
+  const primary = await writeSkill(rootA, 'ppt-skill', '0.0.1');
+  const copy = await writeSkill(rootB, 'ppt-skill', '0.0.2');
+  const incoming = await mkdtemp(path.join(tmpdir(), 'hy-incoming-'));
+  t.after(() => rm(incoming, { recursive: true, force: true }));
+  const source = await writeSkill(incoming, 'ppt-skill', '0.1.0');
+  const actions = [
+    { name: 'ppt-skill', path: primary, source, previousName: 'ppt-skill', previousVersion: '0.0.1' },
+    { name: 'ppt-skill', path: copy, link: primary, previousName: 'ppt-skill', previousVersion: '0.0.2' },
+  ];
+  const stages = [];
+  const warnings = await replaceAll(actions, { onStage: (stage) => stages.push(stage), names: ['ppt-skill'] });
+  assert.deepEqual(warnings, []);
+  assert.equal(stages.length, 2, '每个动作上报一个暂存目录');
+  for (const stage of stages) assert.ok(path.basename(stage).startsWith('.hy-stage-'), stage);
+  // 事务结束后暂存目录全部清理。
+  for (const stage of stages) assert.equal(await exists(stage), null);
+});
+
+test('二次中断提示行：只列确实带有备份（old）的暂存目录；无备份不打行', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-interrupt-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const withBackup = path.join(base, '.hy-stage-a'), without = path.join(base, '.hy-stage-b');
+  await mkdir(path.join(withBackup, 'old'), { recursive: true });
+  await mkdir(without, { recursive: true });
+  const line = interruptBackups([without, withBackup]);
+  assert.ok(line.includes(withBackup), line);
+  assert.ok(!line.includes(without), '没有备份的暂存目录不上提示行');
+  assert.equal(interruptBackups([]), null);
+  assert.equal(interruptBackups([without]), null);
+});
+
+test('RESERVED 下沉进 isSkillName：保留设备名在参数解析与 catalog 契约校验处一致拒绝', async (t) => {
+  const f = await fixture(t);
+  // install <保留名>：用法错误（exit 2）。
+  for (const reserved of ['con', 'nul', 'aux', 'com1', 'lpt9']) {
+    const result = await f.run(['install', reserved, '--json']);
+    assert.equal(result.code, 2, reserved);
+    assert.equal(data(result).error, 'usage');
+  }
+  // 合法边界不受影响：com10、console 不是保留名。
+  assert.equal(isSkillName('com10'), true);
+  assert.equal(isSkillName('console'), true);
+  // catalog 里出现保留名 skill → invalid_response（语义收紧：安装/目录消费端不再接受保留名）。
+  f.state.catalog.push({ id: 'device', name: '设备名', summary: '保留名。', summaryEn: 'Reserved.',
+    free: { skill: 'con' }, paid: null, offer: [], prices: {} });
+  const result = await f.run(['status', '--json']);
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'invalid_response');
 });

@@ -1,6 +1,7 @@
 import { t, withLanguage, resolveLanguage, command, helpLines, skillLabel, planLabel, priceLabel as formatPrice } from './i18n.js';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { existsSync, writeSync } from 'node:fs';
 import { lstat, readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
@@ -8,8 +9,8 @@ import { Client, catalogNames, findSkill, isSkillName, isVersion } from './clien
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory } from './skills.js';
-import { targetRoot, installationRoots } from './hosts.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory } from './skills.js';
+import { targetRoot, installationRoots, nearestHostId } from './hosts.js';
 import { directoryKey, sameDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
 
@@ -186,49 +187,42 @@ async function apply(ctx, actions, versions) {
       prepared.set(name, await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal));
     }
     return await replaceAll(actions.map((action) => ({ ...action, source: action.remove || action.link ? undefined : prepared.get(action.name).source })),
-      { signal: ctx.signal, names: ctx.names });
+      { signal: ctx.signal, names: ctx.names, onStage: ctx.observeStage });
   } finally {
     for (const item of prepared.values()) await item.cleanup().catch(() => {});
   }
 }
 
-// 多目标安装（任务 7 完整版，机制对齐 template）：--to 可多次（第一个目标放实体，其余链接）；
-// 无 --to 时按宿主表优先序自动发现已存在的宿主（zcode 最先）。其他目标里的同名/改名独立旧副本
-// 自动换成链接，已有正确链接幂等跳过；被保护位置跳过并解释原因。
-async function install(ctx, name = ctx.options.skill) {
-  const { product, paid } = findSkill(ctx.catalog, name);
-  // 付费前置拦截（设计「分期计划」：一期付费=引导非购买）：不进 402/checkout 流程，exit 3 附商品页。
-  // 闸门先于 --to 校验：一期语义下付费 skill 无论参数对错都应先得到购买引导，而不是用法报错。
-  if (paid) {
-    const url = ctx.client.subscriptionUrl(name, product);
-    throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
-  }
+// roots 解析：--to 多值（第一个目标放实体、其余链接）或按宿主表优先序自动发现已存在宿主（zcode 最先）；
+// 都没有时非交互报 missing_target（推荐命令沿用 nextCommand，保留 --json/--lang 等原始标志，
+// Agent 重跑不丢通道），交互询问回落——输入似宿主 id 拼写错（编辑距离 1）给提示，仍按路径处理。
+async function resolveRoots(ctx) {
   let roots = ctx.options.to.length ? [...new Set(ctx.options.to.map((value) => targetRoot(value)))] : await installationRoots();
   if (!roots.length) {
-    const next = command('install', name, '--to', 'zcode');
+    const next = `${ctx.nextCommand} --to zcode`;
     const details = { recommended_path: targetRoot('zcode'), recommended_command: next, next_command: next };
     if (!ctx.interactive) throw new CliError(t('missingTarget', { next }), 2, 'missing_target', details);
     const answer = await ctx.ask(t('askTarget'), ctx.signal);
     if (!answer) throw new CliError(t('noTarget', { next }), 2, 'missing_target', details);
+    const suggestion = nearestHostId(answer);
+    if (suggestion) ctx.output.write({ typo_hint: { typed: answer, suggestion } }, [t('askTargetTypo', { typed: answer, suggestion })]);
     roots = [targetRoot(answer)];
   }
-  roots = await uniqueDirectories(roots);
+  return uniqueDirectories(roots);
+}
+
+// 动作规划（只读，不动文件系统）：primary 选举 + 实体/链接双循环。第一个能放下这个 Skill 的根
+// 放真实的一份，其余宿主用链接共享，更新一次全部生效；同名位置被别的东西占着（例如用户自建的
+// 链接指向别处）时顺延，不让其他宿主链到错误的内容上。链接根下的同名目录与改名独立副本换成链接；
+// 已是正确链接（解析到同一实体）幂等跳过；开发目录跳过并解释。安装本身是链接时更新其真实目标。
+async function planActions(ctx, name, roots) {
   const found = (await scan(ctx.names, roots)).filter((item) => item.name === name);
-  // 第一个能放下这个 Skill 的目录放真实的一份，其余宿主用链接共享，更新一次全部生效。
-  // 同名位置被别的东西占着（例如用户自建的链接指向别处）时顺延，不让其他宿主链到错误的内容上。
   let primaryIndex = 0;
   for (let i = 0; i < roots.length; i++) {
     const directory = path.join(roots[i], name);
     if (found.some((item) => sameDirectory(item.root, roots[i])) || !await lstatOrNull(directory) || (await inspectSkill(directory, ctx.names))?.name === name) { primaryIndex = i; break; }
   }
   const primaryRoot = roots[primaryIndex], linkRoots = roots.filter((root, index) => index !== primaryIndex);
-  const auto = !ctx.options.yes && !ctx.interactive;
-  if (ctx.interactive) ctx.output.write({ event: 'targets', paths: roots, primary: primaryRoot, links: linkRoots },
-    [t('targets'), primaryRoot, ...linkRoots.map((root) => t('targetLink', { path: root }))]);
-  if (!await ctx.confirm(t('confirmInstall', { name: skillLabel(name) }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
-    ctx.output.write({ cancelled: true }, [t('installCanceled')]);
-    return 0;
-  }
   const actions = [], skipped = [], links = [];
   const primaries = found.filter((item) => sameDirectory(item.root, primaryRoot));
   const candidates = primaries.length ? primaries : [{ name, path: path.join(primaryRoot, name), version: null }];
@@ -244,26 +238,62 @@ async function install(ctx, name = ctx.options.skill) {
     const directories = [...new Set([path.join(root, name), ...found.filter((item) => sameDirectory(item.root, root)).map((item) => item.path)])];
     for (const directory of directories) {
       const info = await lstatOrNull(directory);
-      // 已是正确的链接（解析到同一实体）→ 幂等跳过，不重建。
       if (info && directoryKey(await canonicalDirectory(directory)) === targetKey) { links.push({ name, path: directory, target, existing: true }); continue; }
       if (info && await isDevelopmentDirectory(directory)) { skipped.push(skippedInstallation({ name, path: directory })); continue; }
       const current = info ? await inspectSkill(directory, ctx.names) : null;
       actions.push({ name, path: directory, link: target, previousName: current?.name === name ? name : null, previousVersion: current?.version || null });
     }
   }
+  return { actions, skipped, links, primaryRoot, linkRoots };
+}
+
+// 多目标安装（任务 7 完整版，机制对齐 template）：resolveRoots 选根 → planActions 只读规划 →
+// 交互列目标并确认 → 预检（互相包含/占用/变化全部在下载之前）→ apply 批量事务 → 复扫与输出。
+async function install(ctx, name = ctx.options.skill) {
+  const { product, paid } = findSkill(ctx.catalog, name);
+  // 付费前置拦截（设计「分期计划」：一期付费=引导非购买）：不进 402/checkout 流程，exit 3 附商品页。
+  // 闸门先于 --to 校验：一期语义下付费 skill 无论参数对错都应先得到购买引导，而不是用法报错。
+  if (paid) {
+    const url = ctx.client.subscriptionUrl(name, product);
+    throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
+  }
+  const roots = await resolveRoots(ctx);
+  const { actions, skipped, links, primaryRoot, linkRoots } = await planActions(ctx, name, roots);
+  // --yes 是用户显式确认（不再提问）；auto_confirmed 只标记「非交互静默确认」——两者都不提问，
+  // 但静默确认需要提示行维持可见性，显式 --yes 是用户自己的决定，不需要提示。
+  const auto = !ctx.options.yes && !ctx.interactive;
+  if (ctx.interactive) ctx.output.write({ event: 'targets', paths: roots, primary: primaryRoot, links: linkRoots },
+    [t('targets'), primaryRoot, ...linkRoots.map((root) => t('targetLink', { path: root }))]);
+  if (!await ctx.confirm(t('confirmInstall', { name: skillLabel(name) }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
+    ctx.output.write({ cancelled: true }, [t('installCanceled')]);
+    return 0;
+  }
   if (!actions.length) {
     ctx.output.write({ installations: [], links, removed: [], skipped, warnings: [] }, [...linkedLines(links), ...skippedLines(skipped)]);
     return 0;
   }
-  // 占用预检前移（任务 6 审查语义在多目标下延续）：整批任一目标被无关内容占用时，下载整包之前
-  // 就失败，不给重定向目标任何被请求的机会；replaceAll 内的同名双检保留，作下载期间的竞态防线。
+  // 目标互相包含（如 --to X --to X/<skill>）：与 replaceAll 内的检查同源，前移到下载之前报用法错误；
+  // replaceAll 内的检查保留，作规划与执行之间的竞态防线。
+  const actionPaths = await Promise.all(actions.map(async (action) => directoryKey(await logicalDirectory(action.path))));
+  for (let i = 0; i < actionPaths.length; i++) {
+    for (let j = 0; j < actionPaths.length; j++) {
+      if (i === j) continue;
+      const relative = path.relative(actionPaths[i], actionPaths[j]);
+      if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) throw new CliError(t('overlappingTargets'), 2, 'overlapping_targets');
+    }
+  }
+  // 占用预检前移（任务 6 审查语义在多目标下延续）：整批任一目标被无关内容占用（含悬空链接——
+  // lstat 存在但读不出 Skill）时，下载整包之前就失败，不给重定向目标任何被请求的机会；
+  // replaceAll 内的同名双检保留，作下载期间的竞态防线。
   for (const action of actions) {
     const info = await lstatOrNull(action.path);
     const current = info ? await inspectSkill(action.path, ctx.names) : null;
     if (info && (!current || current.name !== action.previousName)) throw new CliError(t('occupied', { path: action.path }), 1, 'occupied', { path: action.path });
     if (!info && action.previousName) throw new CliError(t('changed', { path: action.path }), 1, 'changed', { path: action.path });
   }
-  const versions = await ctx.client.versions(ctx.catalog);
+  // 纯链接路径（无实体动作，如主安装是开发目录）：不下载，也不打版本表。
+  const downloads = actions.some((action) => !action.remove && !action.link);
+  const versions = downloads ? await ctx.client.versions(ctx.catalog) : {};
   const warnings = await apply(ctx, actions, versions);
   // 复扫全部根：报告配对冲突/多副本等需要全目录视角的警告（多副本提示带精确的合并命令）。
   const installed = await scan(ctx.names, roots);
@@ -283,14 +313,28 @@ async function install(ctx, name = ctx.options.skill) {
 // runtime 用于测试时注入时钟和终端交互；可执行入口不传测试选项。
 export const run = (argv, runtime = {}) => withLanguage(resolveLanguage(argv), () => runCommand(argv, runtime));
 
+// 二次中断的缓解（不改变「不完整回滚」的基线取舍，只补可见性）：同步落一行备份位置提示再强退，
+// 让用户找得到保留在暂存目录里的备份。只列确实带有备份（old 子目录）的暂存目录。
+export function interruptBackups(stages) {
+  const backups = stages.filter((stage) => existsSync(path.join(stage, 'old')));
+  return backups.length ? t('interruptBackups', { paths: backups.join('；') }) : null;
+}
+
 async function runCommand(argv, runtime) {
-  const tokenValues = argv.flatMap((arg, i) => arg === '--token' ? [argv[i + 1]] : arg.startsWith('--token=') ? [arg.slice(8)] : []);
+  const tokenValues = argv.flatMap((arg, i) => arg === '--token' ? [argv[i + 1]] : arg.startsWith('--token=') ? [argv.slice(8)] : []);
     const output = new Output(argv.includes('--json'), 'unknown', [process.env.HY_TOKEN, ...tokenValues]);
     const controller = new AbortController();
+    // 事务期间经 ctx.observeStage 上报的暂存目录：二次中断时据此提示备份位置。
+    const stages = [];
     let interrupts = 0;
     const cancel = () => {
-      // 第二次中断直接退出：清理与取消提示不该把用户扣住。
-      if (++interrupts > 1) process.exit(130);
+      // 第二次中断直接退出：清理与取消提示不该把用户扣住。退出前同步（writeSync）打一行
+      // 备份位置——此时回滚可能未完成，用户需要能找到备份（同步写保证强退前一定落盘）。
+      if (++interrupts > 1) {
+        const notice = interruptBackups(stages);
+        if (notice) writeSync(2, `${notice}\n`);
+        process.exit(130);
+      }
       controller.abort();
     };
     process.on('SIGINT', cancel);
@@ -311,7 +355,8 @@ async function runCommand(argv, runtime) {
       client: new Client(controller.signal),
       openBrowser: runtime.openBrowser || ((url, timeoutMs) => openBrowser(url, undefined, undefined, timeoutMs)),
       sleep: runtime.sleep || delay, now: runtime.now || Date.now,
-      confirm: runtime.confirm || confirm, ask: runtime.ask || ask };
+      confirm: runtime.confirm || confirm, ask: runtime.ask || ask,
+      observeStage: (stage) => stages.push(stage) };
     if (options.command === 'logout') return await logout(ctx);
     if (options.command === 'login') return await login(ctx, options.token);
     if (options.command === 'status' || options.command === 'list' || options.command === 'install') {

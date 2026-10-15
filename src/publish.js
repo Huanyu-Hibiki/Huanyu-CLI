@@ -10,7 +10,7 @@ import { pipeline } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CliError } from './io.js';
-import { inspectSkill, parseSkill, isSkillName, compare } from './skills.js';
+import { inspectSkill, parseSkill, isSkillName, isReservedSkillName, compare } from './skills.js';
 import { validateArchive } from './archive.js';
 import { tarInvocation, resolveDirectory } from './platform.js';
 import { catalogNames } from './client.js';
@@ -24,20 +24,19 @@ export const RAW_SIZE_LIMIT = 400 * 1024 * 1024;
 const SKILL_LIMIT = 1024 * 1024;
 // 打包时排除的开发与系统垃圾（发现即警告，不阻断）。
 const JUNK = new Set(['.git', '.DS_Store', 'Thumbs.db']);
-// Windows 保留设备名不能作为安装目录：规范名两条来源（frontmatter/目录推导）都拒绝。
-const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 
 // 规范名映射（设计「命名规范化」）：frontmatter 有合法 name 以其为准；否则由目录名推导
 // （小写化并去掉 [a-z0-9-] 以外的字符）。推导名必须以小写字母开头：纯数字开头或清理后为空都拒绝，
-// 避免把偶然的目录名发布成规范名。
+// 避免把偶然的目录名发布成规范名。保留设备名检查已下沉 skills.isSkillName（全链一致），
+// 这里对显式声明单独报 reserved_name，不静默回落到目录推导。
 export function canonicalName(dirName, frontmatterName) {
-  if (frontmatterName !== null && frontmatterName !== undefined && isSkillName(frontmatterName)) {
-    if (RESERVED.test(frontmatterName)) throw new CliError(t('reservedName', { name: frontmatterName }), 1, 'reserved_name');
-    return frontmatterName;
+  if (frontmatterName !== null && frontmatterName !== undefined) {
+    if (isReservedSkillName(frontmatterName)) throw new CliError(t('reservedName', { name: frontmatterName }), 1, 'reserved_name');
+    if (isSkillName(frontmatterName)) return frontmatterName;
   }
   const derived = dirName.toLowerCase().replace(/[^a-z0-9-]/g, '');
   if (!/^[a-z][a-z0-9-]*$/.test(derived)) throw new CliError(t('invalidName', { directory: dirName }), 1, 'invalid_skill_name');
-  if (RESERVED.test(derived)) throw new CliError(t('reservedName', { name: derived }), 1, 'reserved_name');
+  if (isReservedSkillName(derived)) throw new CliError(t('reservedName', { name: derived }), 1, 'reserved_name');
   return derived;
 }
 

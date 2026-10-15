@@ -76,15 +76,16 @@ export async function prepare(client, name, release, token, paid, product, signa
 
 async function exists(file) {
   try { return await lstat(file); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null; throw error; }
 }
 
 // 在目标文件系统上暂存新目录和备份，跨多个目标一起提交或回滚（设计「错误处理」：
 // 暂存前 + 每次 rename 前双重保护、失败逆序回滚、回滚失败保留备份并报 recovery_paths）。
 // action.link 表示在 path 放一个指向主安装的目录链接（Windows 用 junction），而不是复制一份
-// （任务 7 多宿主共享使用，结构保留）。renameFile、linkDirectory 可供测试注入真实的中途失败。
+// （任务 7 多宿主共享使用，结构保留）。renameFile、linkDirectory 可供测试注入真实的中途失败；
+// onStage 在每个暂存目录创建时上报（二次中断时 cli 侧据此提示备份位置）。
 const systemLink = (target, directory) => symlink(target, directory, process.platform === 'win32' ? 'junction' : 'dir');
-export async function replaceAll(actions, { renameFile = rename, linkDirectory = systemLink, signal, names = [] } = {}) {
+export async function replaceAll(actions, { renameFile = rename, linkDirectory = systemLink, signal, names = [], onStage } = {}) {
   // 在暂存前检查整批目标；在每次 rename 前再检查，防止下载期间变成开发目录。
   const protect = async (action) => {
     const directory = action.path;
@@ -110,6 +111,7 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
       await mkdir(path.dirname(action.path), { recursive: true });
       const stage = await mkdtemp(path.join(path.dirname(action.path), '.hy-stage-'));
       staging.push(stage);
+      onStage?.(stage);
       const transaction = { ...action, stage, backup: path.join(stage, 'old'), incoming: path.join(stage, 'new'), movedOld: false, movedNew: false };
       transactions.push(transaction);
       if (action.source) await cp(action.source, transaction.incoming, { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true });

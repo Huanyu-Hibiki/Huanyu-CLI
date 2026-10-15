@@ -6,7 +6,11 @@ import { directoryKey } from './platform.js';
 import { HOSTS, targetRoot, discoveryRoots, projectRootsOf } from './hosts.js';
 
 // 规范名（设计「数据模型」）：^[a-z0-9][a-z0-9-]*$；语义化版本（无前缀/后缀）。
-export const isSkillName = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(value);
+// Windows 保留设备名（con/nul/aux/com1 等，后随点或结尾）不能作为安装目录：
+// 检查从 publish.canonicalName 下沉到这里，参数解析、catalog 契约校验、发布归一化、安装全链一致拒绝。
+const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+export const isReservedSkillName = (value) => typeof value === 'string' && RESERVED.test(value);
+export const isSkillName = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(value) && !RESERVED.test(value);
 export const isVersion = (value) => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value);
 
 function scalar(value) {

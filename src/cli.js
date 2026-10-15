@@ -285,7 +285,13 @@ async function apply(ctx, actions, versions, { purchaseOnInactive = false, manag
         if (!purchaseOnInactive || !paid || !(error instanceof CliError) || (error.details.http_status !== 402 && error.error !== 'inactive')) throw error;
         await requirePurchase(ctx, name, { force: true });
         invalidateAccount(ctx);
-        item = await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal);
+        try { item = await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal); }
+        catch (retry) {
+          // 购买已确认但重试仍失败（履约竞态/下载中断，任务 7 登记）：错误附 hint——重跑原命令即完成
+          // 安装，不会重复收费。购买已在服务端落地，用户此时最需要的是这句话而不是重走付款流程的暗示。
+          if (retry instanceof CliError) throw new CliError(retry.message, retry.code, retry.error, { ...retry.details, hint: t('purchasedRerunHint', { name: skillLabel(name) }) });
+          throw retry;
+        }
       }
       prepared.set(name, item);
     }

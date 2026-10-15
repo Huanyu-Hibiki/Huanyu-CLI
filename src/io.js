@@ -48,8 +48,10 @@ export class Output {
   }
   fail(error) {
     const known = error instanceof CliError;
+    // details.hint（任务 7 登记）：错误之外的下一步指引行（如已购后的重跑即装提示），随消息一起输出。
     this.write({ error: known ? error.error : 'failed', message: known ? error.message : t('failed'), ...(known ? error.details : {}) },
-      [known ? error.message : t('failed'), ...(error.details?.recovery_paths || []).map((p) => t('recovery', { path: p }))], false);
+      [known ? error.message : t('failed'), ...(known && error.details?.hint ? [error.details.hint] : []),
+        ...(error.details?.recovery_paths || []).map((p) => t('recovery', { path: p }))], false);
     return known ? error.code : 1;
   }
 }

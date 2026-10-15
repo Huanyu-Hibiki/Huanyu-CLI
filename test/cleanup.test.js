@@ -90,7 +90,9 @@ test('402 竞态：闸门放行（me 已列）→ 下载 402 → 内联购买确
   assert.deepEqual(output.at(-1).installations, [{ name: 'ppt-design-pro', path: path.join(root(f, 'zcode'), 'ppt-design-pro'), previous: null, version: '0.2.0' }]);
 });
 
-test('重复 402 不重复购买：购买后重试仍 402 → 原错误透出（exit 3 inactive），整个进程只购买一次', async (t) => {
+// 任务 7 登记落地：已确认购买后的重试失败附 hint（JSON 字段）——用户刚付完款，
+// 「尚未购买」的字面会误导；重跑原命令即完成安装、不会重复收费才是正确指引。
+test('重复 402 不重复购买：购买后重试仍 402 → 原错误透出（exit 3 inactive）附重跑指引 hint，整个进程只购买一次', async (t) => {
   const f = await fixture(t);
   await publishPaid(f);
   f.state.downloadInactiveCount = 2; // 购买履约后第二次下载仍 402：不再进入第二次购买
@@ -98,9 +100,22 @@ test('重复 402 不重复购买：购买后重试仍 402 → 原错误透出（
   assert.equal(result.code, 3);
   const output = events(result);
   assert.equal(output.at(-1).error, 'inactive');
+  assert.match(output.at(-1).hint, /^已购买 ppt-design-pro：重新运行原命令即可完成安装，不会重复收费。$/);
   assert.equal(f.state.checkoutRequests, 1, '重试的 402 不再触发第二次购买');
   assert.equal(f.state.requests.filter((r) => r.path === '/api/store/download/ppt-design-pro').length, 2);
   assert.equal(await exists(path.join(f.home, '.zcode')), null, '目标不可达');
+});
+
+// 任务 7 登记落地（文案面）：已购后的重试失败在人类输出里带独立 hint 行——刚付完款的用户
+// 第一眼该看到「重跑即装、不会重复收费」，而不是只有「尚未购买」。
+test('购买后重试失败的人类输出：hint 作为独立行跟随错误消息（stderr）', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.downloadInactiveCount = 2;
+  const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN });
+  assert.equal(human.code, 3);
+  assert.match(human.stderr, /已购买 ppt-design-pro：重新运行原命令即可完成安装，不会重复收费。/);
+  assert.ok(human.stderr.includes('\n'), 'hint 与错误消息分行');
 });
 
 test('update 付费更新清理同宿主用户与项目根的免费版；跨宿主（qwenwork）不误清', async (t) => {

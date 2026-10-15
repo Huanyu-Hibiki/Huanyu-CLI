@@ -83,6 +83,8 @@ export const dictionary = {
   paymentWait: ['等待购买生效，每 3 秒检查一次；最长等待 {duration}，按 Ctrl+C 取消。', 'Checking your purchase every 3 seconds for up to {duration}; press Ctrl+C to cancel.'],
   expiredCheckout: ['付款页面已过期，请重新运行刚才的命令。', 'The payment page has expired. Run the same command again.'],
   invalidCheckout: ['付款信息不完整，请重试。', 'Payment details are incomplete. Please retry.'],
+  // 任务 7 登记落地：已确认购买后的安装失败附在错误 details.hint——重跑原命令即完成安装，不会重复收费。
+  purchasedRerunHint: ['已购买 {name}：重新运行原命令即可完成安装，不会重复收费。', 'Already purchased {name}: rerun the same command to finish installing; you will not be charged twice.'],
   invalidCheckoutStatus: ['付款状态无法读取，请重试。', 'Could not read the payment status. Please retry.'],
   freePurchase: ['{name} 是免费 Skill，无需购买。', '{name} is free; no purchase needed.'],
   unknownPlan: ['这个产品没有 {plan} 方案。', 'This product has no {plan} plan.'],

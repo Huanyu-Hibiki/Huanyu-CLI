@@ -1,6 +1,7 @@
 {
   "name": "huanyu-cli",
   "version": "0.1.0",
+  "description": "安装、更新和管理 Huanyu 商店里的 Skill",
   "type": "module",
   "bin": {
     "hy": "bin/hy.js"
@@ -13,8 +14,7 @@
   },
   "files": [
     "bin/",
-    "src/",
-    "README"
+    "src/"
   ],
   "repository": {
     "type": "git",

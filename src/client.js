@@ -72,8 +72,10 @@ export class Client {
     this.signal.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(abort, download ? 120_000 : timeoutMs);
     const dispose = () => { clearTimeout(timer); this.signal.removeEventListener('abort', abort); };
-    // 二进制体（Uint8Array/Buffer）按原始字节发送并由调用方提供配套头；其余按 JSON 编码。
+    // 二进制体（Uint8Array/Buffer）按原始字节发送；Web 流式体由调用方提供 Content-Type；
+    // 其余按 JSON 编码。
     const binary = body instanceof Uint8Array;
+    const streaming = typeof ReadableStream !== 'undefined' && body instanceof ReadableStream;
     let handedOff = false;
     try {
       const address = /^https?:\/\//.test(route) ? route : this.url(route);
@@ -81,9 +83,10 @@ export class Client {
       const response = await fetch(address, {
         method,
         headers: { 'Accept-Language': this.lang,
-          ...(body !== undefined ? { 'Content-Type': binary ? 'application/gzip' : 'application/json' } : {}),
+          ...(body !== undefined && !streaming ? { 'Content-Type': binary ? 'application/gzip' : 'application/json' } : {}),
           ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
-        ...(body !== undefined ? { body: binary ? body : JSON.stringify(body) } : {}), signal: controller.signal,
+        ...(body !== undefined ? { body: streaming || binary ? body : JSON.stringify(body) } : {}), ...(streaming ? { duplex: 'half' } : {}),
+        signal: controller.signal,
         redirect: download && !token ? 'follow' : 'error',
       });
       if (download && response.ok) { handedOff = true; return { response, dispose }; }
@@ -126,16 +129,17 @@ export class Client {
     if (typeof data?.email !== 'string' || !data.email || !Array.isArray(data.subscriptions) || typeof data.publisher !== 'boolean') throw invalid(t('invalidAccount'));
     return data;
   }
-  // 发布上传（设计「接口设计·发布端」）：体为 tar.gz 二进制，名字/版本/摘要在 X- 头里；
-  // 错误语义 409 version_exists / 403 not_a_publisher / 400 invalid_package / 413 too_large 由调用方映射。
-  async publish(token, { name, version, sha256, body, notes }) {
+  // 发布上传（设计「接口设计·发布端」）：体为 tar.gz 二进制（Web 流式，不整体驻留内存），
+  // 名字/版本/摘要在 X- 头里；错误语义 409 version_exists / 403 not_a_publisher / 400 invalid_package /
+  // 413 too_large 由调用方映射。size 用于响应复核（流式体没有可直接比对的字节数）。
+  async publish(token, { name, version, sha256, size, body, notes }) {
     const data = await this.request('/api/store/publish', {
       token, method: 'POST', body, timeoutMs: 120_000,
       // 说明文本经百分号编码放进头：HTTP 头不接受非 ASCII 字节。
-      headers: { 'X-Skill-Name': name, 'X-Skill-Version': version, 'X-Content-SHA256': sha256, ...(notes ? { 'X-Notes': encodeURIComponent(notes) } : {}) },
+      headers: { 'Content-Type': 'application/gzip', 'X-Skill-Name': name, 'X-Skill-Version': version, 'X-Content-SHA256': sha256, ...(notes ? { 'X-Notes': encodeURIComponent(notes) } : {}) },
     });
     if (data?.skill !== name || data?.version !== version || data?.sha256 !== sha256
-      || !Number.isSafeInteger(data?.size) || data.size !== body.length || typeof data?.url !== 'string' || !data.url) throw invalid(t('publishResponse'));
+      || !Number.isSafeInteger(data?.size) || data.size !== size || typeof data?.url !== 'string' || !data.url) throw invalid(t('publishResponse'));
     return data;
   }
 }

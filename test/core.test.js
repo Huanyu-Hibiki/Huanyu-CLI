@@ -80,6 +80,11 @@ test('规范名映射：frontmatter 合法 name 优先；目录名小写化并�
     for (const bad of ['1abc', '2024-notes', '中文', '-x', '___', '']) {
       assert.throws(() => canonicalName(bad, null), (error) => error instanceof CliError && error.error === 'invalid_skill_name', bad);
     }
+    // Windows 保留设备名不能当安装目录：推导与 frontmatter 两条路都拒绝。
+    for (const reserved of ['con', 'aux', 'nul', 'com1', 'lpt9']) {
+      assert.throws(() => canonicalName(reserved, null), (error) => error instanceof CliError && error.error === 'reserved_name', reserved);
+    }
+    assert.throws(() => canonicalName('anything', 'prn'), (error) => error instanceof CliError && error.error === 'reserved_name');
   });
 });
 

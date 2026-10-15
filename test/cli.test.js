@@ -194,6 +194,7 @@ test('publish 参数面：目录与 --repo 互斥、--all/--check 依赖 --repo 
     [['status', '--check'], 'usage'],
     [['login', '--notes', '说明'], 'usage'],
     [['--version', '--repo', 'x'], 'usage'],
+    [['publish', 'dir', '--notes', 'x'.repeat(2001)], 'usage'],
   ]) {
     const result = await run([...args, '--json']);
     assert.equal(result.code, 2, args.join(' '));
@@ -201,6 +202,7 @@ test('publish 参数面：目录与 --repo 互斥、--all/--check 依赖 --repo 
   }
   assert.match((await run(['publish'])).stderr, /publish 需要一个 Skill 目录，或用 --repo <路径> 指向仓库。/);
   assert.match((await run(['publish', '--repo'], { HY_LANG: 'en' })).stderr, /--repo requires a value\./);
+  assert.match((await run(['publish', 'dir', '--notes', 'x'.repeat(2001)])).stderr, /--notes 不能超过 2000 字符。/);
 });
 
 test('未实现命令执行时退出码 2，error 为 not_implemented 并使用中性文案', async () => {

@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, copyFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { validateArchive } from '../src/archive.js';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -144,9 +145,21 @@ export async function fixture(t) {
         if (injected) return error(res, status, injected, '注入的发布失败。');
         if (!state.publishers.has(token)) return error(res, 403, 'not_a_publisher', '没有发布权限。');
         const name = req.headers['x-skill-name'], version = req.headers['x-skill-version'], sha256 = req.headers['x-content-sha256'];
-        if (!/^[a-z0-9][a-z0-9-]*$/.test(String(name || '')) || !/^\d+\.\d+\.\d+$/.test(String(version || ''))
+        // Windows 保留设备名不能当安装目录：服务端同样拒绝（客户端 canonicalName 已拦，这里是最终验证）。
+        if (!/^[a-z0-9][a-z0-9-]*$/.test(String(name || '')) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(String(name || ''))
+          || !/^\d+\.\d+\.\d+$/.test(String(version || ''))
           || !/^[0-9a-f]{64}$/.test(String(sha256 || '')) || !String(req.headers['content-type'] || '').startsWith('application/gzip')) return error(res, 400, 'invalid_package', '发布头不完整。');
         if (createHash('sha256').update(raw).digest('hex') !== sha256) return error(res, 400, 'invalid_package', '摘要不一致。');
+        // 服务端是最终验证者：对上传的归档复跑安装侧同一验证器。
+        const scratch = await mkdtemp(path.join(tmpdir(), 'hy-fixture-'));
+        try {
+          const upload = path.join(scratch, 'upload.tar.gz');
+          await writeFile(upload, raw);
+          try { await validateArchive(upload, String(name)); }
+          catch { return error(res, 400, 'invalid_package', '包未通过服务端验证。'); }
+        } finally {
+          await rm(scratch, { recursive: true, force: true });
+        }
         const existing = state.published.get(`${name}:${version}`);
         if (existing) {
           // 设计「假设清单」#1：同 sha256 重传幂等成功；内容不同才是版本冲突。
@@ -158,8 +171,14 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname.startsWith('/releases/')) {
         const match = url.pathname.match(/^\/releases\/(.+)-(\d+\.\d+\.\d+)\.tar\.gz$/);
-        const entry = match ? state.published.get(`${match[1]}:${match[2]}`) : null;
+        const name = match?.[1];
+        const entry = match ? state.published.get(`${name}:${match[2]}`) : null;
         if (!entry) return error(res, 404, 'not_found', '没有该版本。');
+        // 付费 skill 的发布物走订阅鉴权（与下载端语义一致，任务 6/7 铺垫）；免费与未入目录的保持公开。
+        if (state.catalog.some((product) => product.paid?.skill === name)) {
+          if (!authenticate()) return;
+          if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
+        }
         res.writeHead(200, { 'Content-Type': 'application/gzip' });
         return res.end(entry.body);
       }

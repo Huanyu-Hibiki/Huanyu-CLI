@@ -53,6 +53,8 @@ export function parseArgs(argv) {
     if (options.directory && options.repo !== null) throw new CliError(t('wrongArgument'), 2, 'usage');
     if ((options.all || options.check) && options.repo === null) throw new CliError(t('wrongArgument'), 2, 'usage');
     if (options.all && options.check) throw new CliError(t('wrongArgument'), 2, 'usage');
+    // 说明文本经 HTTP 头上传，长度有硬上限。
+    if (options.notes !== null && options.notes.length > 2000) throw new CliError(t('notesTooLong'), 2, 'usage');
   }
   if (positions.length || (options.to.length && options.command !== 'install') || (options.token !== null && options.command !== 'login') || (options.plan !== null && options.command !== 'subscribe') || (options.path !== null && options.command !== 'update') || (options.repo !== null && options.command !== 'publish') || (options.notes !== null && options.command !== 'publish') || ((options.all || options.check) && options.command !== 'publish')) throw new CliError(t('wrongArgument'), 2, 'usage');
   return options;
@@ -138,11 +140,16 @@ export const run = (argv, runtime = {}) => withLanguage(resolveLanguage(argv), (
 
 async function runCommand(argv, runtime) {
   const tokenValues = argv.flatMap((arg, i) => arg === '--token' ? [argv[i + 1]] : arg.startsWith('--token=') ? [arg.slice(8)] : []);
-  const output = new Output(argv.includes('--json'), 'unknown', [process.env.HY_TOKEN, ...tokenValues]);
-  const controller = new AbortController();
-  const cancel = () => controller.abort();
-  process.once('SIGINT', cancel);
-  process.once('SIGTERM', cancel);
+    const output = new Output(argv.includes('--json'), 'unknown', [process.env.HY_TOKEN, ...tokenValues]);
+    const controller = new AbortController();
+    let interrupts = 0;
+    const cancel = () => {
+      // 第二次中断直接退出：清理与取消提示不该把用户扣住。
+      if (++interrupts > 1) process.exit(130);
+      controller.abort();
+    };
+    process.on('SIGINT', cancel);
+    process.on('SIGTERM', cancel);
   try {
     const options = parseArgs(argv);
     output.command = options.command;

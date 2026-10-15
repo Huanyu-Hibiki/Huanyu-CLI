@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, writeFile, readFile, readdir, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { gzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { fixture, TOKEN, TOKEN2 } from './fixture.js';
 import { validateArchive } from '../src/archive.js';
+import { packSkill } from '../src/publish.js';
 
 const data = (result) => {
   assert.equal(result.signal, null, result.stderr);
@@ -199,6 +201,8 @@ test('409 version_exists：同版本不同内容单目录报错；同 sha256 重
   assert.equal(conflict.code, 1);
   assert.equal(data(conflict).error, 'version_exists');
   assert.match(data(conflict).message, /ppt-design 0\.2\.0 已发布且内容不同/);
+  // 重新检出/跨机器重打包字节可能不同属正常：文案要解释这一点。
+  assert.match(data(conflict).message, /重新检出.*属正常现象/);
   assert.equal(f.state.published.size, 1);
 
   // 内容未变：同 sha256 重传视为幂等成功（设计「假设清单」#1）。
@@ -342,19 +346,155 @@ test('publish --repo --all 遇 409 跳过该版本并继续整批；裸 --repo �
   assert.equal(publishRequests(f).length, 2);
 });
 
-test('两个目录推导出同一规范名：拒绝并列出冲突目录', async (t) => {
+test('目录推导规范名冲突：一次性列出全部冲突组', async (t) => {
   const f = await fixture(t);
   const repo = path.join(f.temporary, 'skills-repo');
   await mkdir(repo);
-  // Windows 文件系统不区分大小写，PPT-design 与 ppt-design 是同一目录；用下划线变体制造真实冲突。
+  // Windows 文件系统不区分大小写，同组冲突用下划线/大小写变体构造真实的不同目录。
   await makeSkill(repo, 'PPT-design', { version: '0.2.0' });
   await makeSkill(repo, 'P_P_T-design', { version: '0.2.0' });
+  await makeSkill(repo, 'Group_A', { version: '0.1.0' });
+  await makeSkill(repo, 'groupa', { version: '0.1.0' });
   const result = await f.run(['publish', '--repo', repo, '--check', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(result.code, 1);
   const value = data(result);
   assert.equal(value.error, 'name_conflict');
-  assert.equal(value.name, 'ppt-design');
-  assert.deepEqual([...value.paths].sort(), ['PPT-design', 'P_P_T-design']);
-  assert.match(value.message, /同一规范名 ppt-design/);
+  assert.deepEqual(value.conflicts.map((conflict) => conflict.name).sort(), ['groupa', 'ppt-design']);
+  assert.deepEqual([...value.conflicts.find((conflict) => conflict.name === 'ppt-design').paths].sort(), ['PPT-design', 'P_P_T-design']);
+  for (const name of ['PPT-design', 'P_P_T-design', 'Group_A', 'groupa']) assert.ok(value.message.includes(name), name);
   assert.equal(publishRequests(f).length, 0);
+});
+
+test('符号链接/junction 指向 Skill 目录：发布实体内容、规范名取真实目录名，--repo 扫描同样发现', async (t) => {
+  const f = await fixture(t);
+  const target = await makeSkill(f.temporary, 'PPT-design', { version: '0.1.0' });
+  await symlink(target, path.join(f.cwd, 'alias'), process.platform === 'win32' ? 'junction' : 'dir');
+  const result = await f.run(['publish', 'alias', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout);
+  const event = data(result);
+  assert.equal(event.skill, 'ppt-design');
+  assert.equal(event.name_mapping.directory, 'PPT-design');
+  assert.ok(f.state.published.has('ppt-design:0.1.0'));
+
+  const repo = path.join(f.temporary, 'repo-links');
+  await mkdir(repo);
+  const other = await makeSkill(f.temporary, 'linked-skill', { name: 'linked-skill', version: '0.1.0' });
+  await symlink(other, path.join(repo, 'pointer'), process.platform === 'win32' ? 'junction' : 'dir');
+  await mkdir(path.join(repo, 'not-a-skill'));
+  const report = data(await f.run(['publish', '--repo', repo, '--check', '--json'], { HY_TOKEN: TOKEN }));
+  assert.ok(report.skills.some((item) => item.skill === 'linked-skill' && item.status === 'missing'), JSON.stringify(report.skills));
+  assert.ok(!report.skills.some((item) => item.directory === 'pointer'));
+});
+
+test('跨平台不对称修复：保留设备名规范名拒绝；保留名文件按 win32 规则在打包阶段被拒', async (t) => {
+  const f = await fixture(t);
+  await makeSkill(f.cwd, 'device-skill', { name: 'con', version: '0.1.0' });
+  const reserved = await f.run(['publish', 'device-skill', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(reserved.code, 1);
+  assert.equal(data(reserved).error, 'reserved_name');
+  assert.match(data(reserved).message, /Windows 保留设备名/);
+  assert.equal(publishRequests(f).length, 0);
+  // Windows 上无法创建保留名文件，该场景只能在 POSIX 构造。
+  await t.test('保留名归档条目', { skip: process.platform === 'win32' ? 'Windows 无法创建保留名文件' : false }, async () => {
+    await makeSkill(f.cwd, 'posix-skill', { name: 'posix-skill', version: '0.1.0' });
+    await writeFile(path.join(f.cwd, 'posix-skill', 'aux.txt'), '辅助设备内容');
+    const result = await f.run(['publish', 'posix-skill', '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(result.code, 1);
+    assert.equal(data(result).error, 'invalid_package');
+    assert.equal(publishRequests(f).length, 0);
+  });
+});
+
+test('packSkill 资源预拒与 tar 缺失：原始字节/压缩输出超限本地拒绝；tar ENOENT 单独报 tar_missing', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'hy-pack-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const skill = await makeSkill(directory, 'demo-skill', { name: 'demo-skill', version: '0.1.0' });
+  await assert.rejects(packSkill(skill, 'demo-skill', '0.1.0', { rawLimitBytes: 10 }), { error: 'too_large' });
+  await assert.rejects(packSkill(skill, 'demo-skill', '0.1.0', { sizeLimitBytes: 10 }), { error: 'too_large' });
+  await assert.rejects(packSkill(skill, 'demo-skill', '0.1.0', {
+    runner: async () => { throw Object.assign(new Error('spawn tar ENOENT'), { code: 'ENOENT' }); },
+  }), { error: 'tar_missing' });
+  // 失败路径的临时目录同样清理干净。
+  assert.deepEqual((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-')), []);
+});
+
+test('打包排除开发与系统垃圾：.git/.DS_Store/Thumbs.db 警告输出且不进包', async (t) => {
+  const f = await fixture(t);
+  const directory = await makeSkill(f.cwd, 'ppt-design', { name: 'ppt-design', version: '0.1.0' });
+  await mkdir(path.join(directory, '.git'));
+  await writeFile(path.join(directory, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  await writeFile(path.join(directory, '.DS_Store'), 'junk');
+  await writeFile(path.join(directory, 'Thumbs.db'), 'junk');
+  const result = await f.run(['publish', 'ppt-design', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout);
+  const event = data(result);
+  assert.equal(event.warnings.length, 3);
+  assert.ok(event.warnings.every((warning) => warning.startsWith('已从包中排除无关文件：')), JSON.stringify(event.warnings));
+  const stored = f.state.published.get('ppt-design:0.1.0');
+  const text = gunzipSync(stored.body).toString('latin1');
+  assert.ok(!text.includes('.git'), '包内不应有 .git');
+  assert.ok(!text.includes('.DS_Store'), '包内不应有 .DS_Store');
+  assert.ok(!text.includes('Thumbs.db'), '包内不应有 Thumbs.db');
+});
+
+test('SKILL.md 是目录或超过 1MB：给出明确语义而非读取失败', async (t) => {
+  const f = await fixture(t);
+  await mkdir(path.join(f.cwd, 'weird', 'SKILL.md'), { recursive: true });
+  const weird = await f.run(['publish', 'weird', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(weird.code, 1);
+  assert.equal(data(weird).error, 'skill_read');
+  assert.match(data(weird).message, /不是包含 SKILL\.md 的 Skill 目录/);
+  const big = await makeSkill(f.cwd, 'big-skill', { name: 'big-skill', version: '0.1.0' });
+  await writeFile(path.join(big, 'SKILL.md'), `---\nname: big-skill\nmetadata:\n  version: "0.1.0"\n---\n\n${'#'.repeat(1024 * 1024 + 10)}\n`);
+  const oversized = await f.run(['publish', 'big-skill', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(oversized.code, 1);
+  assert.equal(data(oversized).error, 'skill_too_large');
+  assert.equal(publishRequests(f).length, 0);
+});
+
+test('非交互自动确认：无 --yes 时输出提示行与 auto_confirmed 标记，显式 --yes 不输出', async (t) => {
+  const f = await fixture(t);
+  const flagged = path.join(f.temporary, 'repo-auto');
+  await mkdir(flagged);
+  await makeSkill(flagged, 'ppt-design', { name: 'ppt-design', version: '0.2.0' });
+  const auto = await f.run(['publish', '--repo', flagged, '--all', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(auto.code, 0, auto.stdout);
+  assert.equal(events(auto)[0].auto_confirmed, true);
+  const human = path.join(f.temporary, 'repo-human');
+  await mkdir(human);
+  await makeSkill(human, 'oracle-bone', { name: 'oracle-bone', version: '0.2.0' });
+  const text = await f.run(['publish', '--repo', human, '--all']);
+  assert.equal(text.code, 0, text.stderr);
+  assert.match(text.stdout, /非交互模式：已自动确认发布。/);
+  const explicit = path.join(f.temporary, 'repo-explicit');
+  await mkdir(explicit);
+  await makeSkill(explicit, 'new-skill', { name: 'new-skill', version: '0.1.0' });
+  const quiet = await f.run(['publish', '--repo', explicit, '--all', '--yes', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(quiet.code, 0, quiet.stdout);
+  assert.equal(events(quiet)[0].auto_confirmed, undefined);
+  assert.equal(f.state.published.size, 3);
+});
+
+test('服务端是最终验证者：无效归档 400 invalid_package；付费发布物需要令牌与购买，免费发布物公开', async (t) => {
+  const f = await fixture(t);
+  const body = Buffer.from('not a tarball');
+  const response = await fetch(`${f.base}/api/store/publish`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/gzip', 'X-Skill-Name': 'junk-skill', 'X-Skill-Version': '0.1.0', 'X-Content-SHA256': createHash('sha256').update(body).digest('hex') },
+    body,
+  });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, 'invalid_package');
+  assert.ok(!f.state.published.has('junk-skill:0.1.0'));
+
+  await makeSkill(f.cwd, 'ppt-design-pro', { name: 'ppt-design-pro', version: '0.2.0' });
+  await makeSkill(f.cwd, 'ppt-design', { name: 'ppt-design', version: '0.2.0' });
+  assert.equal((await f.run(['publish', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN })).code, 0);
+  assert.equal((await f.run(['publish', 'ppt-design', '--json'], { HY_TOKEN: TOKEN })).code, 0);
+  const paid = `${f.base}/releases/ppt-design-pro-0.2.0.tar.gz`;
+  assert.equal((await fetch(paid)).status, 401);
+  f.state.grants.set(TOKEN2, []);
+  assert.equal((await fetch(paid, { headers: { Authorization: `Bearer ${TOKEN2}` } })).status, 402);
+  assert.equal((await fetch(paid, { headers: { Authorization: `Bearer ${TOKEN}` } })).status, 200);
+  assert.equal((await fetch(`${f.base}/releases/ppt-design-0.2.0.tar.gz`)).status, 200);
 });

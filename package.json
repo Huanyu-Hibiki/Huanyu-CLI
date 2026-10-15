@@ -14,7 +14,10 @@
   },
   "files": [
     "bin/",
-    "src/"
+    "src/",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",

@@ -4,7 +4,8 @@ import { existsSync } from 'node:fs';
 import { access, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { resolveLanguage, withLanguage, t, helpLines, formatCommand, command, COMMAND } from '../src/i18n.js';
+import { resolveLanguage, withLanguage, t, helpLines, formatCommand, command, COMMAND, dictionary } from '../src/i18n.js';
+import { DEFAULT_API } from '../src/client.js';
 import { CliError, Output } from '../src/io.js';
 import { parseSkill, compare, duplicateCopies } from '../src/skills.js';
 import { canonicalName } from '../src/publish.js';
@@ -159,9 +160,57 @@ test('package.json 打包字段与仓库现状一致', async () => {
   assert.equal(pkg.dependencies, undefined);
   assert.equal(pkg.devDependencies, undefined);
   assert.ok(typeof pkg.description === 'string' && /[\u4e00-\u9fff]/.test(pkg.description), 'description 应为非空中文');
+  // 任务 8：README×2 与 LICENSE 落地，随 bin/src 一起进发布包（tarball 内容另由 CI 的 npm pack --dry-run 钉住）。
+  assert.deepEqual(pkg.files, ['bin/', 'src/', 'README.md', 'README.en.md', 'LICENSE']);
   for (const entry of pkg.files) {
-    assert.ok(!/^readme/i.test(entry), `files 不应包含尚不存在的条目：${entry}`);
     assert.ok(existsSync(new URL(`../${entry}`, import.meta.url)), `files 条目应存在：${entry}`);
+  }
+});
+
+// —— 发布收尾（任务 8）：README/约定文档与仓库实际行为的一致性 ——
+
+test('README 双语与 help 文案一致：14 命令齐备、说明逐字取自词条、二期标注正确', async () => {
+  const zh = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  const en = await readFile(new URL('../README.en.md', import.meta.url), 'utf8');
+  // 一期已实现（与 cli.test.js 的执行面一致）；version 与 help 共用一行，只查名字出现。
+  const IMPLEMENTED = ['status', 'list', 'install', 'login', 'logout', 'publish', 'help'];
+  const PENDING = ['update', 'subscribe', 'manage', 'product', 'unpublish', 'audit'];
+  for (const [text, index, marker] of [[zh, 0, '二期'], [en, 1, 'Phase 2']]) {
+    for (const name of COMMANDS) assert.ok(text.includes(name), `命令名缺失：${name}`);
+    assert.ok(text.includes(COMMAND), '应给出 npx github:Huanyu-Hibiki/Huanyu-CLI 直跑方式');
+    assert.ok(text.includes('Node.js 18'), '应说明 Node ≥18');
+    for (const [key, pair] of Object.entries(dictionary)) {
+      // 词条形如「{command} <用法>  <说明>」：说明部分（首个双空格之后）逐字进 README 命令表。
+      if (!key.startsWith('help') || key === 'helpIntro' || key === 'helpUsage') continue;
+      const description = pair[index].split('  ').slice(1).join('  ');
+      assert.ok(text.includes(description), `README 说明与 help 词条不一致（${key}）：${description}`);
+    }
+    const rows = text.split('\n').filter((line) => line.startsWith('|'));
+    for (const name of [...IMPLEMENTED, ...PENDING]) {
+      const row = rows.find((line) => line.includes(`\`${name}`));
+      assert.ok(row, `命令表缺少 ${name} 行`);
+      assert.equal(row.includes(marker), PENDING.includes(name), `${name} 的分期标注`);
+    }
+  }
+});
+
+test('skill 更新检查约定文档完整：端点与 DEFAULT_API 同步、开关与自更新命令齐备', async () => {
+  const text = await readFile(new URL('../docs/skill-convention.md', import.meta.url), 'utf8');
+  assert.ok(text.includes('${HY_API:-https://store.huanyu.example}/api/store/versions'), '查询端点模板');
+  // DEFAULT_API 替换（发布检查清单第一项）时该文档必须同步，测试在此钉住。
+  assert.ok(text.includes(DEFAULT_API), '端点默认值应与 src/client.js 的 DEFAULT_API 一致');
+  assert.ok(text.includes('HY_NO_AUTO_UPDATE') && text.includes('HY_NO_UPDATE_CHECK'), '两个关闭开关');
+  assert.ok(text.includes('npx github:Huanyu-Hibiki/Huanyu-CLI update <skill> --path "<安装路径>"'), '自更新命令模板');
+  // frontmatter 契约与发布命令。
+  assert.ok(text.includes('^[a-z0-9][a-z0-9-]*$'), '规范名正则');
+  assert.ok(text.includes('metadata.version'), '版本字段');
+  assert.ok(text.includes('hy publish') && text.includes('--repo') && text.includes('--all'), '发布命令');
+});
+
+test('发布前检查清单覆盖关键项：占位替换、命令名复验、CI、打包、试点上架、二期待办', async () => {
+  const text = await readFile(new URL('../docs/release-checklist.md', import.meta.url), 'utf8');
+  for (const item of ['DEFAULT_API', 'src/client.js', 'HY_API', 'hy', 'PATH', 'npm pack', '--repo', '--all', 'docs/plans/2026-10-15-huanyu-cli-mvp-plan.md']) {
+    assert.ok(text.includes(item), `清单缺少：${item}`);
   }
 });
 

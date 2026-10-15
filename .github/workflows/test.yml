@@ -22,3 +22,6 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm test
+      # 防止 files 漂移：任一格子（ubuntu × Node 22）核对发布包内容。
+      - run: npm pack --dry-run
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 22

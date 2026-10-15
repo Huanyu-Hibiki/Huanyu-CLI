@@ -60,6 +60,13 @@ test('hy help 中英双语列出全部命令；--help 与 -h 同效', async () =
   assert.match(en.stdout, /status \(default\)/);
   for (const name of COMMANDS) assert.ok(en.stdout.includes(name), name);
   assert.ok(!en.stdout.includes('用法：'));
+  // help 只宣传解析层当前接受的参数；publish 的 --repo/--all/--check 随任务 4 扩展解析层后再写全。
+  assert.ok(zh.stdout.includes('npx github:Huanyu-Hibiki/Huanyu-CLI publish  发布 Skill'));
+  assert.ok(en.stdout.includes('npx github:Huanyu-Hibiki/Huanyu-CLI publish  Publish a skill'));
+  for (const flag of ['--repo', '--all', '--check']) {
+    assert.ok(!zh.stdout.includes(flag), flag);
+    assert.ok(!en.stdout.includes(flag), flag);
+  }
   assert.equal((await run(['--help'])).stdout, zh.stdout);
   assert.equal((await run(['-h'])).stdout, zh.stdout);
 });
@@ -172,12 +179,12 @@ test('install/subscribe 缺 Skill 名或非法 Skill 名退出码 2', async () =
   assert.match((await run(['install'])).stderr, /需要 Skill 名/);
 });
 
-test('未实现命令执行时退出码 2，error 为 not_implemented 并说明二期实现', async () => {
+test('未实现命令执行时退出码 2，error 为 not_implemented 并使用中性文案', async () => {
   for (const name of PENDING) {
     const result = await run([name, '--json']);
     assert.equal(result.code, 2, name);
     assert.equal(data(result).error, 'not_implemented', name);
-    assert.match(data(result).message, /二期/, name);
+    assert.match(data(result).message, /尚未实现/, name);
     assert.ok(data(result).message.includes(name), name);
   }
   for (const args of [['install', 'demo-skill'], ['subscribe', 'demo-skill', '--plan', 'lifetime']]) {
@@ -188,9 +195,9 @@ test('未实现命令执行时退出码 2，error 为 not_implemented 并说明�
   const bare = await run([]);
   assert.equal(bare.code, 2);
   assert.equal(bare.stdout, '');
-  assert.match(bare.stderr, /二期/);
+  assert.match(bare.stderr, /尚未实现/);
   const english = await run(['list', '--lang', 'en']);
-  assert.match(english.stderr, /phase 2/);
+  assert.match(english.stderr, /not implemented yet/);
 });
 
 test('错误输出经过密钥遮盖：--token 值与 HY_TOKEN 环境变量都不出现在输出里', async () => {

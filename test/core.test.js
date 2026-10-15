@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { resolveLanguage, withLanguage, t, helpLines, formatCommand, command, COMMAND } from '../src/i18n.js';
 import { CliError, Output } from '../src/io.js';
 
@@ -90,4 +92,19 @@ test('Output.remember 补充登记密钥；hide 状态整段隐藏', () => {
     output.remember(hidden, { hide: true });
     assert.equal(output.redact(`x${hidden}x`), 'x[已隐藏]x');
   });
+});
+
+test('package.json 打包字段与仓库现状一致', async () => {
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.name, 'huanyu-cli');
+  assert.equal(pkg.version, '0.1.0');
+  assert.equal(pkg.type, 'module');
+  assert.equal(pkg.bin?.hy, 'bin/hy.js');
+  assert.equal(pkg.dependencies, undefined);
+  assert.equal(pkg.devDependencies, undefined);
+  assert.ok(typeof pkg.description === 'string' && /[\u4e00-\u9fff]/.test(pkg.description), 'description 应为非空中文');
+  for (const entry of pkg.files) {
+    assert.ok(!/^readme/i.test(entry), `files 不应包含尚不存在的条目：${entry}`);
+    assert.ok(existsSync(new URL(`../${entry}`, import.meta.url)), `files 条目应存在：${entry}`);
+  }
 });

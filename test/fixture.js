@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, copyFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,14 +30,20 @@ const browserScript = `(async () => {\nif (process.env.HY_TEST_BROWSER !== 'appr
 
 // Windows 无法直接执行 shebang 脚本：复制 node.exe 冒充 cmd.exe（经 ComSpec 显式指定），
 // 并用 NODE_OPTIONS --require 预加载 helper，识别 /v:off 参数后接管为假浏览器。
+// node.exe 副本约 85MB，惰性准备：真正要打开浏览器前才复制，不开浏览器的测试零成本。
+const browserExecutables = new Set();
+export async function ensureBrowserExecutable(executable) {
+  if (browserExecutables.has(executable)) return;
+  await copyFile(process.execPath, executable, constants.COPYFILE_EXCL)
+    .catch((error) => { if (error.code !== 'EEXIST') throw error; });
+  browserExecutables.add(executable);
+}
+
 export async function mockCommandProcessor(directory) {
   const helper = path.join(directory, 'browser-helper.cjs');
   // 异步授权完成前不能让 Node 把 cmd 的 /d 当作主脚本加载。
   await writeFile(helper, `if (process.argv.includes('/v:off') && process.env.HY_BROWSER_URL) {\nrequire('node:module').runMain = () => {};\n${browserScript}}\n`);
-  const executable = path.join(directory, 'cmd.exe');
-  // Node 18 的 Windows 进程会锁住自身可执行文件，硬链接也无法删除。
-  await copyFile(process.execPath, executable);
-  return { executable, nodeOptions: `--require "${helper.replaceAll('\\', '/')}"` };
+  return { executable: path.join(directory, 'cmd.exe'), nodeOptions: `--require "${helper.replaceAll('\\', '/')}"` };
 }
 
 // 假商店：绑定 127.0.0.1 随机端口，提供 catalog/versions 与 device/token/me/logout/approve 端点（契约见设计「接口设计」）；
@@ -145,32 +152,37 @@ export async function fixture(t) {
   // 环境隔离：home/config 指向临时目录；语言固定默认中文（extraEnv 可覆盖）；CI 交互关闭。
   const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: config, APPDATA: config, CODEX_HOME: '',
     HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_API: base, HY_TOKEN: '', CI: '', HY_TEST_BROWSER: '',
-    NODE_OPTIONS: nodeOptions, PATH: `${mockBin}${path.delimiter}${process.env.PATH || ''}`, ...(commandProcessor ? { ComSpec: commandProcessor } : {}) };
+    NODE_OPTIONS: nodeOptions, PATH: `${mockBin}${path.delimiter}${process.env.PATH || ''}`,
+    ...(commandProcessor ? { ComSpec: commandProcessor, ...(process.platform === 'win32' ? { HY_TEST_BROWSER_EXE: commandProcessor } : {}) } : {}) };
   // Windows 的 env 键大小写不敏感，spawn 展开后可能同时出现 PATH/Path、ComSpec/comspec；只保留显式写入的这一份。
   for (const key of Object.keys(env)) if (key !== 'PATH' && key.toLowerCase() === 'path') delete env[key];
   for (const key of Object.keys(env)) if (key !== 'ComSpec' && key.toLowerCase() === 'comspec') delete env[key];
   const configFile = path.join(config, 'huanyu', 'config.json');
   let runNumber = 0;
-  const run = (args, extraEnv = {}, runtime = {}) => new Promise((resolve, reject) => {
-    const traceFile = path.join(temporary, `trace-${runNumber++}.json`);
-    const child = spawn(process.execPath, [runtime.real ? CLI : DRIVER, ...args], { cwd, env: { ...env, ...extraEnv, HY_TEST_RUNTIME: JSON.stringify(runtime), HY_TEST_TRACE: traceFile }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk;
-      // 设备码显示后立即杀死进程，模拟 Agent 中断；待领取记录已先行落盘。
-      if (runtime.killOnDevice && (stdout.includes('授权码：') || stdout.includes('"event":"device"'))) child.kill('SIGKILL');
+  // 真 CLI 子进程会自己经 ComSpec 启动假浏览器，得先确保 node.exe 副本存在；driver 路径由 driver 惰性准备。
+  const run = async (args, extraEnv = {}, runtime = {}) => {
+    if (runtime.real && process.platform === 'win32') await ensureBrowserExecutable(commandProcessor);
+    return await new Promise((resolve, reject) => {
+      const traceFile = path.join(temporary, `trace-${runNumber++}.json`);
+      const child = spawn(process.execPath, [runtime.real ? CLI : DRIVER, ...args], { cwd, env: { ...env, ...extraEnv, HY_TEST_RUNTIME: JSON.stringify(runtime), HY_TEST_TRACE: traceFile }, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+        // 设备码显示后立即杀死进程，模拟 Agent 中断；待领取记录已先行落盘。
+        if (runtime.killOnDevice && (stdout.includes('授权码：') || stdout.includes('"event":"device"'))) child.kill('SIGKILL');
+      });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.stdin.end();
+      const timer = setTimeout(() => child.kill('SIGKILL'), 25_000);
+      child.on('error', (err) => { clearTimeout(timer); reject(err); });
+      child.on('close', async (code, signal) => {
+        clearTimeout(timer);
+        let trace = null;
+        try { trace = JSON.parse(await readFile(traceFile, 'utf8')); } catch {}
+        resolve({ code, signal, stdout, stderr, trace });
+      });
     });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.stdin.end();
-    const timer = setTimeout(() => child.kill('SIGKILL'), 25_000);
-    child.on('error', (err) => { clearTimeout(timer); reject(err); });
-    child.on('close', async (code, signal) => {
-      clearTimeout(timer);
-      let trace = null;
-      try { trace = JSON.parse(await readFile(traceFile, 'utf8')); } catch {}
-      resolve({ code, signal, stdout, stderr, trace });
-    });
-  });
+  };
   const close = async () => {
     await new Promise((resolve, reject) => { server.close((err) => err ? reject(err) : resolve()); server.closeAllConnections(); });
     await rm(temporary, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, readFile, access } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, access, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fixture, TOKEN, TOKEN2, EMAIL } from './fixture.js';
 import { configPath } from '../src/config.js';
@@ -124,7 +124,7 @@ test('configPath 忽略相对的 XDG_CONFIG_HOME/APPDATA，回落安全默认或
     // win32：相对路径的 APPDATA 不可信（凭证可能写进随 cwd 漂移的目录），同样视同未设置。
     assert.equal(configPath({ APPDATA: 'C:\\Users\\u\\AppData\\Roaming' }, 'win32'), 'C:\\Users\\u\\AppData\\Roaming\\huanyu\\config.json');
     for (const appdata of [undefined, '', 'relative', '.']) {
-      await assert.rejects(configPath({ APPDATA: appdata }, 'win32'),
+      assert.throws(() => configPath({ APPDATA: appdata }, 'win32'),
         (error) => error instanceof CliError && error.message === '未设置 APPDATA，无法定位配置文件。', `APPDATA=${appdata}`);
     }
   });
@@ -155,6 +155,24 @@ test('win32 缺 APPDATA 时读写路径都原样报 missingAppdata（不被转�
   assert.equal(write.code, 1);
   assert.match(write.stderr, /未设置 APPDATA，无法定位配置文件。/);
   await absent(f.configFile);
+});
+
+test('假浏览器 node.exe 副本惰性准备：不打开浏览器的命令零复制，首次打开时才落盘', async (t) => {
+  const f = await fixture(t);
+  await f.run(['login', '--token', TOKEN, '--json']);
+  await f.run(['status', '--json']);
+  await f.run(['logout', '--json']);
+  // 上述命令都不触达浏览器：win32 下只有 helper 脚本，POSIX 下只有两个假 open 脚本。
+  const idle = (await readdir(f.mockBin)).sort();
+  assert.deepEqual(idle, process.platform === 'win32' ? ['browser-helper.cjs'] : ['open', 'xdg-open']);
+  // 设备码流程真正打开假浏览器后，副本才出现（大小与 node.exe 一致）。
+  await f.run(['login', '--json'], { HY_TEST_BROWSER: 'approve' });
+  if (process.platform === 'win32') {
+    const copy = await stat(path.join(f.mockBin, 'cmd.exe'));
+    assert.equal(copy.size, (await stat(process.execPath)).size);
+  } else {
+    assert.deepEqual((await readdir(f.mockBin)).sort(), ['open', 'xdg-open']);
+  }
 });
 
 test('Windows 下 ComSpec 未设置时回落系统目录的 cmd.exe 绝对路径，不搜 PATH', async () => {

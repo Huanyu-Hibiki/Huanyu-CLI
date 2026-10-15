@@ -6,13 +6,18 @@ import { CliError } from './io.js';
 import { pathsFor, userHome, restrictPermissions } from './platform.js';
 import { DEFAULT_API } from './client.js';
 
+const absoluteDirectory = (value, paths) => typeof value === 'string' && value.trim() && paths.isAbsolute(value) ? value : null;
+
 export function configPath(env = process.env, platform = process.platform) {
   const paths = pathsFor(platform);
   if (platform === 'win32') {
-    if (!env.APPDATA) throw new CliError(t('missingAppdata'));
-    return paths.join(env.APPDATA, 'huanyu', 'config.json');
+    // 相对路径的 APPDATA 不可信：凭证不能写进随 cwd 漂移的目录，等价于未设置。
+    const appdata = absoluteDirectory(env.APPDATA, paths);
+    if (!appdata) throw new CliError(t('missingAppdata'));
+    return paths.join(appdata, 'huanyu', 'config.json');
   }
-  return paths.join(env.XDG_CONFIG_HOME || paths.join(userHome(env, platform), '.config'), 'huanyu', 'config.json');
+  // XDG 规范要求绝对路径；相对值忽略并回落 ~/.config。
+  return paths.join(absoluteDirectory(env.XDG_CONFIG_HOME, paths) || paths.join(userHome(env, platform), '.config'), 'huanyu', 'config.json');
 }
 
 export function isPendingDevice(device) {
@@ -34,6 +39,8 @@ async function readConfig() {
     return data;
   } catch (error) {
     if (error.code === 'ENOENT') return null;
+    // 自带的 CliError（如 missingAppdata）原样透出；其余读写故障统一转 configRead。
+    if (error instanceof CliError) throw error;
     // 坏配置必须显式报错，交给用户处理，绝不静默重置。
     throw new CliError(t('configRead'), 1, 'config_read');
   }
@@ -41,14 +48,18 @@ async function readConfig() {
 
 const origin = (value) => { try { return new URL(value).origin; } catch { return null; } };
 
+// 本机保存且签发给该服务器的令牌；不走 HY_TOKEN 短路（logout 两枚令牌都要撤销）。
+export async function readSavedAuth(api) {
+  const data = await readConfig();
+  if (!data?.token || origin(data.api || DEFAULT_API) !== origin(api)) return null;
+  return { token: data.token, email: data.email };
+}
+
 // 保存的令牌只发给签发它的服务器：HY_API 指向别处时当作没有登录。
 // 旧配置没有记录服务器，视为默认服务器。HY_TOKEN 是用户显式提供的，不受限制。
 export async function readAuth(api) {
   if (process.env.HY_TOKEN) return { token: process.env.HY_TOKEN, email: null };
-  const data = await readConfig();
-  if (!data?.token) return null;
-  if (origin(data.api || DEFAULT_API) !== origin(api)) return null;
-  return { token: data.token, email: data.email };
+  return await readSavedAuth(api);
 }
 
 export async function readPendingDevice() {
@@ -68,7 +79,8 @@ async function saveConfig(data) {
     handle = undefined;
     await restrictPermissions(temp);
     await rename(temp, file);
-  } catch {
+  } catch (error) {
+    if (error instanceof CliError) throw error;
     throw new CliError(t('configWrite'), 1, 'config_write');
   } finally {
     await handle?.close().catch(() => {});

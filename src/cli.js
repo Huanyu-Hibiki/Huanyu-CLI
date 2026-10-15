@@ -2,7 +2,7 @@ import { t, withLanguage, resolveLanguage, command, helpLines, skillLabel, planL
 import { setTimeout as delay } from 'node:timers/promises';
 import { readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
-import { readAuth, logout as deleteConfig } from './config.js';
+import { readSavedAuth, logout as deleteConfig } from './config.js';
 import { Client, catalogNames, isSkillName } from './client.js';
 import { login, loadAuth } from './auth.js';
 import { openBrowser } from './browser.js';
@@ -84,16 +84,30 @@ async function status(ctx) {
 
 async function logout(ctx) {
   const warnings = [];
-  let revoked = false, token;
-  try {
-    token = (await readAuth(ctx.client.base))?.token;
+  let revoked = false;
+  const revoke = async (token) => {
+    if (!token) return;
     ctx.output.remember(token);
-    if (token) { await ctx.client.request('/api/cli/logout', { method: 'POST', token }); revoked = true; }
+    try { await ctx.client.request('/api/cli/logout', { method: 'POST', token }); }
+    catch (error) {
+      // 失效令牌已经无法使用；网络和其他错误只警告，仍要清除本机配置。
+      if (!(error instanceof CliError && error.details.http_status === 401)) {
+        warnings.push(t('revokeWarning', { message: error.message, url: ctx.client.url('/account/') }));
+        return;
+      }
+    }
+    revoked = true;
+  };
+  try {
+    // 本机配置里的令牌只撤销签发给当前服务器的那一枚，不跨域发送。
+    const saved = await readSavedAuth(ctx.client.base);
+    if (saved?.token && saved.token !== process.env.HY_TOKEN) await revoke(saved.token);
   } catch (error) {
-    // 失效令牌已经无法使用；网络和其他错误仍要清除本机配置。
-    if (error instanceof CliError && error.details.http_status === 401) revoked = true;
-    else warnings.push(t('revokeWarning', { message: error.message, url: ctx.client.url('/account/') }));
-  } finally { await deleteConfig(); }
+    warnings.push(t('revokeWarning', { message: error.message, url: ctx.client.url('/account/') }));
+  }
+  // 环境令牌是用户显式提供的；与配置里的不同也要一并撤销，不留半撤销。
+  await revoke(process.env.HY_TOKEN);
+  await deleteConfig();
   if (process.env.HY_TOKEN) warnings.push(t('tokenEnvWarning'));
   ctx.output.write({ logged_out: true, revoked, warnings }, [revoked ? t('revoked') : t('configRemoved'), ...warnings]);
   return 0;

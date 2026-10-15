@@ -111,6 +111,7 @@ export async function loadAuth(ctx) {
   ctx.authLoaded = true;
 }
 
+// 任务 4（publish）与任务 6（install）接线使用；登录域任务 3 阶段暂无 CLI 调用方属预期。
 export async function requireLogin(ctx) {
   await loadAuth(ctx);
   // 环境变量和 CI 沿用原有令牌规则；本机待领取登录优先完成。

@@ -22,6 +22,7 @@ const events = (result) => {
 };
 const absent = (directory) => assert.rejects(access(directory), { code: 'ENOENT' });
 const exists = async (file) => { try { return await lstat(file); } catch { return null; } };
+const stageLeftovers = async (root) => (await readdir(root, { recursive: false }).catch((error) => error.code === 'ENOENT' ? [] : (() => { throw error; })())).filter((name) => name.startsWith('.hy-stage-'));
 const sorted = (paths) => [...paths].sort();
 const root = (f, host) => path.join(f.home, `.${host}`, 'skills');
 const projectRoot = (f, host) => path.join(f.cwd, `.${host}`, 'skills');
@@ -122,21 +123,39 @@ test('update 付费更新清理同宿主用户与项目根的免费版；跨宿�
   assert.deepEqual(await snapshot(other), before, 'qwenwork 的免费版不因 zcode 装付费版被清（sameAgentRoots 归属）');
 });
 
-test('update 已最新（up_to_date）也清理遗留免费版：不询问，removed 列明，updated_count 0', async (t) => {
+// security-MEDIUM-2b 重写：纯清理批次（0 替换 >0 移除）交互要确认、非交互要 auto_confirmed
+// 警示行；quality-LOW-7：纯清理批次打 cleanup_only 标记（status 仍 up_to_date）。
+test('update 已最新也清理遗留免费版：交互确认「移除 N 个免费版？」，非交互打 auto_confirmed 警示 + cleanup_only', async (t) => {
   const f = await fixture(t);
+  await publishPaid(f);
   const pro = await writeSkill(root(f, 'zcode'), 'ppt-design-pro', '0.2.0');
-  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
   const before = await snapshot(pro);
-  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN }, { interactive: true, answers: [] });
-  assert.equal(result.code, 0, result.stdout + result.stderr);
-  const value = data(result);
-  assert.equal(result.trace.questions.length, 0, '清理不单独询问');
+  // 交互拒绝：纯清理批次同样要确认，拒绝则免费版保留。
+  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const declined = await f.run(['update', '--json'], { HY_TOKEN: TOKEN }, { interactive: true, answers: [false] });
+  assert.equal(declined.code, 0, declined.stdout + declined.stderr);
+  const cancelled = data(declined);
+  assert.equal(cancelled.status, 'cancelled');
+  assert.deepEqual(cancelled.removed, []);
+  assert.ok(await exists(free), '拒绝确认时免费版不被移除');
+  assert.match(declined.trace.questions[0], /移除 1 个免费版？ \[Y\/n\]/);
+  // 交互接受：移除执行，纯清理批次打 cleanup_only（status 仍 up_to_date）。
+  const accepted = await f.run(['update', '--json'], { HY_TOKEN: TOKEN }, { interactive: true, answers: [true] });
+  assert.equal(accepted.code, 0, accepted.stdout + accepted.stderr);
+  const value = data(accepted);
   assert.equal(value.status, 'up_to_date');
   assert.equal(value.updated_count, 0);
   assert.deepEqual(value.installations, []);
   assert.deepEqual(value.removed, [free]);
+  assert.equal(value.cleanup_only, true, '纯清理批次打 cleanup_only 标记');
   await absent(free);
   assert.deepEqual(await snapshot(pro), before, '已最新的付费版不动');
+  // 非交互：静默确认要有警示行。
+  const again = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const human = await f.run(['update'], { HY_TOKEN: TOKEN });
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.match(human.stdout, /非交互模式：已自动确认移除免费版。/);
+  await absent(again);
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '无更新不下载');
 });
 
@@ -297,4 +316,152 @@ test('removedFree 双语文案：中文/英文安装输出列明被移除的免�
   assert.equal(en.code, 0, en.stdout + en.stderr);
   assert.ok(en.stdout.includes(`Removed ppt-design from the same Agent: ${free}`), en.stdout);
   await absent(free);
+});
+
+// —— 三路审查修复（security HIGH-1 / MEDIUM-2/3、spec-MINOR、quality LOW）——
+
+test('HIGH-1：订阅失效 + 付费版已最新 → 清理不越过权益闸门：免费版保留、冲突警告照报', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  await writeSkill(root(f, 'zcode'), 'ppt-design-pro', '0.2.0');
+  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.1.0');
+  f.state.grants.set(TOKEN, []);
+  const before = await snapshot(free);
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.equal(value.status, 'up_to_date');
+  assert.deepEqual(value.removed, [], '无有效权益不得清理同宿主免费版');
+  assert.deepEqual(value.skipped, []);
+  assert.deepEqual(await snapshot(free), before);
+  assert.equal(value.warnings.length, 1, '免费版保留 → 共存冲突警告照报');
+  assert.match(value.warnings[0], /ppt-design 和 ppt-design-pro 两个版本同时装/);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+  // 未登录同样不清理，且不为清理决策发起设备码登录（fail-safe：跳过清理、保留警告）。
+  const anonymous = await f.run(['update', '--json']);
+  assert.equal(anonymous.code, 0, anonymous.stdout + anonymous.stderr);
+  assert.deepEqual(data(anonymous).removed, []);
+  assert.deepEqual(await snapshot(free), before);
+  assert.ok(!f.state.requests.some((r) => r.path === '/api/cli/device'), '清理判定不得发起登录');
+});
+
+test('MEDIUM-3：用法校验先于付款——未购付费 install 无宿主 → missing_target exit 2，不创建付款会话', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.grants.set(TOKEN, []);
+  const result = await f.run(['install', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 2);
+  assert.equal(data(result).error, 'missing_target');
+  assert.equal(f.state.checkoutRequests, 0, '用法校验失败不得进入付款');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+  // 已购（或购买完成）后的正常路径仍是一条命令完成购买+安装（前述用例覆盖），此处只钉顺序。
+});
+
+test('MEDIUM-2a：install 确认文案计入移除——「安装 X 并移除 N 个免费版？」；拒绝则安装与移除都不动', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const yes = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN }, { interactive: true, answers: [true] });
+  assert.equal(yes.code, 0, yes.stdout + yes.stderr);
+  assert.match(yes.trace.questions[0], /安装 ppt-design-pro 并移除 1 个免费版？ \[Y\/n\]/);
+  await absent(free);
+  // 拒绝：安装与移除都不发生。
+  const again = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const no = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN }, { interactive: true, answers: [false] });
+  assert.equal(no.code, 0, no.stdout + no.stderr);
+  assert.ok(no.stdout.endsWith('已取消安装。\n'), no.stdout);
+  assert.ok(await exists(again), '拒绝确认时免费版不被移除');
+  assert.equal(await versionOf(again), '0.0.9');
+  assert.equal(await versionOf(path.join(root(f, 'zcode'), 'ppt-design-pro')), '0.2.0', '已装的付费版不动');
+});
+
+test('MEDIUM-2c：混合批次确认文案计入移除——「更新 N 处并移除 M 个免费版？」', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const pro = await writeSkill(root(f, 'zcode'), 'ppt-design-pro', '0.0.9');
+  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const result = await f.run(['update'], { HY_TOKEN: TOKEN }, { interactive: true, answers: [true] });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.trace.questions[0], /更新 1 处安装并移除 1 个免费版？ \[Y\/n\]/);
+  assert.equal(await versionOf(pro), '0.2.0');
+  await absent(free);
+});
+
+test('spec：数据驱动正例——第二组配对商品的付费版安装同样清理其免费版（堵按名分支回归）', async (t) => {
+  const f = await fixture(t);
+  f.state.catalog.push({ id: 'other', name: 'Other', summary: '', summaryEn: '', free: { skill: 'other' }, paid: { skill: 'other-pro' },
+    offer: ['lifetime'], prices: { lifetime: { amount: 900, currency: 'cny', interval: null } } });
+  await writeSkill(f.cwd, 'other', '0.1.0');
+  await writeSkill(f.cwd, 'other-pro', '0.2.0');
+  for (const skill of ['other', 'other-pro']) {
+    const published = await f.run(['publish', skill, '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(published.code, 0, published.stdout + published.stderr);
+  }
+  const otherFree = await writeSkill(root(f, 'zcode'), 'other', '0.0.9');
+  const pptFree = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const result = await f.run(['install', 'other-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.removed, [otherFree], '新配对商品的免费版被清理');
+  assert.deepEqual(value.skipped, []);
+  await absent(otherFree);
+  assert.ok(await exists(pptFree), '其他商品的免费版不受影响');
+  assert.deepEqual(value.installations, [{ name: 'other-pro', path: path.join(root(f, 'zcode'), 'other-pro'), previous: null, version: '0.2.0' }]);
+});
+
+test('spec：remove 动作并入整批事务——中途 rename 失败免费版完整还原（备份链实证）', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const pro = await writeSkill(root(f, 'zcode'), 'ppt-design-pro', '0.0.9');
+  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const before = await snapshot(free);
+  // 第 3 次 rename 是免费版挪备份时：付费更新已完全提交，回滚必须把两者都还原。
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN }, { failRenameAt: 3 });
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'replace');
+  assert.equal(await versionOf(pro), '0.0.9', '已提交的付费更新要被整批回滚');
+  assert.deepEqual(await snapshot(free), before, '免费版完整还原');
+  assert.deepEqual(await stageLeftovers(root(f, 'zcode')), []);
+});
+
+test('spec：invalidateAccount 判别——第一个购买完成后 me 列出两个授权，第二个不再购买（checkoutRequests===1）', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.catalog.push({ id: 'other', name: 'Other', summary: '', summaryEn: '', free: null, paid: { skill: 'other-pro' },
+    offer: ['lifetime'], prices: { lifetime: { amount: 900, currency: 'cny', interval: null } } });
+  await writeSkill(f.cwd, 'other-pro', '0.2.0');
+  const published = await f.run(['publish', 'other-pro', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(published.code, 0, published.stdout + published.stderr);
+  f.state.grants.set(TOKEN, []);
+  // 购买完成（me 轮询到点）时一次性授予两个 skill：模拟服务端把同账号既有授权一并列出。
+  f.state.checkoutGrants = ['ppt-design-pro', 'other-pro'];
+  const proA = await writeSkill(root(f, 'zcode'), 'ppt-design-pro', '0.0.9');
+  const proB = await writeSkill(root(f, 'claude'), 'other-pro', '0.0.9');
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const output = events(result);
+  assert.deepEqual(output.map((event) => event.event), ['checkout', 'subscribed', undefined]);
+  assert.equal(output.at(-1).updated_count, 2);
+  assert.equal(f.state.checkoutRequests, 1, '第二个未购付费 skill 经刷新后的快照直接放行，不再购买');
+  assert.equal(await versionOf(proA), '0.2.0');
+  assert.equal(await versionOf(proB), '0.2.0');
+});
+
+test('LOW-6：免费版恰好装在付费版位置 → 原位替换，removed 条目附 replaced_by 消歧', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const custom = path.join(f.cwd, 'custom-skills');
+  // 目录名是付费版规范名，内容却是免费版：安装付费版时原位替换（replacesFree）。
+  const free = await writeSkill(custom, 'ppt-design', '0.0.9', 'ppt-design-pro');
+  const human = await f.run(['install', 'ppt-design-pro', '--to', custom], { HY_TOKEN: TOKEN });
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.ok(human.stdout.includes(`已移除同一 Agent 里的 ppt-design：${free}`), human.stdout);
+  // 再造一次同场景验证 JSON：removed 条目附 replaced_by（与纯 remove 的字符串条目区分）。
+  await writeSkill(custom, 'ppt-design', '0.0.9', 'ppt-design-pro');
+  const result = await f.run(['install', 'ppt-design-pro', '--to', custom, '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.removed, [{ path: free, replaced_by: 'ppt-design-pro' }]);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design-pro', path: free, previous: null, version: '0.2.0' }]);
+  assert.equal(await versionOf(free), '0.2.0');
 });

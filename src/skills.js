@@ -206,9 +206,15 @@ export async function sameAgentRoots(directory, env = process.env, platform = pr
   const resolved = directoryKey(await canonicalDirectory(directory));
   const matches = [];
   for (const roots of groups) {
-    if ((await Promise.all(roots.map(async (root) => directoryKey(await canonicalDirectory(root))))).includes(resolved)) matches.push(roots);
+    if ((await canonicalRootKeys(roots)).includes(resolved)) matches.push(roots);
   }
   return [...new Set([directory, ...(matches.length === 1 ? matches[0] : [])])];
+}
+
+// 宿主根集合的规范键材料（quality-LOW-8 抽取）：canonical 解析、去重、排序——清理分组
+//（cli.js addFreeReplacements）与冲突判别（conflicts）共用同一构造，避免两处漂移。
+export async function canonicalRootKeys(roots) {
+  return [...new Set(await Promise.all(roots.map(async (root) => directoryKey(await canonicalDirectory(root)))))].sort();
 }
 
 export async function scan(names, roots = discoveryRoots()) {
@@ -265,8 +271,8 @@ export async function conflicts(installed, catalog, env = process.env, platform 
     const seen = new Set();
     for (const pro of installed.filter((item) => item.name === product.paid.skill)) {
       const roots = await sameAgentRoots(pro.root, env, platform, cwd);
-      const canonical = [...new Set(await Promise.all(roots.map(async (root) => directoryKey(await canonicalDirectory(root)))))];
-      const key = [...canonical].sort().join('\0');
+      const canonical = await canonicalRootKeys(roots);
+      const key = canonical.join('\0');
       if (seen.has(key)) continue;
       seen.add(key);
       for (const free of installed.filter((item) => item.name === product.free.skill)) {

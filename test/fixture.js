@@ -150,6 +150,9 @@ export async function fixture(t) {
     // 覆盖会话 URL/整包响应（形状校验负例）。
     checkoutPolls: 0, checkoutRequests: 0, checkoutCreated: 0, checkoutActiveAfter: 2, checkoutStatusPolls: 0,
     checkoutStatusActiveAfter: Infinity, sessions: new Map(), checkoutPrices: null, checkoutPrice: null,
+    // checkoutGrants（任务 5 审查 spec-3）：me 轮询解锁时授予的 skill 列表——默认只授当前购买的
+    // skill；设为数组可模拟「服务端把同账号的既有授权一并列出」（invalidateAccount 判别用）。
+    checkoutGrants: null,
     checkoutNotice: null, checkoutAlreadyActive: false, checkoutStatusErrors: null, checkoutPollErrors: null,
     checkoutToken: null, checkoutSkill: null, meSubscriptions: null, checkoutUrl: null,
     checkoutResponse: null, checkoutStatusResponse: null, fulfillmentPending: false,
@@ -428,7 +431,7 @@ export async function fixture(t) {
           state.checkoutPolls++;
           const pollError = state.checkoutPollErrors?.[state.checkoutPolls - 1];
           if (pollError) return error(res, 502, 'upstream', '服务连接失败');
-          if (state.checkoutPolls >= state.checkoutActiveAfter) state.grants.set(token, [state.checkoutSkill]);
+          if (state.checkoutPolls >= state.checkoutActiveAfter) state.grants.set(token, state.checkoutGrants ?? [state.checkoutSkill]);
         }
         // publisher 是契约字段（设计「接口设计」）；dropPublisher 用于缺字段的 invalid_response 测试；
         // rawSubscriptions 整体替换订阅列表（security-L2 条目形状残缺的负例注入），

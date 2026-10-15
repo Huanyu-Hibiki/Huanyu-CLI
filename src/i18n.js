@@ -144,6 +144,11 @@ export const dictionary = {
   // 安装族（任务 6）
   missingTarget: ['未指定安装位置，请用 --to 指定，例如：{next}', 'No install location specified. Use --to, for example: {next}'],
   confirmInstall: ['安装 {name}？', 'Install {name}?'],
+  // 免费版清理确认族（二期任务 5 审查 MEDIUM-2）：确认文案计入移除数；纯清理批次单独确认。
+  confirmInstallRemove: ['安装 {name} 并移除 {count} 个免费版？', 'Install {name} and remove {count} free version(s)?'],
+  confirmUpdateRemove: ['更新 {count} 处安装并移除 {removed} 个免费版？', 'Update {count} installations and remove {removed} free version(s)?'],
+  confirmCleanup: ['移除 {removed} 个免费版？', 'Remove {removed} free version(s)?'],
+  autoConfirmedCleanup: ['非交互模式：已自动确认移除免费版。', 'Non-interactive mode: free-version removal was auto-confirmed.'],
   installCanceled: ['已取消安装。', 'Installation canceled.'],
   installed: ['已安装 {name} {version}：{path}', 'Installed {name} {version}: {path}'],
   updated: ['已更新 {name}：{previous} → {version}（{path}）', 'Updated {name}: {previous} → {version} ({path})'],

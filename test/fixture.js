@@ -9,6 +9,8 @@ export const CLI = fileURLToPath(new URL('../bin/hy.js', import.meta.url));
 const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 export const TOKEN = 'hy_Abcd0123456789abcdefghijklmnopqrstuvXYZ';
 export const INVALID = 'hy_Bad0123456789abcdefghijklmnopqrstuvXYZ';
+// 第二枚有效令牌：用 state.grants.set(TOKEN2, [...]) 注册后即可通过鉴权，用于多令牌场景。
+export const TOKEN2 = 'hy_Other0123456789abcdefghijklmnopqrstuv';
 export const EMAIL = 'test@example.com';
 // Windows 的模式位不区分 owner/group/others；用户隔离由目录 ACL 提供。
 export const configMode = process.platform === 'win32' ? 0o666 : 0o600;
@@ -80,7 +82,7 @@ export async function fixture(t) {
       const token = req.headers.authorization?.replace(/^Bearer /, '');
       const english = req.headers['accept-language'] === 'en';
       state.requests.push({ method: req.method, path: url.pathname, query: url.searchParams, token, body, headers: req.headers });
-      const authenticate = () => { if (token !== TOKEN || state.revoked.has(token)) { error(res, 401, 'unauthorized', `令牌无效：${token || ''}`); return false; } return true; };
+      const authenticate = () => { if ((token !== TOKEN && !state.grants.has(token)) || state.revoked.has(token)) { error(res, 401, 'unauthorized', `令牌无效：${token || ''}`); return false; } return true; };
       if (req.method === 'GET' && url.pathname === '/api/store/catalog') {
         // 通用错误注入：failWith 命中 catalog/versions 时按它返回错误 JSON（error/message 可省略）。
         if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);

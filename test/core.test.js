@@ -76,6 +76,17 @@ test('Output 遮盖已记住的密钥与编码形式，只显示前 8 字符', (
   assert(!JSON.stringify(result).includes('othersecretsignature'));
 });
 
+test('长度不超过 8 的密钥整段隐藏，不显示任何前缀片段', () => {
+  withLanguage({ lang: 'zh' }, () => {
+    const short = 's3cr3t';
+    const output = new Output(false, 'login', [short]);
+    assert.equal(output.redact(`令牌 ${short} 尾`), '令牌 [已隐藏] 尾');
+    assert(!output.redact(`x${short}x`).includes(short));
+    const json = new Output(true, 'login', [short]);
+    assert.equal(json.sanitize({ token: short }).token, '[已隐藏]');
+  });
+});
+
 test('hy_ 前缀兜底：陌生令牌即使带省略号也只显示前 8 字符', () => {
   const output = new Output(false, 'status');
   assert.equal(output.redact('hy_UnrecognizedSecretToken123…'), 'hy_Unrec…');

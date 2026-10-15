@@ -10,8 +10,9 @@ const BIN = fileURLToPath(new URL('../bin/hy.js', import.meta.url));
 const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 const { version: VERSION } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
-// 任务 4 起 publish、任务 6 起 install 已实现；仍待实现的命令保持 not_implemented。
-const PENDING = ['update', 'manage', 'product', 'unpublish', 'audit'];
+// 任务 4 起 publish、任务 6 起 install、二期任务 1 起 update 已实现；仍待实现的命令保持 not_implemented。
+// update 与 install 一样先拉 catalog，本测试不带假商店服务器，不能再当 not_implemented 样本（行为测试见 test/update.test.js）。
+const PENDING = ['manage', 'product', 'unpublish', 'audit'];
 
 // 语言相关环境固定为确定值（默认中文）；extraEnv 在其后展开以便覆盖测试环境变量通道。
 const BASE_ENV = { HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_TOKEN: '', CI: '' };

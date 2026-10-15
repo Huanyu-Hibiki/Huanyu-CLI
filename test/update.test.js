@@ -1,0 +1,227 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { lstat, mkdir, readFile, readdir, realpath, rm } from 'node:fs/promises';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
+
+const data = (result) => {
+  assert.equal(result.signal, null, result.stderr);
+  assert.equal(result.stderr, '', result.stderr);
+  return JSON.parse(result.stdout);
+};
+const exists = async (file) => { try { return await lstat(file); } catch { return null; } };
+const stageLeftovers = async (root) => (await readdir(root, { recursive: false }).catch((error) => error.code === 'ENOENT' ? [] : (() => { throw error; })())).filter((name) => name.startsWith('.hy-stage-'));
+const versionOf = async (directory) => ((await readFile(path.join(directory, 'SKILL.md'), 'utf8')).match(/version: "([^"]+)"/) || [])[1];
+
+// 二期任务 1：hy update 全量更新——链接只更新实体、整批事务、定点/过滤/开发目录/回滚/up_to_date。
+
+test('链接种：链接宿主里的旧版本只更新真实目录，链接保持指向且新版本即刻生效（status 复核）', async (t) => {
+  const f = await fixture(t);
+  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  // 只更新链接指向的真实目录：动作落在 real，链接本身不在动作列表里。
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: real, previous: '0.0.9', version: '0.1.0' }]);
+  assert.equal(value.status, 'updated');
+  assert.equal(value.found_count, 1);
+  assert.equal(value.eligible_count, 1);
+  assert.equal(value.updated_count, 1);
+  assert.equal(value.auto_confirmed, true);
+  assert.equal(await versionOf(real), '0.1.0');
+  // 链接原样保留且指向不变；透过链接读到的已是新版本（更新一次全部生效）。
+  assert.ok((await lstat(linked)).isSymbolicLink(), '链接不应被换成独立副本');
+  assert.equal(await readDirectoryLink(linked), real);
+  assert.equal(await versionOf(linked), '0.1.0');
+  // status 复核：一份实体、real_path 与版本正确、无多副本警告。
+  const status = data(await f.run(['status', '--json']));
+  assert.equal(status.installations.length, 1);
+  assert.equal(status.installations[0].path, linked);
+  assert.equal(status.installations[0].real_path, await realpath(real));
+  assert.equal(status.installations[0].current, '0.1.0');
+  assert.deepEqual(status.warnings, []);
+  // 文本通道：updated 行（previous → version）与非交互自动确认提示（先把实体降回旧版本再跑一次）。
+  await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  const human = await f.run(['update']);
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.match(human.stdout, new RegExp(`已更新 ppt-design：0\\.0\\.9 → 0\\.1\\.0（${real.replaceAll('\\', '\\\\')}）`));
+  assert.match(human.stdout, /非交互模式：已自动确认更新。/);
+});
+
+test('多副本种：多宿主多副本各自更新、同名只下载一次、多副本警告保留、counts 形状完整', async (t) => {
+  const f = await fixture(t);
+  const zcode = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  const claude = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.8', 'my-ppt');
+  const current = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'oracle-bone', '0.1.0');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  // counts JSON 形状：found/eligible/updated + status。
+  assert.equal(value.found_count, 3);
+  assert.equal(value.eligible_count, 3);
+  assert.equal(value.updated_count, 2);
+  assert.equal(value.status, 'updated');
+  // 两份独立副本各自更新到最新；未过期的 oracle-bone 不在 installations 里。
+  assert.equal(await versionOf(zcode), '0.1.0');
+  assert.equal(await versionOf(claude), '0.1.0');
+  assert.equal(await versionOf(current), '0.1.0');
+  assert.deepEqual(value.installations.map((item) => [item.path, item.previous, item.version]).sort(),
+    [[zcode, '0.0.9', '0.1.0'], [claude, '0.0.8', '0.1.0']].sort());
+  // 同名多副本共享一次下载（apply 按 Skill 名去重准备）。
+  assert.equal(f.state.requests.filter((r) => r.path === '/api/store/download/ppt-design').length, 1);
+  assert.equal(f.state.requests.filter((r) => r.path === '/api/store/download/oracle-bone').length, 0);
+  // 副本仍是独立目录：复扫的多副本警告保留（提示合并成一份）。
+  assert.equal(value.warnings.length, 1);
+  assert.match(value.warnings[0], /2 份独立副本/);
+});
+
+test('定点种：--path 只更新指定目录；未知目录与 --skill 不匹配拒绝', async (t) => {
+  const f = await fixture(t);
+  const zcode = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  const claude = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.8');
+  const result = await f.run(['update', '--path', zcode, '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: zcode, previous: '0.0.9', version: '0.1.0' }]);
+  assert.equal(value.found_count, 1);
+  assert.equal(value.updated_count, 1);
+  assert.equal(value.status, 'updated');
+  // 定点不扫其他宿主：claude 旧副本原样保留，也不报多副本警告（单根视野）。
+  assert.equal(await versionOf(claude), '0.0.8');
+  assert.deepEqual(value.warnings, []);
+  // 未知目录（存在但无可识别 Skill）→ exit 2 unknown_installation。
+  const empty = path.join(f.cwd, 'empty-dir');
+  await mkdir(empty);
+  const unknown = await f.run(['update', '--path', empty, '--json']);
+  assert.equal(unknown.code, 2);
+  assert.equal(data(unknown).error, 'unknown_installation');
+  assert.match((await f.run(['update', '--path', empty])).stderr, /没有可识别的 Skill/);
+  // 目录里装的是 oracle-bone，与 --skill ppt-design 不符 → exit 2 skill_mismatch。
+  const oracle = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'oracle-bone', '0.0.9');
+  const mismatch = await f.run(['update', 'ppt-design', '--path', oracle, '--json']);
+  assert.equal(mismatch.code, 2);
+  assert.equal(data(mismatch).error, 'skill_mismatch');
+  assert.match(data(mismatch).message, /与 ppt-design 不符/);
+});
+
+test('开发目录种：skipped 只报一次且内容不动；全部为开发目录 → skipped 状态且不打版本表', async (t) => {
+  const f = await fixture(t);
+  const dev = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  await mkdir(path.join(dev, '.git'));
+  const normal = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.8');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: dev, reason: 'development_directory' }]);
+  assert.equal(value.found_count, 2);
+  assert.equal(value.eligible_count, 1);
+  assert.equal(value.updated_count, 1);
+  assert.equal(await versionOf(dev), '0.0.9', '开发目录内容不动');
+  assert.equal(await versionOf(normal), '0.1.0');
+  assert.match((await f.run(['update'])).stdout, new RegExp(`ppt-design：开发目录，跳过（${dev.replaceAll('\\', '\\\\')}）`));
+  // 全为开发目录：状态 skipped，不再打版本表也不发起下载。
+  await rm(normal, { recursive: true, force: true });
+  const versionsCalls = f.state.requests.filter((r) => r.path === '/api/store/versions').length;
+  const downloads = f.state.requests.filter((r) => r.path.startsWith('/api/store/download')).length;
+  const all = await f.run(['update', '--json']);
+  assert.equal(all.code, 0);
+  const allValue = data(all);
+  assert.equal(allValue.status, 'skipped');
+  assert.equal(allValue.found_count, 1);
+  assert.equal(allValue.eligible_count, 0);
+  assert.equal(allValue.updated_count, 0);
+  assert.equal(f.state.requests.filter((r) => r.path === '/api/store/versions').length, versionsCalls, '全开发目录不打版本表');
+  assert.equal(f.state.requests.filter((r) => r.path.startsWith('/api/store/download')).length, downloads);
+  assert.equal(await versionOf(dev), '0.0.9');
+});
+
+test('注入回滚种：批量中途 rename 失败 → 整批回滚，两处旧版本完整保留且无暂存残留', async (t) => {
+  const f = await fixture(t);
+  const zcode = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  const claude = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.8');
+  // 第 3 次 rename 是第二处安装挪备份时：第一处已完全提交，回滚必须把它还原。
+  const result = await f.run(['update', '--json'], {}, { failRenameAt: 3 });
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'replace');
+  assert.equal(await versionOf(zcode), '0.0.9', '已提交的第一处要被整批回滚还原');
+  assert.equal(await versionOf(claude), '0.0.8');
+  assert.deepEqual(await stageLeftovers(path.dirname(zcode)), []);
+  assert.deepEqual(await stageLeftovers(path.dirname(claude)), []);
+});
+
+test('up_to_date 种：全部最新 → 状态 up_to_date、空 installations、不打下载请求', async (t) => {
+  const f = await fixture(t);
+  await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.1.0');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0);
+  const value = data(result);
+  assert.equal(value.status, 'up_to_date');
+  assert.deepEqual(value.installations, []);
+  assert.equal(value.found_count, 1);
+  assert.equal(value.eligible_count, 1);
+  assert.equal(value.updated_count, 0);
+  assert.equal('auto_confirmed' in value, false, '无动作被静默确认时不打 auto_confirmed');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '无可更新不应下载');
+  assert.equal((await f.run(['update'])).stdout, '已安装的 Skill 无需更新。\n');
+});
+
+test('过滤种：update <skill> 只更新指定 Skill；未知 Skill 名拒绝', async (t) => {
+  const f = await fixture(t);
+  const ppt = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  const oracle = await writeSkill(path.join(f.home, '.claude', 'skills'), 'oracle-bone', '0.0.9');
+  const result = await f.run(['update', 'oracle-bone', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.equal(value.found_count, 1);
+  assert.deepEqual(value.installations, [{ name: 'oracle-bone', path: oracle, previous: '0.0.9', version: '0.1.0' }]);
+  assert.equal(await versionOf(ppt), '0.0.9', '未指定的 Skill 不动');
+  const unknown = await f.run(['update', 'bogus-skill', '--json']);
+  assert.equal(unknown.code, 2);
+  assert.equal(data(unknown).error, 'unknown_skill');
+});
+
+test('付费 Skill 的 update 沿用一期购买引导拦截：exit 3 purchase_unavailable，不发下载', async (t) => {
+  const f = await fixture(t);
+  await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design-pro', '0.0.9');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 3);
+  const value = data(result);
+  assert.equal(value.error, 'purchase_unavailable');
+  assert.equal(value.phase2, true);
+  assert.equal(value.url, `${f.base}/store/ppt-design-pro/`);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download') || r.path.startsWith('/releases/')), '付费引导拦截不应进入下载');
+  const human = await f.run(['update']);
+  assert.equal(human.code, 3);
+  assert.match(human.stderr, /暂未开放购买/);
+});
+
+test('交互确认更新数量；拒绝 → updateCanceled（exit 0）且未动目标', async (t) => {
+  const f = await fixture(t);
+  const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  const result = await f.run(['update'], {}, { interactive: true, answers: [false] });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.ok(result.stdout.endsWith('已取消更新。\n'), result.stdout);
+  assert.match(result.trace.questions[0], /更新 1 处安装？ \[Y\/n\]/);
+  assert.equal(await versionOf(target), '0.0.9');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+  const json = await f.run(['update', '--json'], {}, { interactive: true, answers: [false] });
+  assert.equal(json.code, 0);
+  const value = data(json);
+  assert.equal(value.status, 'cancelled');
+  assert.equal(value.cancelled, true);
+  assert.equal(value.updated_count, 0);
+});
+
+test('no_installations：本机没有任何商店 Skill → 状态 no_installations', async (t) => {
+  const f = await fixture(t);
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0);
+  const value = data(result);
+  assert.equal(value.status, 'no_installations');
+  assert.equal(value.found_count, 0);
+  assert.deepEqual(value.installations, []);
+  assert.match((await f.run(['update'])).stdout, /未发现已安装的商店 Skill。/);
+});

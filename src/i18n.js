@@ -151,6 +151,13 @@ export const dictionary = {
   loginRequired: ['请先运行 {command} login。', 'First run {command} login.'],
   purchaseUnavailable: ['{name} 暂未开放购买：购买功能二期上线，可先到 {url} 查看商品页。', '{name} is not available for purchase yet. Purchasing arrives in phase 2; see the product page at {url}.'],
   autoConfirmedInstall: ['非交互模式：已自动确认安装。', 'Non-interactive mode: installation was auto-confirmed.'],
+  // 更新族（二期任务 1）
+  unknownInstallation: ['这个目录里没有可识别的 Skill：{path}', 'No recognized skill in this directory: {path}'],
+  installationMismatch: ['指定目录里安装的是 {name}，与 {expected} 不符。', 'This directory contains {name}, not {expected}.'],
+  upToDate: ['已安装的 Skill 无需更新。', 'Installed skills are up to date.'],
+  confirmUpdate: ['更新 {count} 处安装？', 'Update {count} installations?'],
+  updateCanceled: ['已取消更新。', 'Update canceled.'],
+  autoConfirmedUpdate: ['非交互模式：已自动确认更新。', 'Non-interactive mode: update was auto-confirmed.'],
   // 发布族（任务 4）
   skillRead: ['无法读取 {path}，请检查目录和文件权限。', 'Could not read {path}. Check the directory and file permissions.'],
   developmentRead: ['无法检查 {path}，请检查目录权限。', 'Could not check {path}. Check directory permissions.'],

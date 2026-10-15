@@ -11,10 +11,10 @@ import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo } from './publish.js';
 import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory } from './skills.js';
 import { targetRoot, installationRoots, nearestHostId } from './hosts.js';
-import { directoryKey, sameDirectory } from './platform.js';
+import { directoryKey, sameDirectory, resolveDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
 
-// 14 个命令全部在参数解析层合法；help/version/list/login/logout/status/publish 之外的执行逻辑随后续任务落地。
+// 14 个命令全部在参数解析层合法；help/version/list/login/logout/status/publish/install/update 之外的执行逻辑随后续任务落地。
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
 
 export function parseArgs(argv) {
@@ -187,7 +187,7 @@ async function apply(ctx, actions, versions) {
       prepared.set(name, await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal));
     }
     return await replaceAll(actions.map((action) => ({ ...action, source: action.remove || action.link ? undefined : prepared.get(action.name).source })),
-      { signal: ctx.signal, names: ctx.names, onStage: ctx.observeStage });
+      { signal: ctx.signal, names: ctx.names, onStage: ctx.observeStage, renameFile: ctx.renameFile });
   } finally {
     for (const item of prepared.values()) await item.cleanup().catch(() => {});
   }
@@ -310,6 +310,68 @@ async function install(ctx, name = ctx.options.skill) {
   return 0;
 }
 
+// 全量更新（二期任务 1）：扫描九宿主的全部已装商店 Skill → 过滤过期（version < latest）→
+// 按 real_path 去重（链接安装只更新真实目标一次，链接保持指向、新版本即刻生效）→ apply 整批
+// 事务替换 → 复扫冲突/多副本警告。`update <skill>` 只更新指定；`--path <目录>` 定点（拒绝未知
+// 目录/与 --skill 不匹配）。开发目录跳过并解释；交互确认更新数量，非交互 auto_confirmed 警示沿用。
+// 付费 Skill 沿用 install 的一期购买引导拦截（purchaseUnavailable，exit 3 附商品页）；
+// 已购安装的解锁（requireLogin + 令牌下载）由二期任务 3/5 接入。
+async function update(ctx) {
+  if (ctx.options.skill) findSkill(ctx.catalog, ctx.options.skill);
+  let all;
+  if (ctx.options.path) {
+    const directory = resolveDirectory(ctx.options.path);
+    const item = await inspectSkill(directory, ctx.names);
+    if (!item) throw new CliError(t('unknownInstallation', { path: directory }), 2, 'unknown_installation');
+    if (ctx.options.skill && item.name !== ctx.options.skill) throw new CliError(t('installationMismatch', { name: skillLabel(item.name), expected: skillLabel(ctx.options.skill) }), 2, 'skill_mismatch');
+    all = [item];
+  } else all = await scan(ctx.names);
+  const found = all.filter((item) => !ctx.options.skill || item.name === ctx.options.skill);
+  const skipped = found.filter((item) => item.development).map(skippedInstallation);
+  // 与 template 对齐的双重防线：scan 已按 real_path 折叠，这里再按真实目录去重一次——
+  // 多宿主链接到同一实体时只更新真实目标，不重复动作。
+  const seen = new Set();
+  const eligible = found.filter((item) => {
+    if (item.development || seen.has(directoryKey(item.real_path))) return false;
+    seen.add(directoryKey(item.real_path)); return true;
+  });
+  const counts = { found_count: found.length, eligible_count: eligible.length };
+  if (!eligible.length) {
+    const warnings = await conflicts(all, ctx.catalog);
+    ctx.output.write({ installations: [], removed: [], skipped, warnings, ...counts, updated_count: 0, status: found.length ? 'skipped' : 'no_installations' },
+      [...(found.length ? [] : [t('noInstallations')]), ...skippedLines(skipped), ...warnings]);
+    return 0;
+  }
+  const versions = await ctx.client.versions(ctx.catalog);
+  const pending = eligible.filter((item) => !item.version || compare(item.version, versions[item.name].latest) < 0);
+  const actions = await Promise.all(pending.map(async (item) => ({ name: item.name, path: await realInstallation(item), previousName: item.name, previousVersion: item.version })));
+  for (const action of actions) {
+    const { product, paid } = findSkill(ctx.catalog, action.name);
+    if (paid) {
+      const url = ctx.client.subscriptionUrl(action.name, product);
+      throw new CliError(t('purchaseUnavailable', { name: skillLabel(action.name), url }), 3, 'purchase_unavailable', { url, phase2: true });
+    }
+  }
+  // --yes 是用户显式确认；auto_confirmed 只标记「非交互静默确认」——与 install 同语义，
+  // 但仅在实际有动作被静默确认时标记（up_to_date 无动作就不打提示行）。
+  const auto = actions.length > 0 && !ctx.options.yes && !ctx.interactive;
+  if (actions.length && !await ctx.confirm(t('confirmUpdate', { count: actions.length }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
+    ctx.output.write({ cancelled: true, removed: [], skipped, ...counts, updated_count: 0, status: 'cancelled' }, [t('updateCanceled'), ...skippedLines(skipped)]);
+    return 0;
+  }
+  const warnings = await apply(ctx, actions, versions);
+  // 复扫原发现范围（--path 定点只看那个根）：冲突警告需要全目录视角；多副本只在非定点时报告。
+  const after = await scan(ctx.names, all.map((item) => item.root));
+  warnings.push(...await conflicts(after, ctx.catalog));
+  if (!ctx.options.path) warnings.push(...duplicateLines(duplicateCopies(after.filter((item) => !ctx.options.skill || item.name === ctx.options.skill))));
+  const installations = actions.map((item) => ({ name: item.name, path: item.path, previous: item.previousVersion, version: versions[item.name].latest }));
+  ctx.output.write({ installations, removed: [], skipped, warnings, ...counts, updated_count: installations.length,
+    status: installations.length ? 'updated' : 'up_to_date', ...(auto ? { auto_confirmed: true } : {}) },
+    [...(installations.length ? installations.map((item) => t('updated', { name: skillLabel(item.name), previous: item.previous || t('unknownVersion'), version: item.version, path: item.path })) : [t('upToDate')]),
+      ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedUpdate')] : [])]);
+  return 0;
+}
+
 // runtime 用于测试时注入时钟和终端交互；可执行入口不传测试选项。
 export const run = (argv, runtime = {}) => withLanguage(resolveLanguage(argv), () => runCommand(argv, runtime));
 
@@ -356,15 +418,18 @@ async function runCommand(argv, runtime) {
       openBrowser: runtime.openBrowser || ((url, timeoutMs) => openBrowser(url, undefined, undefined, timeoutMs)),
       sleep: runtime.sleep || delay, now: runtime.now || Date.now,
       confirm: runtime.confirm || confirm, ask: runtime.ask || ask,
+      // renameFile 仅供测试注入批量事务的中途失败（install/update 整批回滚验证）；生产路径为 undefined，replaceAll 内回落真实 rename。
+      renameFile: runtime.renameFile,
       observeStage: (stage) => stages.push(stage) };
     if (options.command === 'logout') return await logout(ctx);
     if (options.command === 'login') return await login(ctx, options.token);
-    if (options.command === 'status' || options.command === 'list' || options.command === 'install') {
+    if (options.command === 'status' || options.command === 'list' || options.command === 'install' || options.command === 'update') {
       // catalog 拉取一次并缓存进 ctx；status 扫描与 install/update 等后续命令复用。
       ctx.catalog = await ctx.client.catalog();
       ctx.names = catalogNames(ctx.catalog);
       if (options.command === 'status') return await status(ctx);
       if (options.command === 'install') return await install(ctx);
+      if (options.command === 'update') return await update(ctx);
       return await list(ctx);
     }
     if (options.command === 'publish') {

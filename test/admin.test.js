@@ -74,17 +74,27 @@ test('product 注册新发布的 skill 并声明配对：catalog 增商品，lis
   assert.equal(free.type, 'free');
 });
 
-test('product 非法字段值本地拒绝：价格非数字/缺币种/负数/未知字段/空摘要，未发出 PUT', async (t) => {
+test('product 非法字段值本地拒绝：价格非数字/缺币种/负数/天价/未知字段/空摘要，未发出 PUT', async (t) => {
   const f = await fixture(t);
   await f.run(['login', '--token', TOKEN, '--json']);
   for (const bad of ['prices.lifetime=abc,cny', 'prices.lifetime=6900', 'prices.lifetime=-1,cny', 'prices.lifetime=0,cny',
-    'prices.lifetime=6900,cnyx', 'prices.Lifetime=6900,cny', 'unknown=x', 'summary=']) {
+    'prices.lifetime=6900,cnyx', 'prices.Lifetime=6900,cny', 'prices.lifetime=1000000001,cny', 'unknown=x', 'summary=']) {
     const result = await f.run(['product', 'ppt-design', '--set', bad, '--json'], { HY_TOKEN: TOKEN });
     assert.equal(result.code, 2, bad);
     assert.equal(data(result).error, 'usage', bad);
     assert.match(data(result).message, /--set 字段值无效/, bad);
   }
-  assert.equal(putRequests(f).length, 0);
+  // 重复键（M3）：顶层字段与 prices 方案名各只能设置一次，静默覆盖改为显式报错。
+  const duplicateTop = await f.run(['product', 'ppt-design', '--set', 'summary=甲', '--set', 'summary=乙', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(duplicateTop.code, 2);
+  assert.equal(data(duplicateTop).error, 'usage');
+  assert.match(data(duplicateTop).message, /--set summary 重复：每个字段只能设置一次。/);
+  const duplicatePlan = await f.run(['product', 'ppt-design', '--set', 'prices.lifetime=6900,cny', '--set', 'prices.lifetime=9900,cny', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(duplicatePlan.code, 2);
+  assert.match(data(duplicatePlan).message, /--set prices\.lifetime 重复/);
+  // 不同 prices 方案并存是合法的（不是重复键）。
+  assert.equal((await f.run(['product', 'ppt-design', '--set', 'prices.lifetime=6900,cny', '--set', 'prices.yearly=12000,cny', '--json'], { HY_TOKEN: TOKEN })).code, 0);
+  assert.equal(putRequests(f).length, 1);
   assert.match((await f.run(['product', 'ppt-design', '--set', 'prices.lifetime=abc,cny'])).stderr, /prices\.<方案>=<分>,<币种>/);
 });
 
@@ -118,7 +128,9 @@ test('product 服务端错误映射：400 invalid_field 退出 1、403 退出 3�
   const invalid = await f.run(['product', 'ppt-design', '--set', 'summary=x', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(invalid.code, 1);
   assert.equal(data(invalid).error, 'invalid_field');
-  assert.match(data(invalid).message, /--set 字段值无效/);
+  // 服务端拒绝用独立词条透传原因（M2），不再复用本地语法提示误导用户。
+  assert.match(data(invalid).message, /商店拒绝了该商品元数据：注入的商品更新失败。/);
+  assert.doesNotMatch(data(invalid).message, /--set 字段值无效/);
   f.state.productStatus = 403;
   const forbidden = await f.run(['product', 'ppt-design', '--set', 'summary=x', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(forbidden.code, 3);
@@ -202,6 +214,54 @@ test('unpublish 下架：已装不受影响、新安装该版本 404、latest �
   assert.equal((await fetch(`${f.base}/api/store/download/ppt-design?version=0.1.0&format=tar.gz`)).status, 404);
 });
 
+test('全下架占位一致（M1）：status 不报可更新并带 all_yanked 标记，update 跳过下载并解释', async (t) => {
+  const f = await fixture(t);
+  await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
+  const target = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await writeSkill(f.cwd, 'ppt-design', '0.2.0');
+  assert.equal((await f.run(['publish', 'ppt-design', '--json'], { HY_TOKEN: TOKEN })).code, 0);
+  await writeSkill(f.cwd, 'ppt-design', '0.3.0');
+  assert.equal((await f.run(['publish', 'ppt-design', '--json'], { HY_TOKEN: TOKEN })).code, 0);
+  for (const version of ['0.1.0', '0.2.0', '0.3.0']) await f.run(['unpublish', 'ppt-design', version, '--json'], { HY_TOKEN: TOKEN });
+  // 全部版本下架：latest 占位 0.3.0（本身已下架）——status/update 不得把它当可更新目标。
+  const status = data(await f.run(['status', '--json']));
+  const item = status.installations.find((installation) => installation.name === 'ppt-design');
+  assert.equal(item.latest, '0.3.0');
+  assert.equal(item.update_available, false);
+  assert.equal(item.all_yanked, true);
+  // history 仍可见（含 yanked 标记），只是不可作为更新目标。
+  assert.deepEqual(item.updates.map((update) => [update.version, update.yanked ?? false]), [['0.2.0', true], ['0.3.0', true]]);
+  assert.match((await f.run(['status'])).stdout, /ppt-design：0\.1\.0（商店全部版本已下架）/);
+  // update：不进 pending、不下载，跳过并解释；本地版本不动；状态 up_to_date（无可更新动作）。
+  const downloadsBefore = f.state.requests.filter((request) => request.path === '/api/store/download/ppt-design').length;
+  const update = data(await f.run(['update', '--json']));
+  assert.deepEqual(update.installations, []);
+  assert.deepEqual(update.skipped, [{ name: 'ppt-design', path: target, reason: 'all_yanked' }]);
+  assert.equal(update.updated_count, 0);
+  assert.equal(update.status, 'up_to_date');
+  const text = await f.run(['update']);
+  assert.match(text.stdout, /已安装的 Skill 无需更新。/);
+  assert.match(text.stdout, /ppt-design：商店全部版本已下架，跳过更新/);
+  // update 没有发起新的下载（downloadsBefore 是准备阶段 install 的那一次）。
+  assert.equal(f.state.requests.filter((request) => request.path === '/api/store/download/ppt-design').length, downloadsBefore);
+  assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /version: "0\.1\.0"/);
+});
+
+test('product 跨商品冲突本地预判（M2）：free/paid 属于其他商品时精确报错且未发 PUT；本地无法预判的交给服务端', async (t) => {
+  const f = await fixture(t);
+  const conflict = await f.run(['product', 'ppt-design', '--set', 'paid=oracle-bone', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(conflict.code, 2);
+  assert.equal(data(conflict).error, 'product_conflict');
+  assert.match(data(conflict).message, /oracle-bone 已属于商品 甲骨文，不能在该商品下声明配对。/);
+  assert.equal(putRequests(f).length, 0);
+  // 目标商品自己的另一面（swap 到已有 skill）本地不冲突：最终由服务端按 free=paid 规则拒绝（独立词条透传原因）。
+  const swap = await f.run(['product', 'ppt-design', '--set', 'free=ppt-design-pro', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(swap.code, 1);
+  assert.equal(data(swap).error, 'invalid_field');
+  assert.match(data(swap).message, /商店拒绝了该商品元数据：free 与 paid 不能相同。/);
+  assert.equal(putRequests(f).length, 1);
+});
+
 test('unpublish 拒绝语义：版本不存在 404 → 退出 1；非 publisher（TOKEN2 与服务端 403）退出 3；未登录退出 3', async (t) => {
   const f = await fixture(t);
   // 不先 login：令牌经 HY_TOKEN 按次提供，未登录场景才能走真实的设备码引导。
@@ -251,6 +311,7 @@ test('audit 对账四分类 + yanked 提示：无需登录，--json 结构化，
   // 只读公开接口：audit 全程不再新增 /api/auth/me 请求（前面的 publish/unpublish 属于准备阶段）。
   const authRequests = () => f.state.requests.filter((request) => request.path === '/api/auth/me').length;
   const authBefore = authRequests();
+  const requestsBefore = f.state.requests.length;
   const result = await f.run(['audit', '--repo', repo, '--json']);
   assert.equal(result.code, 0, result.stdout);
   const value = data(result);
@@ -266,6 +327,10 @@ test('audit 对账四分类 + yanked 提示：无需登录，--json 结构化，
   assert.deepEqual(value.counts, { total: 4, publishable: 2, current: 1, local_behind: 0, store_only: 1 });
   // 只读公开接口：audit 全程没有新增 /api/auth/me 请求，未登录可用。
   assert.equal(authRequests(), authBefore);
+  // 零令牌保证（L5）：audit 触发的 catalog/versions 请求都不带 Authorization。
+  const publicRequests = f.state.requests.slice(requestsBefore).filter((request) => ['/api/store/catalog', '/api/store/versions'].includes(request.path));
+  assert.ok(publicRequests.length >= 2);
+  assert.ok(publicRequests.every((request) => request.token === undefined));
   // 与 publish --check 同源（共享 reconcileRepo）：同一仓库两份报告一致。
   const check = data(await f.run(['publish', '--repo', repo, '--check', '--json'], { HY_TOKEN: TOKEN }));
   assert.deepEqual(check.skills, value.skills);

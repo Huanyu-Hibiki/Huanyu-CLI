@@ -204,6 +204,9 @@ export const dictionary = {
   // 管理命令族（二期任务 2）
   productUsage: ['product 需要一个 Skill 名和至少一个 --set <字段>=<值>，例如 --set summary=... 或 --set prices.lifetime=6900,cny。', 'product requires a skill name and at least one --set <field>=<value>, for example --set summary=... or --set prices.lifetime=6900,cny.'],
   productFields: ['--set 字段值无效：summary/name 需为非空文本；prices.<方案>=<分>,<币种>（如 prices.lifetime=6900,cny）；free/paid 需为规范名且互异。', '--set has an invalid value: summary/name must be non-empty text; prices.<plan>=<cents>,<currency> (for example prices.lifetime=6900,cny); free/paid must be canonical skill names and differ from each other.'],
+  productDuplicate: ['--set {key} 重复：每个字段只能设置一次。', '--set {key} is repeated; each field can only be set once.'],
+  productConflict: ['{skill} 已属于商品 {owner}，不能在该商品下声明配对。', '{skill} already belongs to the product {owner}; it cannot be paired under this product.'],
+  productRejected: ['商店拒绝了该商品元数据：{message}', 'The store rejected this product metadata: {message}'],
   productUpdated: ['已更新商品：{name}', 'Product updated: {name}'],
   productResponse: ['商品信息不完整，请重试。', 'The product response is incomplete. Please retry.'],
   unpublishUsage: ['unpublish 需要 <skill> 和 <版本>（x.y.z）。', 'unpublish requires <skill> and <version> (x.y.z).'],
@@ -212,6 +215,9 @@ export const dictionary = {
   unpublishMissing: ['没有 {name} {version} 这个版本，请核对后重试。', 'There is no {name} {version} release. Check it and retry.'],
   unpublishResponse: ['下架结果不完整，请重试。', 'The unpublish response is incomplete. Please retry.'],
   auditYanked: ['已下架：{name} {version}（历史保留，新安装 404）', 'Yanked: {name} {version} (kept in history; new installs return 404)'],
+  // 全下架占位语义（假设 #4 注记，M1）：latest 指向的版本本身已下架 = 商店无任何可安装版本。
+  versionYanked: ['{name}：{version}（商店全部版本已下架）', '{name}: {version} (all store versions yanked)'],
+  skippedYanked: ['{name}：商店全部版本已下架，跳过更新（{path}）', '{name}: all store versions yanked; update skipped ({path})'],
 };
 
 export function resolveLanguage(argv = [], env = process.env) {

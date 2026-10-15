@@ -9,7 +9,7 @@ import { Client, catalogNames, findSkill, isSkillName, isVersion } from './clien
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo, reconcileRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory } from './skills.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked } from './skills.js';
 import { targetRoot, installationRoots, nearestHostId } from './hosts.js';
 import { directoryKey, sameDirectory, resolveDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
@@ -87,18 +87,21 @@ export function parseArgs(argv) {
 
 // --set 字段解析（product 专用，二期任务 2）：发布者可编辑面 = name/summary 文本、prices.<方案>=<分>,<币种>、
 // free/paid 配对声明（设计「数据模型」Product 结构）。纯本地校验给快速反馈；服务端仍是最终验证者（400）。
+// 金额上限 10^9 分（=1 千万元，M 审查 L4）：防单位弄错出的天价；重复键显式报错（M3），不静默覆盖。
 function parseProductFields(sets) {
-  const fields = {};
+  const fields = {}, seen = new Set();
   for (const entry of sets) {
     const separator = entry.indexOf('=');
     const key = separator > 0 ? entry.slice(0, separator) : '', value = separator > 0 ? entry.slice(separator + 1) : '';
+    if (seen.has(key)) throw new CliError(t('productDuplicate', { key }), 2, 'usage');
+    seen.add(key);
     const invalidField = () => new CliError(t('productFields'), 2, 'usage');
     if (key === 'summary' || key === 'name') {
       if (!value.trim() || value.length > 500) throw invalidField();
       fields[key] = value;
     } else if (key.startsWith('prices.')) {
       const plan = key.slice('prices.'.length), match = value.match(/^(\d+),([A-Za-z]{3})$/), amount = Number(match?.[1]);
-      if (!/^[a-z][a-z0-9_-]*$/.test(plan) || !match || !(amount > 0) || !Number.isSafeInteger(amount)) throw invalidField();
+      if (!/^[a-z][a-z0-9_-]*$/.test(plan) || !match || !(amount > 0) || !Number.isSafeInteger(amount) || amount > 1_000_000_000) throw invalidField();
       fields.prices = { ...fields.prices, [plan]: { amount, currency: match[2].toLowerCase(), interval: null } };
     } else if (key === 'free' || key === 'paid') {
       if (!isSkillName(value)) throw invalidField();
@@ -126,7 +129,8 @@ const subscriptionLines = (subscriptions) => subscriptions.length ? subscription
 
 function installationLines(installed) {
   return installed.flatMap((item) => {
-    const key = item.development ? 'versionSkipped' : item.current === item.latest ? 'versionCurrent' : item.current && compare(item.current, item.latest) > 0 ? 'versionNewer' : 'versionUpdate';
+    // 全下架（M1）优先于版本比较：占位 latest 本身已下架，不能显示为「可更新 → 已下架版本」。
+    const key = item.development ? 'versionSkipped' : item.all_yanked ? 'versionYanked' : item.current === item.latest ? 'versionCurrent' : item.current && compare(item.current, item.latest) > 0 ? 'versionNewer' : 'versionUpdate';
     return [t(key, { name: skillLabel(item.name), version: item.current || t('unknownVersion'), latest: item.latest }),
       t('location', { path: item.path }), ...item.updates.flatMap((entry) => [t('releaseNotes', { version: entry.version }), entry.notes || t('noReleaseNotes')])];
   });
@@ -138,7 +142,7 @@ const HISTORY_LIMIT = 20;
 
 // install/update 共用的输出小件（任务 7）：跳过原因行与链接行。
 const skippedInstallation = (item) => ({ name: item.name, path: item.path, reason: 'development_directory' });
-const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
+const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink', all_yanked: 'skippedYanked' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
 const linkedLines = (links) => links.map((item) => t('linked', { name: skillLabel(item.name), path: item.path, target: item.target }));
 async function lstatOrNull(file) {
   try { return await lstat(file); }
@@ -153,8 +157,13 @@ async function status(ctx) {
   const found = await scan(ctx.names);
   // 没有安装就不打版本表：空场景省一次网络请求。
   const versions = found.length ? await ctx.client.versions(ctx.catalog) : {};
-  const installations = found.map((item) => ({ name: item.name, path: item.path, current: item.version, latest: versions[item.name].latest, development: item.development, real_path: item.real_path,
-    update_available: !item.development && (!item.version || compare(item.version, versions[item.name].latest) < 0), updates: updates(item.version, versions[item.name]) }));
+  const installations = found.map((item) => {
+    // 全下架（M1）：latest 是占位（本身已下架）→ 不报可更新，打 all_yanked 标记，文本走专门词条。
+    const yanked = latestYanked(versions[item.name]);
+    return { name: item.name, path: item.path, current: item.version, latest: versions[item.name].latest, development: item.development, real_path: item.real_path,
+      update_available: !item.development && !yanked && (!item.version || compare(item.version, versions[item.name].latest) < 0),
+      ...(yanked ? { all_yanked: true } : {}), updates: updates(item.version, versions[item.name]) };
+  });
   const warnings = await conflicts(found, ctx.catalog);
   warnings.push(...duplicateLines(duplicateCopies(found)));
   for (const item of found) {
@@ -407,7 +416,12 @@ async function update(ctx) {
     return 0;
   }
   const versions = await ctx.client.versions(ctx.catalog);
-  const pending = eligible.filter((item) => !item.version || compare(item.version, versions[item.name].latest) < 0);
+  // 全下架（M1，与 status 的 all_yanked 口径一致）：占位 latest 本身已下架的 skill 不进 pending、
+  // 不发起下载，跳过并解释——避免「报告可更新 → 下载 404」的前后矛盾。
+  const updateDue = (item) => !item.version || compare(item.version, versions[item.name].latest) < 0;
+  const pending = eligible.filter((item) => updateDue(item) && !latestYanked(versions[item.name]));
+  skipped.push(...eligible.filter((item) => updateDue(item) && latestYanked(versions[item.name]))
+    .map((item) => ({ name: item.name, path: item.path, reason: 'all_yanked' })));
   const actions = await Promise.all(pending.map(async (item) => ({ name: item.name, path: await realInstallation(item), previousName: item.name, previousVersion: item.version })));
   // 付费闸门（quality-M2 抽取为 purchaseGate，与 install 共用）：过期才有动作，已最新的付费
   // 安装不触发拦截；任务 3/5 解锁时只改 purchaseGate。
@@ -445,8 +459,9 @@ async function requirePublisher(ctx) {
   if (account.publisher !== true) throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
 }
 
-// hy product（二期任务 2）：注册/更新商品元数据。--set 值已在参数层校验；未知 skill 用公开目录+版本表
-// 预检（拼错名直接引导，不发 PUT）；服务端 upsert 与版本发布解耦（发布过或已在目录即可注册）。
+// hy product（二期任务 2）：注册/更新商品元数据。--set 值已在参数层校验；未知 skill 与跨商品配对冲突
+// 都用公开目录+版本表本地预检（此时手里已有 catalog，精确指明冲突，不发 PUT）；服务端 upsert 与版本
+// 发布解耦（发布过或已在目录即可注册），本地无法预判的规则由服务端终审（400 独立词条透传原因）。
 async function product(ctx) {
   const skill = ctx.options.skill;
   const fields = parseProductFields(ctx.options.set);
@@ -454,14 +469,23 @@ async function product(ctx) {
   const versions = await ctx.client.versions(catalog);
   const known = Boolean(versions[skill]) || catalog.some((item) => [item.id, item.free?.skill, item.paid?.skill].includes(skill));
   if (!known) throw new CliError(t('unknownSkill', { name: skillLabel(skill) }), 2, 'unknown_skill');
+  // 跨商品冲突预判（M2）：free/paid 值若属于其他商品，目录的 skill 全局唯一契约会破坏——本地拒绝并指明归属。
+  const target = catalog.find((item) => [item.id, item.free?.skill, item.paid?.skill].includes(skill));
+  for (const field of ['free', 'paid']) {
+    const value = fields[field];
+    if (!value) continue;
+    const owner = catalog.find((item) => item !== target && [item.id, item.free?.skill, item.paid?.skill].includes(value));
+    if (owner) throw new CliError(t('productConflict', { skill: value, owner: owner.name || owner.id }), 2, 'product_conflict');
+  }
   let updated;
   try {
     updated = await ctx.client.product(ctx.token, skill, fields);
   } catch (error) {
     if (error instanceof CliError) {
-      // 404/400/403 语义映射（设计「接口设计·发布端」）：404 与本地预检同义，403 与未登录同走登录引导。
+      // 404/400/403 语义映射（设计「接口设计·发布端」）：404 与本地预检同义，403 与未登录同走登录引导；
+      // 400 是服务端终审拒绝（本地语法已过预检），用独立词条透传服务端原因，不复用本地语法提示（M2）。
       if (error.details.http_status === 404) throw new CliError(t('unknownSkill', { name: skillLabel(skill) }), 2, 'unknown_skill');
-      if (error.error === 'invalid_field') throw new CliError(t('productFields'), 1, 'invalid_field');
+      if (error.error === 'invalid_field') throw new CliError(t('productRejected', { message: error.message }), 1, 'invalid_field');
       if (error.error === 'not_a_publisher') throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
     }
     throw error;

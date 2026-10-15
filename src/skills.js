@@ -212,6 +212,10 @@ export function updates(current, release) {
     .map(({ version, published_at, notes, yanked }) => ({ version, published_at, notes: typeof notes === 'string' ? notes : '', ...(yanked ? { yanked: true } : {}) }));
 }
 
+// 全下架判定（假设 #4 的占位语义，M1）：latest 指向的 history 条目本身已下架
+// = 该 skill 在商店已无任何可安装版本（版本表仍保留占位 latest，下载端 404）。
+export const latestYanked = (release) => Boolean(release?.history?.some((entry) => entry.version === release.latest && entry.yanked));
+
 // 配对数据驱动（设计「领域层重组」③）：对每个 free+paid 齐备的商品，同宿主根同时装了两个版本即警告。
 // 宿主归属用 sameAgentRoots（含项目级根），免费版经链接共享到付费版宿主也能识别。
 export async function conflicts(installed, catalog, env = process.env, platform = process.platform, cwd = process.cwd()) {

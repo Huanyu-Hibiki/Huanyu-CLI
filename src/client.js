@@ -116,4 +116,9 @@ export class Client {
     }
     return skills;
   }
+  async me(token, options = {}) {
+    const data = await this.request('/api/auth/me', { token, ...options });
+    if (typeof data?.email !== 'string' || !data.email || !Array.isArray(data.subscriptions)) throw invalid(t('invalidAccount'));
+    return data;
+  }
 }

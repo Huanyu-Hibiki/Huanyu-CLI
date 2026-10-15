@@ -1,6 +1,7 @@
 import { run } from '../src/cli.js';
 import { writeFile } from 'node:fs/promises';
 import { confirm } from '../src/io.js';
+import { openBrowser } from '../src/browser.js';
 
 const options = JSON.parse(process.env.HY_TEST_RUNTIME || '{}');
 let time = options.startTime ?? 0;
@@ -15,11 +16,12 @@ process.exitCode = await run(process.argv.slice(2), {
   terminal: options.terminal ?? options.interactive ?? false,
   interactive: options.interactive ?? false,
   now: () => time,
-  // 真实浏览器打开随登录命令（任务 3）接入；此前占位记录 URL 并返回未打开。
+  // 无 browserDelay 时接真实 openBrowser：POSIX 走 PATH 里的假 open/xdg-open，Windows 走 ComSpec 劫持的假浏览器。
   openBrowser: async (url, timeoutMs) => {
     trace.browserUrls.push(url);
     trace.browserTimeouts.push(timeoutMs);
-    if (options.browserDelay !== undefined) time += Math.min(options.browserDelay, timeoutMs);
+    if (options.browserDelay === undefined) return await openBrowser(url, undefined, undefined, timeoutMs);
+    time += Math.min(options.browserDelay, timeoutMs);
     return false;
   },
   sleep: async (ms, unused, { signal }) => { if (signal.aborted) throw new Error('aborted'); trace.delays.push(ms); time += ms; },

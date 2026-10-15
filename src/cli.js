@@ -247,16 +247,33 @@ async function planActions(ctx, name, roots) {
   return { actions, skipped, links, primaryRoot, linkRoots };
 }
 
+// 付费前置拦截（install/update 共用，设计「分期计划」：一期付费=引导非购买）：不进 402/checkout
+// 流程，exit 3 附商品页。二期任务 3/5（requireLogin + 令牌下载 + 402 内联购买）解锁时只改这里。
+function purchaseGate(ctx, name) {
+  const { product, paid } = findSkill(ctx.catalog, name);
+  if (!paid) return;
+  const url = ctx.client.subscriptionUrl(name, product);
+  throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
+}
+
+// 下载前占用/变更预检（install/update 共用）：整批任一目标被无关内容占用（含悬空链接——
+// lstat 存在但读不出 Skill）或凭空消失时，下载整包之前就失败，不给重定向目标任何被请求的机会；
+// replaceAll 内的同名双检保留，作下载期间的竞态防线（任务 6 审查语义在多目标下延续）。
+async function assertReplaceable(ctx, actions) {
+  for (const action of actions) {
+    const info = await lstatOrNull(action.path);
+    const current = info ? await inspectSkill(action.path, ctx.names) : null;
+    if (info && (!current || current.name !== action.previousName)) throw new CliError(t('occupied', { path: action.path }), 1, 'occupied', { path: action.path });
+    if (!info && action.previousName) throw new CliError(t('changed', { path: action.path }), 1, 'changed', { path: action.path });
+  }
+}
+
 // 多目标安装（任务 7 完整版，机制对齐 template）：resolveRoots 选根 → planActions 只读规划 →
 // 交互列目标并确认 → 预检（互相包含/占用/变化全部在下载之前）→ apply 批量事务 → 复扫与输出。
 async function install(ctx, name = ctx.options.skill) {
-  const { product, paid } = findSkill(ctx.catalog, name);
-  // 付费前置拦截（设计「分期计划」：一期付费=引导非购买）：不进 402/checkout 流程，exit 3 附商品页。
-  // 闸门先于 --to 校验：一期语义下付费 skill 无论参数对错都应先得到购买引导，而不是用法报错。
-  if (paid) {
-    const url = ctx.client.subscriptionUrl(name, product);
-    throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
-  }
+  // 闸门先于 --to 校验（quality-M2 抽取自此处与 update）：一期语义下付费 skill 无论参数对错
+  // 都应先得到购买引导，而不是用法报错。
+  purchaseGate(ctx, name);
   const roots = await resolveRoots(ctx);
   const { actions, skipped, links, primaryRoot, linkRoots } = await planActions(ctx, name, roots);
   // --yes 是用户显式确认（不再提问）；auto_confirmed 只标记「非交互静默确认」——两者都不提问，
@@ -282,20 +299,16 @@ async function install(ctx, name = ctx.options.skill) {
       if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) throw new CliError(t('overlappingTargets'), 2, 'overlapping_targets');
     }
   }
-  // 占用预检前移（任务 6 审查语义在多目标下延续）：整批任一目标被无关内容占用（含悬空链接——
-  // lstat 存在但读不出 Skill）时，下载整包之前就失败，不给重定向目标任何被请求的机会；
-  // replaceAll 内的同名双检保留，作下载期间的竞态防线。
-  for (const action of actions) {
-    const info = await lstatOrNull(action.path);
-    const current = info ? await inspectSkill(action.path, ctx.names) : null;
-    if (info && (!current || current.name !== action.previousName)) throw new CliError(t('occupied', { path: action.path }), 1, 'occupied', { path: action.path });
-    if (!info && action.previousName) throw new CliError(t('changed', { path: action.path }), 1, 'changed', { path: action.path });
-  }
+  // 占用预检（quality-M1 抽取为 assertReplaceable，update 复用）：整批任一目标被无关内容
+  // 占用时，下载整包之前就失败；replaceAll 内的同名双检保留，作下载期间的竞态防线。
+  await assertReplaceable(ctx, actions);
   // 纯链接路径（无实体动作，如主安装是开发目录）：不下载，也不打版本表。
   const downloads = actions.some((action) => !action.remove && !action.link);
   const versions = downloads ? await ctx.client.versions(ctx.catalog) : {};
   const warnings = await apply(ctx, actions, versions);
   // 复扫全部根：报告配对冲突/多副本等需要全目录视角的警告（多副本提示带精确的合并命令）。
+  // 与 update 的复扫段成对语义（quality-M3）：update 按发现根复扫、--path 定点不报多副本；
+  // 两段需同步改动，抽取窗口留任务 7 收尾。
   const installed = await scan(ctx.names, roots);
   warnings.push(...await conflicts(installed, ctx.catalog));
   warnings.push(...duplicateLines(duplicateCopies(installed)));
@@ -335,6 +348,8 @@ async function update(ctx) {
     if (item.development || seen.has(directoryKey(item.real_path))) return false;
     seen.add(directoryKey(item.real_path)); return true;
   });
+  // 计数口径（审查 LOW 补注）：eligible_count 是进入版本比对的非开发安装（已按 real_path
+  // 去重，不含版本过滤——已最新的也计入）；updated_count 只计实际替换的过期安装。
   const counts = { found_count: found.length, eligible_count: eligible.length };
   if (!eligible.length) {
     const warnings = await conflicts(all, ctx.catalog);
@@ -345,13 +360,9 @@ async function update(ctx) {
   const versions = await ctx.client.versions(ctx.catalog);
   const pending = eligible.filter((item) => !item.version || compare(item.version, versions[item.name].latest) < 0);
   const actions = await Promise.all(pending.map(async (item) => ({ name: item.name, path: await realInstallation(item), previousName: item.name, previousVersion: item.version })));
-  for (const action of actions) {
-    const { product, paid } = findSkill(ctx.catalog, action.name);
-    if (paid) {
-      const url = ctx.client.subscriptionUrl(action.name, product);
-      throw new CliError(t('purchaseUnavailable', { name: skillLabel(action.name), url }), 3, 'purchase_unavailable', { url, phase2: true });
-    }
-  }
+  // 付费闸门（quality-M2 抽取为 purchaseGate，与 install 共用）：过期才有动作，已最新的付费
+  // 安装不触发拦截；任务 3/5 解锁时只改 purchaseGate。
+  for (const action of actions) purchaseGate(ctx, action.name);
   // --yes 是用户显式确认；auto_confirmed 只标记「非交互静默确认」——与 install 同语义，
   // 但仅在实际有动作被静默确认时标记（up_to_date 无动作就不打提示行）。
   const auto = actions.length > 0 && !ctx.options.yes && !ctx.interactive;
@@ -359,8 +370,13 @@ async function update(ctx) {
     ctx.output.write({ cancelled: true, removed: [], skipped, ...counts, updated_count: 0, status: 'cancelled' }, [t('updateCanceled'), ...skippedLines(skipped)]);
     return 0;
   }
+  // 下载前占用/变更预检（quality-M1，与 install 共用 assertReplaceable）：scan 与执行之间
+  // 目标被第三方改动时，在下载整包之前失败。
+  await assertReplaceable(ctx, actions);
   const warnings = await apply(ctx, actions, versions);
   // 复扫原发现范围（--path 定点只看那个根）：冲突警告需要全目录视角；多副本只在非定点时报告。
+  // 与 install 的复扫段成对语义（quality-M3）：install 按 --to/发现根复扫、始终报多副本；
+  // 两段需同步改动，抽取窗口留任务 7 收尾。
   const after = await scan(ctx.names, all.map((item) => item.root));
   warnings.push(...await conflicts(after, ctx.catalog));
   if (!ctx.options.path) warnings.push(...duplicateLines(duplicateCopies(after.filter((item) => !ctx.options.skill || item.name === ctx.options.skill))));

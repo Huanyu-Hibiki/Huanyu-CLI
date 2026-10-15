@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { lstat, mkdir, readFile, readdir, realpath, rm } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
 
 const data = (result) => {
@@ -150,6 +151,105 @@ test('注入回滚种：批量中途 rename 失败 → 整批回滚，两处旧�
   assert.equal(await versionOf(claude), '0.0.8');
   assert.deepEqual(await stageLeftovers(path.dirname(zcode)), []);
   assert.deepEqual(await stageLeftovers(path.dirname(claude)), []);
+});
+
+test('下载前占用预检：scan 与执行之间目标被换成无关内容 → occupied 且不下载整包', async (t) => {
+  const f = await fixture(t);
+  const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  // 版本表响应被压住 500ms：scan 已完成（看到的还是旧版本），窗口内第三方把目标换成无关内容。
+  f.state.versionsDelay = 500;
+  const pending = f.run(['update', '--json']);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/api/store/versions')) await delay(20);
+  await rm(target, { recursive: true, force: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(path.join(target, 'unrelated.txt'), 'not ours');
+  const result = await pending;
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'occupied');
+  // 无关内容原样保留；整包尚未下载（预检在下载之前，不给重定向目标任何被请求的机会）。
+  assert.equal(await readFile(path.join(target, 'unrelated.txt'), 'utf8'), 'not ours');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '占用预检应在下载之前');
+  assert.deepEqual(await stageLeftovers(path.dirname(target)), []);
+});
+
+test('conflicts 复扫判别例：同宿主根装 ppt-design + ppt-design-pro 跑 update → warnings 含 conflict 行', async (t) => {
+  const f = await fixture(t);
+  const free = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  // 付费版已最新（0.1.0）：不进 pending，也就不触发付费闸门，纯当冲突警告的另一半存在。
+  await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design-pro', '0.1.0');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.equal(await versionOf(free), '0.1.0');
+  assert.equal(value.warnings.length, 1);
+  assert.match(value.warnings[0], /ppt-design 和 ppt-design-pro 两个版本同时装/);
+  // up_to_date 的复扫同样报告冲突（警告不依赖是否有动作发生）。
+  const human = await f.run(['update']);
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.match(human.stdout, /已安装的 Skill 无需更新。/);
+  assert.match(human.stdout, /ppt-design 和 ppt-design-pro 两个版本同时装/);
+});
+
+test('--path 指向链接安装：动作落真实目标，链接不动', async (t) => {
+  const f = await fixture(t);
+  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const result = await f.run(['update', '--path', linked, '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: real, previous: '0.0.9', version: '0.1.0' }]);
+  assert.equal(value.found_count, 1);
+  assert.equal(value.updated_count, 1);
+  assert.ok((await lstat(linked)).isSymbolicLink(), '定点链接不应被换成独立副本');
+  assert.equal(await readDirectoryLink(linked), real);
+  assert.equal(await versionOf(real), '0.1.0');
+});
+
+test('交互确认接受：回答 yes → 继续更新且不打非交互提示', async (t) => {
+  const f = await fixture(t);
+  const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  const result = await f.run(['update'], {}, { interactive: true, answers: [true] });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.trace.questions[0], /更新 1 处安装？ \[Y\/n\]/);
+  assert.match(result.stdout, new RegExp(`已更新 ppt-design：0\\.0\\.9 → 0\\.1\\.0（${target.replaceAll('\\', '\\\\')}）`));
+  assert.ok(!result.stdout.includes('非交互模式'), '交互确认不是静默确认');
+  assert.equal(await versionOf(target), '0.1.0');
+});
+
+test('本地版本高于 latest（0.2.0 > 0.1.0）：不降级，up_to_date 且不打下载请求', async (t) => {
+  const f = await fixture(t);
+  const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.2.0');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0);
+  const value = data(result);
+  assert.equal(value.status, 'up_to_date');
+  assert.deepEqual(value.installations, []);
+  assert.equal(value.found_count, 1);
+  assert.equal(value.eligible_count, 1);
+  assert.equal(value.updated_count, 0);
+  assert.equal(await versionOf(target), '0.2.0', '高于 latest 的本地版本不降级');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+});
+
+test('--path 指向开发目录：skipped 语义正确（跳过、不动内容、不打版本表）', async (t) => {
+  const f = await fixture(t);
+  const dev = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  await mkdir(path.join(dev, '.git'));
+  const result = await f.run(['update', '--path', dev, '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.equal(value.status, 'skipped');
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: dev, reason: 'development_directory' }]);
+  assert.equal(value.found_count, 1);
+  assert.equal(value.eligible_count, 0);
+  assert.equal(value.updated_count, 0);
+  assert.equal(await versionOf(dev), '0.0.9', '开发目录内容不动');
+  assert.ok(!f.state.requests.some((r) => r.path === '/api/store/versions'), '开发目录定点不打版本表');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+  assert.match((await f.run(['update', '--path', dev])).stdout, /开发目录，跳过/);
 });
 
 test('up_to_date 种：全部最新 → 状态 up_to_date、空 installations、不打下载请求', async (t) => {

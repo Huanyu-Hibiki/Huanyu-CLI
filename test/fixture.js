@@ -123,8 +123,9 @@ export async function fixture(t) {
     publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
     // 下载端（任务 6）：releases 为免费默认发布物（每 fixture 浅拷贝一层 Map，防跨用例可变共享）；
     // dropChecksum 让 versions 省略摘要（fail-closed 测试）、badChecksum 让 versions 下发错误摘要、
-    // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载。
-    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0 };
+    // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载、
+    // versionsDelay 压住版本表响应（构造 scan 之后、下载之前的目标变动窗口，update 预检测试用）。
+    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0, versionsDelay: 0 };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -161,6 +162,7 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname === '/api/store/versions') {
         if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);
+        if (state.versionsDelay) await new Promise((resolve) => setTimeout(resolve, state.versionsDelay));
         // state.history 可覆盖默认两条版本（条目为字符串或 {version, notes}），供 status 的更新/截断测试改写。
         const entry = (item) => typeof item === 'string' ? { version: item, notes: null } : item;
         const history = (state.history || ['0.1.0', '0.0.9']).map((item) => {

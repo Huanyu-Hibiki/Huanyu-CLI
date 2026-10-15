@@ -98,7 +98,9 @@ async function defaultReleases() {
 // 请求全部记入 state.requests，目录与设备流数据可直接改写用于错误注入。
 export async function fixture(t) {
   let temporary = await mkdtemp(path.join(tmpdir(), 'hy-test-'));
-  if (process.platform === 'win32') temporary = await realpath(temporary);
+  // macOS 的 /var 是 /private/var 的别名、Windows 有 8.3 短路径：一律 realpath，
+  // 让 f.* 派生路径与产品内部的 canonical 解析一致（否则期望值与 real_path 断言会差一个别名前缀）。
+  temporary = await realpath(temporary);
   const home = path.join(temporary, 'home'), cwd = path.join(temporary, 'project'), config = path.join(temporary, 'config'), mockBin = path.join(temporary, 'bin');
   for (const directory of [home, cwd, config, mockBin]) await mkdir(directory);
   // 真 CLI 也使用假浏览器。Windows 不能执行 shebang，使用 Node 的 exe 和预加载脚本。

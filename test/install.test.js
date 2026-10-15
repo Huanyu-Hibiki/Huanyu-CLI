@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
 import { interruptBackups } from '../src/cli.js';
 import { isSkillName } from '../src/skills.js';
@@ -107,8 +107,10 @@ test('回滚时目标被第三方改动（dev/ino 不符）→ rollback_failed +
   let calls = 0;
   const renameFile = async (from, to) => {
     if (++calls === 3) {
-      // 第一个目标已完全提交后、第二个动作失败前：第三方把目标换成了别的目录（不同 inode）。
-      await rm(first, { recursive: true, force: true });
+      // 第一个目标已完全提交后、第二个动作失败前：第三方把目标换成了别的目录。
+      // 用 rename 移走原目录再 mkdir：旧 inode 仍被占用、新目录 ino 必然不同——
+      // 直接 rm+mkdir 在 Linux 上会立刻复用刚释放的 inode 号，dev/ino 防线就检测不到。
+      await rename(first, `${first}-moved`);
       await mkdir(first);
       await writeFile(path.join(first, 'intruder.txt'), 'not ours');
       throw new Error('injected');

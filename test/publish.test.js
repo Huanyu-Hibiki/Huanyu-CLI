@@ -58,6 +58,8 @@ test('前置（任务 3 审查登记）：me 端点带 publisher 字段——TOK
 test('publish 单目录：frontmatter 读取、打包上传、摘要与请求头正确，versions 反映新版本且临时目录清理', async (t) => {
   const f = await fixture(t);
   await makeSkill(f.cwd, 'ppt-design', { name: 'ppt-design', version: '0.2.0' });
+  // tmpdir 为全机共享且各测试文件并行运行：只断言本测试"新增"的临时目录被清理。
+  const before = new Set((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-')));
   const result = await f.run(['publish', 'ppt-design', '--notes', '修复若干问题', '--json'], { HY_TOKEN: TOKEN });
   const event = data(result);
   assert.equal(result.code, 0, result.stdout);
@@ -91,8 +93,8 @@ test('publish 单目录：frontmatter 读取、打包上传、摘要与请求头
   assert.equal(versions.skills['ppt-design'].sha256, event.sha256);
   assert.equal(versions.skills['ppt-design'].download_url, `${f.base}/releases/ppt-design-0.2.0.tar.gz`);
   assert.ok(versions.skills['ppt-design'].history[0].notes.includes('修复若干问题'));
-  // 打包临时目录 finally 清理，不留残骸。
-  assert.deepEqual((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-')), []);
+  // 打包临时目录 finally 清理，不留残骸（只比对本测试新增的，见 before 快照）。
+  assert.deepEqual((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-') && !before.has(name)), []);
 });
 
 test('命名映射：目录名推导 PPT-design→ppt-design，文本摘要给出来源；frontmatter 合法 name 优先；非法 name 回落推导', async (t) => {
@@ -421,13 +423,14 @@ test('packSkill 资源预拒与 tar 缺失：原始字节/压缩输出超限本�
   const directory = await mkdtemp(path.join(tmpdir(), 'hy-pack-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const skill = await makeSkill(directory, 'demo-skill', { name: 'demo-skill', version: '0.1.0' });
+  const before = new Set((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-')));
   await assert.rejects(packSkill(skill, 'demo-skill', '0.1.0', { rawLimitBytes: 10 }), { error: 'too_large' });
   await assert.rejects(packSkill(skill, 'demo-skill', '0.1.0', { sizeLimitBytes: 10 }), { error: 'too_large' });
   await assert.rejects(packSkill(skill, 'demo-skill', '0.1.0', {
     runner: async () => { throw Object.assign(new Error('spawn tar ENOENT'), { code: 'ENOENT' }); },
   }), { error: 'tar_missing' });
-  // 失败路径的临时目录同样清理干净。
-  assert.deepEqual((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-')), []);
+  // 失败路径的临时目录同样清理干净（只比对本测试新增的，tmpdir 为并行测试共享）。
+  assert.deepEqual((await readdir(tmpdir())).filter((name) => name.startsWith('hy-publish-') && !before.has(name)), []);
 });
 
 test('打包排除开发与系统垃圾：.git/.DS_Store/Thumbs.db 警告输出且不进包', async (t) => {

@@ -10,7 +10,7 @@ const BIN = fileURLToPath(new URL('../bin/hy.js', import.meta.url));
 const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 const { version: VERSION } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
-const PENDING = ['status', 'list', 'update', 'login', 'logout', 'manage', 'publish', 'product', 'unpublish', 'audit'];
+const PENDING = ['status', 'update', 'login', 'logout', 'manage', 'publish', 'product', 'unpublish', 'audit'];
 
 // 语言相关环境固定为确定值（默认中文）；extraEnv 在其后展开以便覆盖测试环境变量通道。
 const BASE_ENV = { HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_TOKEN: '', CI: '' };
@@ -196,7 +196,7 @@ test('未实现命令执行时退出码 2，error 为 not_implemented 并使用�
   assert.equal(bare.code, 2);
   assert.equal(bare.stdout, '');
   assert.match(bare.stderr, /尚未实现/);
-  const english = await run(['list', '--lang', 'en']);
+  const english = await run(['status', '--lang', 'en']);
   assert.match(english.stderr, /not implemented yet/);
 });
 

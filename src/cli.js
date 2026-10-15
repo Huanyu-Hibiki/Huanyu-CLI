@@ -1,11 +1,10 @@
-import { t, withLanguage, resolveLanguage, command, helpLines } from './i18n.js';
+import { t, withLanguage, resolveLanguage, command, helpLines, skillLabel, planLabel, priceLabel as formatPrice } from './i18n.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
+import { Client, catalogNames, isSkillName } from './client.js';
 
-// Skill 规范名与设计一致：^[a-z0-9][a-z0-9-]*$。skills.js 数据层在后续任务落地后移入。
-const isSkillName = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(value);
-// 14 个命令全部在参数解析层合法；任务 1 只实现 help/version 的执行逻辑。
+// 14 个命令全部在参数解析层合法；help/version/list 之外的执行逻辑随后续任务落地。
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
 
 export function parseArgs(argv) {
@@ -45,6 +44,19 @@ export function parseArgs(argv) {
   return options;
 }
 
+function priceLabel(prices) {
+  return Object.entries(prices).map(([plan, price]) => t('pricePlan', { price: formatPrice(price), plan: planLabel(plan) })).join('; ') || t('priceUnavailable');
+}
+
+// list 展示目录里每个商品的免费/付费 Skill：名称、类型、价格与摘要。
+async function list(ctx) {
+  const skills = ctx.catalog.flatMap((product) => ['free', 'paid'].filter((type) => product[type]).map((type) => ({
+    skill: product[type].skill, name: product.name, summary: product.summary || '', type, prices: type === 'paid' ? product.prices : {}, page: ctx.client.subscriptionUrl(product[type].skill, product),
+  })));
+  ctx.output.write({ skills }, skills.length ? skills.map((s) => t('catalogLine', { name: skillLabel(s.skill), type: s.type === 'free' ? t('free') : t('paid', { price: priceLabel(s.prices) }), summary: s.summary ? t('summary', { summary: s.summary }) : '' })) : [t('emptyCatalog')]);
+  return 0;
+}
+
 // runtime 用于测试时注入时钟和终端交互；可执行入口不传测试选项。
 export const run = (argv, runtime = {}) => withLanguage(resolveLanguage(argv), () => runCommand(argv, runtime));
 
@@ -68,10 +80,17 @@ async function runCommand(argv, runtime) {
       interactive: runtime.interactive ?? canPrompt(options.json),
       terminal: runtime.terminal ?? Boolean(process.stdin.isTTY && process.stdout.isTTY),
       nextCommand: command(...argv), signal: controller.signal,
+      client: new Client(controller.signal),
       // 真实 openBrowser 随登录命令（任务 3）引入；此前占位为不打开。
       openBrowser: runtime.openBrowser || (async () => false),
       sleep: runtime.sleep || delay, now: runtime.now || Date.now,
       confirm: runtime.confirm || confirm, ask: runtime.ask || ask };
+    if (options.command === 'list') {
+      // catalog 拉取一次并缓存进 ctx；status/install/update 等后续命令复用。
+      ctx.catalog = await ctx.client.catalog();
+      ctx.names = catalogNames(ctx.catalog);
+      return await list(ctx);
+    }
     throw new CliError(t('notImplemented', { name: options.command }), 2, 'not_implemented');
   } catch (error) {
     if (controller.signal.aborted) return output.fail(new CliError(t('canceled'), 1, 'cancelled'));

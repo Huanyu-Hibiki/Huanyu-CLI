@@ -2,9 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { setTimeout as delay } from 'node:timers/promises';
 import { access, chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN, withPrivateTmp } from './fixture.js';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN, withPrivateTmp, gate, waitForRequest } from './fixture.js';
 import { interruptBackups, invalidateAccount } from '../src/cli.js';
 import { isSkillName } from '../src/skills.js';
 import { prepare, replaceAll } from '../src/install.js';
@@ -172,12 +171,13 @@ test('下载期间目标变成开发目录 → rename 前双重保护拦截并�
   const f = await fixture(t);
   const root = path.join(f.home, '.zcode', 'skills');
   const target = await writeSkill(root, 'ppt-design', '0.0.1');
-  // 服务端把发布物响应压住 500ms：测试在下载进行中把目标变成开发目录。
-  f.state.releaseDelay = 500;
+  // 发布物响应被门控压住（Promise 门控，任务 7）：请求已到、响应未发，测试在此窗口把目标变成开发目录。
+  const held = gate();
+  f.state.holdRelease = held.promise;
   const pending = f.run(['install', 'ppt-design', '--to', 'zcode']);
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/releases/ppt-design-0.1.0.tar.gz')) await delay(20);
+  await waitForRequest(f, (r) => r.path === '/releases/ppt-design-0.1.0.tar.gz');
   await mkdir(path.join(target, '.git'));
+  held.release();
   const result = await pending;
   assert.equal(result.code, 1);
   assert.match(result.stderr, /开发目录，跳过：/);
@@ -411,12 +411,13 @@ test('changed：下载期间目标被删除 → changed 保护，不误装新目
   const f = await fixture(t);
   const root = path.join(f.home, '.zcode', 'skills');
   const target = await writeSkill(root, 'ppt-design', '0.0.1');
-  // 前置预检时目标还在（同名旧版本），下载期间被第三方删除。
-  f.state.releaseDelay = 500;
+  // 前置预检时目标还在（同名旧版本）；发布物响应被门控压住，窗口内被第三方删除。
+  const held = gate();
+  f.state.holdRelease = held.promise;
   const pending = f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/releases/ppt-design-0.1.0.tar.gz')) await delay(20);
+  await waitForRequest(f, (r) => r.path === '/releases/ppt-design-0.1.0.tar.gz');
   await rm(target, { recursive: true, force: true });
+  held.release();
   const result = await pending;
   assert.equal(result.code, 1);
   assert.equal(data(result).error, 'changed');

@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { access, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN } from './fixture.js';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN, gate, waitForRequest } from './fixture.js';
 import { command } from '../src/i18n.js';
 
 const data = (result) => {
@@ -221,14 +220,15 @@ test('注入回滚种：批量中途 rename 失败 → 整批回滚，两处旧�
 test('下载前占用预检：scan 与执行之间目标被换成无关内容 → occupied 且不下载整包', async (t) => {
   const f = await fixture(t);
   const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
-  // 版本表响应被压住 500ms：scan 已完成（看到的还是旧版本），窗口内第三方把目标换成无关内容。
-  f.state.versionsDelay = 500;
+  // 版本表响应被门控压住（Promise 门控，任务 7）：scan 已完成（看到的还是旧版本），窗口内第三方把目标换成无关内容。
+  const held = gate();
+  f.state.holdVersions = held.promise;
   const pending = f.run(['update', '--json']);
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/api/store/versions')) await delay(20);
+  await waitForRequest(f, (r) => r.path === '/api/store/versions');
   await rm(target, { recursive: true, force: true });
   await mkdir(target, { recursive: true });
   await writeFile(path.join(target, 'unrelated.txt'), 'not ours');
+  held.release();
   const result = await pending;
   assert.equal(result.code, 1);
   assert.equal(data(result).error, 'occupied');
@@ -243,13 +243,14 @@ test('下载前占用预检：scan 与执行之间目标被换成无关内容 �
 test('M4：声明过 previousName 的位变悬空链接（下载前竞态）→ occupied 拒绝且不下载', async (t) => {
   const f = await fixture(t);
   const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
-  f.state.versionsDelay = 500;
+  const held = gate();
+  f.state.holdVersions = held.promise;
   const pending = f.run(['update', '--json']);
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/api/store/versions')) await delay(20);
+  await waitForRequest(f, (r) => r.path === '/api/store/versions');
   // 窗口内：原目录被换成悬空链接（有 previousName 声明的位）——不得按 dangling_link 跳过装过去。
   await rm(target, { recursive: true, force: true });
   await linkDirectory(path.join(f.temporary, 'missing'), target);
+  held.release();
   const result = await pending;
   assert.equal(result.code, 1);
   assert.equal(data(result).error, 'occupied');

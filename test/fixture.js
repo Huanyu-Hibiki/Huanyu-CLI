@@ -94,6 +94,20 @@ async function defaultReleases() {
   return seedCache;
 }
 
+// 响应门控（任务 7 登记落地，任务 1 审查登记的助手上移）：gate() 返回 { promise, release }；
+// 把 promise 赋给 state.holdVersions / state.holdRelease 压住对应端点的响应，测试在窗口内完成
+// 目标变更后 release()——响应严格在变更之后发出，消除「固定 500ms 内改完」的竞态余量。
+// waitForRequest 轮询 fixture 记录的请求作为窗口入口（请求已到、响应未发的那一刻）。
+export const gate = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
+export async function waitForRequest(f, predicate, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (f.state.requests.some(predicate)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`waitForRequest 超时：${predicate}`);
+}
+
 // 进程内直连组件的单元测试用：把 os.tmpdir 指到本测试私有目录（TMPDIR/TEMP/TMP 三通道覆盖
 // POSIX 与 Windows 的解析顺序），临时目录残留断言不再与并行测试文件共享系统 tmpdir 竞态。
 export async function withPrivateTmp(fn) {
@@ -164,9 +178,10 @@ export async function fixture(t) {
     yanked: new Set(), productStatus: null, unpublishStatus: null,
     // 下载端（任务 6）：releases 为免费默认发布物（每 fixture 浅拷贝一层 Map，防跨用例可变共享）；
     // dropChecksum 让 versions 省略摘要（fail-closed 测试）、badChecksum 让 versions 下发错误摘要、
-    // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载、
-    // versionsDelay 压住版本表响应（构造 scan 之后、下载之前的目标变动窗口，update 预检测试用）。
-    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0, versionsDelay: 0,
+    // corruptBody 让 /releases 截断正文（客户端读到不完整流）。holdVersions/holdRelease 是 Promise
+    // 门控（任务 7 登记落地，取代固定 500ms 延时）：设为未决 Promise 压住版本表/发布物响应，测试在
+    // 窗口内完成目标变更后 resolve——响应严格在变更之后发出，不再依赖「500ms 内改完」的竞态余量。
+    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, holdVersions: null, holdRelease: null,
     // 付费下载（二期任务 3）：badDownloadVersion 让下载端点回错误的 X-Skill-Version（头校验正例）；
     // badDownloadChecksum 回错误的 X-Content-SHA256、dropDownloadChecksum 省略该头（摘要负例）。
     // downloadInactiveCount（二期任务 5）：前 N 次付费下载先清空授权再判权——模拟「me 已列但
@@ -209,7 +224,7 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname === '/api/store/versions') {
         if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);
-        if (state.versionsDelay) await new Promise((resolve) => setTimeout(resolve, state.versionsDelay));
+        if (state.holdVersions) await state.holdVersions;
         // state.history 可覆盖默认两条版本（条目为字符串或 {version, notes}），供 status 的更新/截断测试改写。
         const entry = (item) => typeof item === 'string' ? { version: item, notes: null } : item;
         const baseHistory = (state.history || ['0.1.0', '0.0.9']).map((item) => {
@@ -388,7 +403,7 @@ export async function fixture(t) {
           if (!authenticate()) return;
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
         }
-        if (state.releaseDelay) await new Promise((resolve) => setTimeout(resolve, state.releaseDelay));
+        if (state.holdRelease) await state.holdRelease;
         if (state.corruptBody) {
           // 截断正文后断开：Content-Length 与实际字节不符，客户端读到不完整流（download 失败）。
           // 等半截数据真正写进 socket 再 destroy，保证响应头先于连接重置到达客户端。

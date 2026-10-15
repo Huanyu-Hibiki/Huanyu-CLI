@@ -109,7 +109,7 @@ SkillRelease versions[name] = { latest, history: [{ version, published_at, notes
 
 | 接口 | 方法/鉴权 | 说明 |
 |---|---|---|
-| `/api/store/publish` | POST 🔒 publisher | 体 = tar.gz 二进制；头 `X-Skill-Name`+`X-Skill-Version`+`X-Content-SHA256`。响应 `{ skill, version, sha256, size, url }`。错误：409 `version_exists`、403 `not_a_publisher`、400 `invalid_package`、413 `too_large` |
+| `/api/store/publish` | POST 🔒 publisher | 体 = tar.gz 二进制；头 `X-Skill-Name`+`X-Skill-Version`+`X-Content-SHA256`+可选 `X-Notes`（更新说明，encodeURIComponent 编码，≤2000 字符）。响应 `{ skill, version, sha256, size, url }`。错误：409 `version_exists`、403 `not_a_publisher`、400 `invalid_package`、413 `too_large` |
 | `/api/store/products/<skill>` | PUT 🔒 publisher | 商品元数据（与版本发布解耦） |
 | `/api/store/releases/<skill>/<version>` | DELETE 🔒 publisher | 下架（yank；新安装 404，已装不受影响） |
 | `/api/store/releases/<skill>/<version>/notes` | PUT 🔒 publisher | 补充/修订更新说明 |
@@ -156,7 +156,7 @@ SkillRelease versions[name] = { latest, history: [{ version, published_at, notes
 
 | # | 假设 | 默认值 | 何时可推翻 |
 |---|------|--------|-----------|
-| 1 | 上传幂等 | 同 `sha256` 重传视为幂等成功；不做断点续传 | 首期联调时按服务端实现微调 |
+| 1 | 上传幂等 | 同机器同检出重传 sha256 稳定（tar 条目 mtime 保留 + zlib 头 mtime=0 的确定字节打包）；**跨机器/重新 git clone 后重打包字节可能不同**（tar 头 uid/gid/条目顺序未归一化），此时同版本重发得 409，属预期，提版本即可。不做断点续传 | 首期联调时按服务端实现微调 |
 | 2 | 包大小上限 | 100MB（`413 too_large` 阈值） | 服务端定稿 |
 | 3 | 版本单调性 | 服务端拒绝重复版本（409）与低于 latest 的版本；允许跳版本 | 契约评审 |
 | 4 | yank 语义 | history 保留 + `yanked` 标记；`latest` 回落到最高未 yank 版本 | 契约评审 |

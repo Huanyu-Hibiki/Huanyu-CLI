@@ -9,7 +9,7 @@ import { isSkillName } from '../src/skills.js';
 import { prepare, replaceAll } from '../src/install.js';
 import { Client } from '../src/client.js';
 import { targetRoot } from '../src/hosts.js';
-import { command } from '../src/i18n.js';
+import { command, withLanguage } from '../src/i18n.js';
 
 const data = (result) => {
   assert.equal(result.signal, null, result.stderr);
@@ -902,7 +902,9 @@ test('M1：status 可发现暂存目录里的备份残留（.hy-stage-*/old）�
 });
 
 // 三审 HIGH-1.3（TOCTOU 闭合）：replaceAll 执行期复检管辖——集合不含动作根时拒绝并回滚。
-test('M2：replaceAll 执行期复检 managedKeys——动作根不在集合内 → occupiedOutside 拒绝且原样回滚', async (t) => {
+// 直连进程内组件，语言按 withLanguage 钉中文：断言匹配词条文案，不随 CI 运行器的系统语言漂移
+//（macOS runner 的 LANG 解析为英文，任务 7 的首次 macOS CI 暴露了这里的语言回退）。
+test('M2：replaceAll 执行期复检 managedKeys——动作根不在集合内 → occupiedOutside 拒绝且原样回滚', async (t) => await withLanguage({ lang: 'zh' }, async () => {
   const base = await mkdtemp(path.join(tmpdir(), 'hy-toctou-'));
   t.after(() => rm(base, { recursive: true, force: true }));
   const target = await writeSkill(base, 'a-skill', '1.0.0');
@@ -915,9 +917,9 @@ test('M2：replaceAll 执行期复检 managedKeys——动作根不在集合内 
   assert.match(error.message, /CLI 管理范围之外的目录/);
   assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /1\.0\.0/, '回滚后原目录保留');
   assert.deepEqual(await stageLeftovers(base), []);
-});
+}));
 
-test('M1：同根多处备份改名撞名（注入固定 stamp）→ 撞名的那份留在暂存目录并警告，绝不销毁旧内容', async (t) => {
+test('M1：同根多处备份改名撞名（注入固定 stamp）→ 撞名的那份留在暂存目录并警告，绝不销毁旧内容', async (t) => await withLanguage({ lang: 'zh' }, async () => {
   const base = await mkdtemp(path.join(tmpdir(), 'hy-backup-'));
   t.after(() => rm(base, { recursive: true, force: true }));
   const first = await writeSkill(base, 'a-skill', '1.0.0'), second = await writeSkill(base, 'b-skill', '1.0.0');
@@ -940,7 +942,7 @@ test('M1：同根多处备份改名撞名（注入固定 stamp）→ 撞名的�
   const stages = (await readdir(base)).filter((name) => name.startsWith('.hy-stage-'));
   assert.equal(stages.length, 1, '撞名的暂存目录不清理');
   assert.match(await readFile(path.join(base, stages[0], 'old', 'SKILL.md'), 'utf8'), /name: b-skill/);
-});
+}));
 
 test('多目标事务（linkDirectory 注入失败）：旧副本完整还原、无链接残留、stage 清空', async (t) => {
   const base = await mkdtemp(path.join(tmpdir(), 'hy-multi-'));

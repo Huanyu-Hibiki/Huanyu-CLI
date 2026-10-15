@@ -2,7 +2,7 @@ import { t, withLanguage, resolveLanguage, command, helpLines, skillLabel, planL
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { existsSync, writeSync } from 'node:fs';
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
 import { Client, catalogNames, findSkill, isSkillName, isVersion } from './client.js';
@@ -10,8 +10,8 @@ import { login, loadAuth, requireLogin } from './auth.js';
 import { requirePurchase } from './purchase.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo, reconcileRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked, sameAgentRoots, canonicalRootKeys, freeReplacements } from './skills.js';
-import { targetRoot, installationRoots, nearestHostId } from './hosts.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked, sameAgentRoots, canonicalRootKeys, freeReplacements, retainedBackups } from './skills.js';
+import { targetRoot, installationRoots, nearestHostId, managedRoots } from './hosts.js';
 import { directoryKey, sameDirectory, resolveDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
 
@@ -145,7 +145,7 @@ const HISTORY_LIMIT = 20;
 
 // install/update 共用的输出小件（任务 7）：跳过原因行与链接行。
 const skippedInstallation = (item) => ({ name: item.name, path: item.path, reason: 'development_directory' });
-const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink', unrecognized_skill: 'skippedUnrecognizedSkill', all_yanked: 'skippedYanked' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
+const skippedLines = (skipped) => skipped.map((item) => t(({ symbolic_link: 'skippedSymbolicLink', unrecognized_skill: 'skippedUnrecognizedSkill', all_yanked: 'skippedYanked', dangling_link: 'skippedDanglingLink' })[item.reason] || 'skipped', { name: skillLabel(item.name), path: item.path }));
 const linkedLines = (links) => links.map((item) => t('linked', { name: skillLabel(item.name), path: item.path, target: item.target }));
 // 免费版清理输出（任务 5）：被移除的免费版 = 独立 remove 动作 + 原位替换（replacesFree）的安装动作。
 const removedActions = (actions) => actions.filter((action) => action.remove || action.replacesFree);
@@ -156,6 +156,16 @@ async function lstatOrNull(file) {
 }
 // 安装本身是链接时，更新它指向的真实目录，不把链接换成一份独立副本。
 const realInstallation = async (item) => (await lstatOrNull(item.path))?.isSymbolicLink() ? item.real_path : item.path;
+
+// 悬空链接判定（任务 6 M4）：lstat 存在（是链接）但解析不到目标。只把 ENOENT/ENOTDIR 当悬空，
+// 其他读取错误照常抛出（fail-closed，不把权限故障误判成可跳过）。
+async function resolvesTarget(directory) {
+  try { await realpath(directory); return true; }
+  catch (error) {
+    if (['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
+    throw error;
+  }
+}
 
 // 扫描九宿主的用户级目录报告已装商店 skill：版本、可更新、警告（配对冲突/多副本/历史截断）；未登录也可用。
 async function status(ctx) {
@@ -172,6 +182,8 @@ async function status(ctx) {
   });
   const warnings = await conflicts(found, ctx.catalog);
   warnings.push(...duplicateLines(duplicateCopies(found)));
+  // 保留的旧版本备份（任务 6 M1）：提示位置与清理方法，让「可恢复」真正可发现。
+  for (const backup of await retainedBackups()) warnings.push(t('backupRetained', { path: backup }));
   for (const item of found) {
     const history = versions[item.name].history;
     const oldest = history.filter((entry) => isVersion(entry.version)).sort((a, b) => compare(a.version, b.version))[0];
@@ -335,7 +347,9 @@ async function resolveRoots(ctx) {
 // 动作规划（只读，不动文件系统）：primary 选举 + 实体/链接双循环。第一个能放下这个 Skill 的根
 // 放真实的一份，其余宿主用链接共享，更新一次全部生效；同名位置被别的东西占着（例如用户自建的
 // 链接指向别处）时顺延，不让其他宿主链到错误的内容上。链接根下的同名目录与改名独立副本换成链接；
-// 已是正确链接（解析到同一实体）幂等跳过；开发目录跳过并解释。安装本身是链接时更新其真实目标。
+// 已是正确链接（解析到同一实体）幂等跳过；开发目录跳过并解释。安装本身是链接时更新其真实目标
+//——但真实目标必须落在 CLI 管辖的根集合内（任务 6 M2 写穿白名单），指向管理范围之外的自建链接
+// 按占用拒绝并解释，不借 CLI 之手改写任意目录。
 async function planActions(ctx, name, roots) {
   const found = (await scan(ctx.names, roots)).filter((item) => item.name === name);
   let primaryIndex = 0;
@@ -348,10 +362,17 @@ async function planActions(ctx, name, roots) {
   const primaries = found.filter((item) => sameDirectory(item.root, primaryRoot));
   const candidates = primaries.length ? primaries : [{ name, path: path.join(primaryRoot, name), version: null }];
   const target = path.resolve((candidates.find((item) => path.basename(item.path) === name) || candidates[0]).path);
+  const managedKeys = new Set(await canonicalRootKeys(await managedRoots(roots)));
   for (const item of candidates) {
     // 暂存前的第一重开发目录保护：跳过并解释，不动内容、不发起下载。
     if (await isDevelopmentDirectory(item.path)) { skipped.push(skippedInstallation(item)); continue; }
-    actions.push({ name, path: primaries.length ? await realInstallation(item) : item.path, previousName: primaries.length ? name : null, previousVersion: item.version });
+    const real = primaries.length ? await realInstallation(item) : item.path;
+    // M2 写穿白名单：非链接主安装的父目录就是 roots 之一（恒在集合内）；链接主安装的真实目标
+    // 父目录不在集合内 = 用户自建链接指向 CLI 管理范围之外 → 拒绝写穿，交还用户处置。
+    if (!managedKeys.has(directoryKey(await canonicalDirectory(path.dirname(real))))) {
+      throw new CliError(t('occupiedOutside', { path: real }), 1, 'occupied', { path: real, link: item.path });
+    }
+    actions.push({ name, path: real, previousName: primaries.length ? name : null, previousVersion: item.version });
   }
   const targetKey = directoryKey(await canonicalDirectory(target));
   for (const root of linkRoots) {
@@ -359,6 +380,8 @@ async function planActions(ctx, name, roots) {
     const directories = [...new Set([path.join(root, name), ...found.filter((item) => sameDirectory(item.root, root)).map((item) => item.path)])];
     for (const directory of directories) {
       const info = await lstatOrNull(directory);
+      // M4：悬空链接只让出自己这个位——跳过并解释，不再拖垮整批（fail-closed 语义见 assertReplaceable）。
+      if (info?.isSymbolicLink() && !await resolvesTarget(directory)) { skipped.push({ name, path: directory, reason: 'dangling_link' }); continue; }
       if (info && directoryKey(await canonicalDirectory(directory)) === targetKey) { links.push({ name, path: directory, target, existing: true }); continue; }
       if (info && await isDevelopmentDirectory(directory)) { skipped.push(skippedInstallation({ name, path: directory })); continue; }
       const current = info ? await inspectSkill(directory, ctx.names) : null;
@@ -420,13 +443,24 @@ async function manage(ctx) {
 // 下载前占用/变更预检（install/update 共用）：整批任一目标被无关内容占用（含悬空链接——
 // lstat 存在但读不出 Skill）或凭空消失时，下载整包之前就失败，不给重定向目标任何被请求的机会；
 // replaceAll 内的同名双检保留，作下载期间的竞态防线（任务 6 审查语义在多目标下延续）。
+// 任务 6 M4 的唯一放宽：规划与预检之间目标位变成悬空链接、且该动作是「无既有内容声明的新链接」
+//（action.link 且 previousName 为空）时，撤下该动作并跳过解释——一个坏链接不再拖垮整批。实体位
+// 与声明过旧内容的位仍 fail-closed（occupied/changed 整批拒绝，不能凭空装、也不能顶掉来路不明的内容）。
 async function assertReplaceable(ctx, actions) {
-  for (const action of actions) {
+  const skipped = [];
+  for (let i = 0; i < actions.length; i++) {
+    const action = actions[i];
     const info = await lstatOrNull(action.path);
+    if (info?.isSymbolicLink() && action.link && !action.previousName && !await resolvesTarget(action.path)) {
+      actions.splice(i--, 1);
+      skipped.push({ name: action.name, path: action.path, reason: 'dangling_link' });
+      continue;
+    }
     const current = info ? await inspectSkill(action.path, ctx.names) : null;
     if (info && (!current || current.name !== action.previousName)) throw new CliError(t('occupied', { path: action.path }), 1, 'occupied', { path: action.path });
     if (!info && action.previousName) throw new CliError(t('changed', { path: action.path }), 1, 'changed', { path: action.path });
   }
+  return skipped;
 }
 
 // 多目标安装（任务 7 完整版，机制对齐 template）：resolveRoots 选根 → planActions 只读规划 →
@@ -465,7 +499,8 @@ async function install(ctx, name = ctx.options.skill) {
   skipped.push(...cleanup.skipped.filter((item) => !skipped.some((existing) => sameDirectory(existing.path, item.path))));
   // 占用预检（quality-M1 抽取为 assertReplaceable，update 复用）：整批任一目标被无关内容
   // 占用时，下载整包之前就失败；replaceAll 内的同名双检保留，作下载期间的竞态防线。
-  await assertReplaceable(ctx, actions);
+  // M4：预检期变成悬空链接的链接位撤下并解释（skipped）。
+  skipped.push(...await assertReplaceable(ctx, actions));
   const removals = removedActions(actions).length;
   if (!await ctx.confirm(t(removals ? 'confirmInstallRemove' : 'confirmInstall', { name: skillLabel(name), count: removals }), ctx.options.yes, ctx.interactive, ctx.signal, true)) {
     ctx.output.write({ cancelled: true }, [t('installCanceled')]);
@@ -582,8 +617,9 @@ async function update(ctx) {
     }
   }
   // 下载前占用/变更预检（quality-M1，与 install 共用 assertReplaceable）：scan 与执行之间
-  // 目标被第三方改动时，在下载整包之前失败（含清理并入的 remove 动作）。
-  await assertReplaceable(ctx, actions);
+  // 目标被第三方改动时，在下载整包之前失败（含清理并入的 remove 动作）；悬空链接的链接位
+  // 撤下并解释（M4；update 的动作全部声明过 previousName，实际不会走到该分支，语义与 install 对齐）。
+  skipped.push(...await assertReplaceable(ctx, actions));
   const warnings = await apply(ctx, actions, versions, { purchaseOnInactive: true });
   // 复扫原发现范围 + 清理扫描过的同宿主根（--path 定点只看那个根）：冲突警告需要全目录视角；
   // 多副本只在非定点时报告。与 install 的复扫段成对语义（quality-M3）：install 按 --to/发现根

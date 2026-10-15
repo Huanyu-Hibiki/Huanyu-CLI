@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN, withPrivateTmp } from './fixture.js';
 import { interruptBackups, invalidateAccount } from '../src/cli.js';
 import { isSkillName } from '../src/skills.js';
@@ -543,10 +543,16 @@ test('其他宿主里的独立旧副本自动换成链接（replaced_copy），s
   assert.deepEqual(value.links.map((item) => [item.path, item.existing, item.replaced_copy]).sort(byPath),
     [[old, false, true], [renamed, false, true], [path.join(f.home, '.trae', 'skills', 'ppt-design'), false, false]].sort(byPath));
   for (const directory of [old, renamed]) assert.equal(await readDirectoryLink(directory), primary);
+  // 任务 6 M1：被换成链接的两份旧副本保留为备份——status 改为提示备份位置（多副本警告消失）。
+  const backupOf = async (directory) => path.join(directory, (await readdir(directory)).find((name) => name.startsWith('.hy-backup-')));
+  const backupOld = await backupOf(path.dirname(old)), backupRenamed = await backupOf(path.dirname(renamed));
   status = data(await f.run(['status', '--json']));
-  assert.deepEqual(status.warnings, []);
   assert.equal(status.installations.length, 1);
   assert.equal(status.installations[0].path, primary);
+  assert.deepEqual(status.warnings, [
+    `旧版本备份保留在：${backupOld}（下次安装或更新时自动清理，也可手动删除）`,
+    `旧版本备份保留在：${backupRenamed}（下次安装或更新时自动清理，也可手动删除）`,
+  ]);
 });
 
 test('幂等：多宿主第二次安装 → 实体替换为同版本、已有链接 existing 保持、无错误', async (t) => {
@@ -720,10 +726,13 @@ test('overlap 预检前移：--to 目标互相包含 → 下载之前报 overlap
   assert.deepEqual(await stageLeftovers(outer), []);
 });
 
-test('realInstallation：主安装位置是用户自建链接指向同名 skill 的普通目录 → 实体更新真实目标，自建链接保留', async (t) => {
+// 任务 6 M2 写穿白名单：主安装位置是用户自建链接时，实体动作只跟随到 CLI 管辖的根集合内
+//（发现根/--to 显式根/各宿主用户级与项目级根）；指向管理范围之外的链接不写穿——不能借 CLI
+// 之手改写任意目录。
+test('M2 写穿白名单（正例）：主安装链接的真实目标在宿主根内 → 实体更新真实目标，自建链接保留', async (t) => {
   const f = await fixture(t);
   await threeHosts(f);
-  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.1');
+  const real = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.1');
   const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
   await mkdir(path.dirname(linked), { recursive: true });
   await linkDirectory(real, linked);
@@ -732,16 +741,45 @@ test('realInstallation：主安装位置是用户自建链接指向同名 skill 
   const value = data(result);
   assert.deepEqual(value.installations.map((item) => [item.path, item.previous, item.version]), [[real, '0.0.1', '0.1.0']]);
   assert.match(await readFile(path.join(real, 'SKILL.md'), 'utf8'), /0\.1\.0/);
-  // 自建链接原样保留；其余宿主链接到主安装位置（经它解析到同一实体）。
+  // 自建链接原样保留；claude 位与真实目标已是同一实体（existing 幂等跳过），最后一个宿主链到主安装位置。
   assert.ok((await lstat(linked)).isSymbolicLink());
   assert.equal(await readDirectoryLink(linked), real);
-  for (const host of ['.claude', '.trae']) assert.equal(await readDirectoryLink(path.join(f.home, host, 'skills', 'ppt-design')), linked);
+  assert.deepEqual(value.links.map((item) => [item.path, item.existing]), [
+    [path.join(f.home, '.claude', 'skills', 'ppt-design'), true],
+    [path.join(f.home, '.trae', 'skills', 'ppt-design'), false],
+  ]);
   const status = data(await f.run(['status', '--json']));
   assert.equal(status.installations.length, 1);
   assert.equal(status.installations[0].real_path, await realpath(real));
 });
 
-test('链接宿主位的悬空 symlink → occupied 整批失败（fail-closed），悬空链接原样保留且不下载', async (t) => {
+test('M2 写穿白名单（反例）：主安装链接指向 CLI 管理范围之外的目录 → occupied 拒绝并解释，不安装不写穿', async (t) => {
+  const f = await fixture(t);
+  await threeHosts(f);
+  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.1');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 1);
+  const value = data(result);
+  assert.equal(value.error, 'occupied');
+  assert.match(value.message, /CLI 管理范围之外的目录/);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '拒绝发生在下载之前');
+  // 自建链接与其真实目标都原样保留：不写穿、整批不留安装、无暂存残留。
+  assert.equal(await readDirectoryLink(linked), real);
+  assert.match(await readFile(path.join(real, 'SKILL.md'), 'utf8'), /0\.0\.1/);
+  assert.equal(await exists(path.join(f.home, '.claude', 'skills', 'ppt-design')), null);
+  assert.equal(await exists(path.join(f.home, '.trae', 'skills', 'ppt-design')), null);
+  assert.deepEqual(await stageLeftovers(path.dirname(real)), []);
+  const english = await f.run(['install', 'ppt-design', '--to', 'zcode', '--lang', 'en']);
+  assert.equal(english.code, 1);
+  assert.match(english.stderr, /outside the directories this CLI manages/);
+});
+
+// 任务 6 M4：悬空链接从「occupied 阻塞整批」改为「跳过该宿主位 + skipped 解释」；实体目标位
+// 仍 fail-closed（不能凭空装出一份来路不明的新内容顶掉用户的链接）。
+test('M4 悬空链接在链接宿主位：跳过该宿主并解释（dangling_link），其余宿主照常安装，链接原样保留', async (t) => {
   const f = await fixture(t);
   await threeHosts(f);
   const dangling = path.join(f.home, '.claude', 'skills', 'ppt-design');
@@ -749,12 +787,96 @@ test('链接宿主位的悬空 symlink → occupied 整批失败（fail-closed�
   await mkdir(path.dirname(dangling), { recursive: true });
   await linkDirectory(missing, dangling);
   const result = await f.run(['install', 'ppt-design', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  assert.deepEqual(value.installations, [{ name: 'ppt-design', path: primary, previous: null, version: '0.1.0' }]);
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: dangling, reason: 'dangling_link' }]);
+  assert.deepEqual(value.links.map((item) => item.path), [path.join(f.home, '.trae', 'skills', 'ppt-design')]);
+  assert.ok((await lstat(dangling)).isSymbolicLink(), '悬空链接应原样保留');
+  assert.equal(await readDirectoryLink(dangling), missing);
+  assert.equal(await exists(missing), null, '不凭空创建链接目标');
+  const human = await f.run(['install', 'ppt-design']);
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.match(human.stdout, /链接目标不存在（悬空链接），跳过/);
+  const english = await f.run(['install', 'ppt-design', '--lang', 'en']);
+  assert.equal(english.code, 0, english.stdout + english.stderr);
+  assert.match(english.stdout, /the link target does not exist/);
+});
+
+test('M4 悬空链接在主目标位（--to 单根）：occupied 整批拒绝（fail-closed 保持），不下载、链接保留', async (t) => {
+  const f = await fixture(t);
+  const dangling = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  const missing = path.join(f.temporary, 'missing');
+  await mkdir(path.dirname(dangling), { recursive: true });
+  await linkDirectory(missing, dangling);
+  const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(result.code, 1);
   assert.equal(data(result).error, 'occupied');
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '占用预检应在下载之前');
   assert.ok((await lstat(dangling)).isSymbolicLink(), '悬空链接应原样保留');
   assert.equal(await readDirectoryLink(dangling), missing);
-  assert.equal(await exists(path.join(f.home, '.zcode', 'skills', 'ppt-design')), null, '整批失败不留安装');
+});
+
+// 任务 6 M1（方案 C·事务备份保留）：商店只存最新版发布物，无法与本地旧副本做内容差异比对来
+// 识别「本地修改」——改为把「提交即销毁」降级为「提交后可恢复」：被替换目录的备份改名保留在
+// 安装根（.hy-backup-<stamp>），status 提示位置与清理方法，下一次安装自动清过期备份（每根只留
+// 本次事务留下的一份）。回滚失败备份绝不清理的既有守卫不受影响（见上组注入用例）。
+test('M1 备份保留：替换提交后旧内容保留在 .hy-backup-*（含本地修改痕迹）；status 提示；下次安装清理过期备份', async (t) => {
+  const f = await fixture(t);
+  const root = path.join(f.home, '.zcode', 'skills');
+  const target = await writeSkill(root, 'ppt-design', '0.0.1');
+  await writeFile(path.join(target, 'assets', 'local-edit.txt'), 'user change');
+  const first = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
+  assert.equal(first.code, 0, first.stdout + first.stderr);
+  const backups = async () => (await readdir(root)).filter((name) => name.startsWith('.hy-backup-')).sort();
+  let names = await backups();
+  assert.equal(names.length, 1, '替换提交后保留一份备份');
+  const backup = path.join(root, names[0]);
+  // 备份含旧内容（含用户的本地修改痕迹——被替换销毁的内容可恢复）。
+  assert.match(await readFile(path.join(backup, 'SKILL.md'), 'utf8'), /0\.0\.1/);
+  assert.equal(await readFile(path.join(backup, 'assets', 'local-edit.txt'), 'utf8'), 'user change');
+  // 备份目录不参与扫描：status 只报一份安装，提示备份位置与清理方法（中英文）。
+  const status = data(await f.run(['status', '--json']));
+  assert.equal(status.installations.length, 1);
+  assert.equal(status.installations[0].current, '0.1.0');
+  assert.deepEqual(status.warnings, [`旧版本备份保留在：${backup}（下次安装或更新时自动清理，也可手动删除）`]);
+  const human = await f.run(['status']);
+  assert.ok(human.stdout.includes(`旧版本备份保留在：${backup}`), human.stdout);
+  const english = await f.run(['status', '--lang', 'en']);
+  assert.match(english.stdout, /A previous version is backed up at:/);
+  // 下次安装：新备份生成、旧备份清理，安装根下仍只有一份（保留最近一份）。
+  const second = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
+  assert.equal(second.code, 0, second.stdout + second.stderr);
+  names = await backups();
+  assert.equal(names.length, 1, '过期备份在下次安装时自动清理，只保留最近一份');
+  const fresh = path.join(root, names[0]);
+  assert.notEqual(fresh, backup);
+  assert.match(await readFile(path.join(fresh, 'SKILL.md'), 'utf8'), /0\.1\.0/, '新备份是本次被替换的 0.1.0 内容');
+  await assert.rejects(access(path.join(backup, 'SKILL.md')), { code: 'ENOENT' }, '旧备份被清理');
+});
+
+test('M1：同根多处备份改名撞名（注入固定 stamp）→ 撞名的那份留在暂存目录并警告，绝不销毁旧内容', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-backup-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const first = await writeSkill(base, 'a-skill', '1.0.0'), second = await writeSkill(base, 'b-skill', '1.0.0');
+  const incoming = await mkdtemp(path.join(tmpdir(), 'hy-incoming-'));
+  t.after(() => rm(incoming, { recursive: true, force: true }));
+  const sourceA = await writeSkill(incoming, 'a-skill', '2.0.0'), sourceB = await writeSkill(incoming, 'b-skill', '2.0.0');
+  // 两个动作用同一个备份 stamp：第一份改名成功后，第二份撞名失败——必须走「保留暂存目录」路径。
+  const warnings = await replaceAll([
+    { name: 'a-skill', path: first, source: sourceA, previousName: 'a-skill', previousVersion: '1.0.0' },
+    { name: 'b-skill', path: second, source: sourceB, previousName: 'b-skill', previousVersion: '1.0.0' },
+  ], { names: ['a-skill', 'b-skill'], backupStamp: () => 'same' });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /临时目录清理失败/);
+  // 两处新内容照常提交；第一份备份改名成功，第二份完整留在暂存目录（可手动恢复）。
+  assert.match(await readFile(path.join(first, 'SKILL.md'), 'utf8'), /2\.0\.0/);
+  assert.match(await readFile(path.join(second, 'SKILL.md'), 'utf8'), /2\.0\.0/);
+  assert.ok((await readdir(base)).includes('.hy-backup-same'), '第一份备份保留');
+  const stages = (await readdir(base)).filter((name) => name.startsWith('.hy-stage-'));
+  assert.equal(stages.length, 1, '撞名的暂存目录不清理');
+  assert.match(await readFile(path.join(base, stages[0], 'old', 'SKILL.md'), 'utf8'), /name: b-skill/);
 });
 
 test('多目标事务（linkDirectory 注入失败）：旧副本完整还原、无链接残留、stage 清空', async (t) => {

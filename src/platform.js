@@ -21,6 +21,10 @@ export function resolveDirectory(value, env = process.env, platform = process.pl
 
 // Windows 的路径比较忽略大小写、分隔符和 Win32 扩展路径前缀。
 // resolvePath 只在「以 win32 语义比较且本机真是 win32」时默认启用 8.3 还原；跨平台测试可注入或置空。
+// 已知限制（一期任务 7 登记、二期任务 6 ③ 定案）：归一覆盖 8.3、大小写、分隔符与 \\?\ 前缀
+//（含 \\?\UNC\ 形式）；映射盘符与 UNC 两种形式指向同一网络实体时（Z:\share 与 \\server\share）
+// 不互转——Node 标准库没有可靠的盘符映射查询 API（net use 属外部命令），不做转换。同一实体经
+// 同一路径形式访问仍正确判等；跨形式混排由链接规划的 targetKey 幂等跳过与扫描的 real_path 折叠自愈。
 export function directoryKey(value, platform = process.platform, resolvePath = platform === 'win32' && process.platform === 'win32' ? realpathSync.native : null) {
   const paths = pathsFor(platform);
   if (platform === 'win32') {

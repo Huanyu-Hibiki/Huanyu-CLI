@@ -465,3 +465,76 @@ test('LOW-6：免费版恰好装在付费版位置 → 原位替换，removed �
   assert.deepEqual(value.installations, [{ name: 'ppt-design-pro', path: free, previous: null, version: '0.2.0' }]);
   assert.equal(await versionOf(free), '0.2.0');
 });
+
+// —— 任务 6：M1 remove 动作与替换统一保留备份 + template 三个边缘清理用例（#7/#8 模式） ——
+
+test('M1：清理移除的免费版同样保留备份——remove 动作与替换统一，且备份不参与后续清理扫描', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const free = await writeSkill(root(f, 'zcode'), 'ppt-design', '0.0.9');
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  await absent(free);
+  const backups = (await readdir(root(f, 'zcode'))).filter((name) => name.startsWith('.hy-backup-'));
+  assert.equal(backups.length, 1, '移除的免费版内容保留为备份（销毁变可恢复）');
+  assert.match(await readFile(path.join(root(f, 'zcode'), backups[0], 'SKILL.md'), 'utf8'), /name: ppt-design/);
+  assert.match(await readFile(path.join(root(f, 'zcode'), backups[0], 'SKILL.md'), 'utf8'), /0\.0\.9/);
+  // 备份目录不参与后续清理扫描：再装一次不把备份里的免费版再删一遍。
+  const again = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(again.code, 0, again.stdout + again.stderr);
+  assert.deepEqual(data(again).removed, [], '备份不是可清理的免费版');
+});
+
+test('CODEX_HOME 重定义后旧 ~/.codex 不参与清理：清理作用域按当前环境归属宿主组', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const legacy = await writeSkill(root(f, 'codex'), 'ppt-design', '0.0.9');
+  const relocated = path.join(f.temporary, 'codex-home', 'skills');
+  const moved = await writeSkill(relocated, 'ppt-design', '0.1.0');
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'codex', '--json'],
+    { HY_TOKEN: TOKEN, CODEX_HOME: path.join(f.temporary, 'codex-home') });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.removed, [moved], '重定义后的 codex 根内免费版照常清理');
+  await absent(moved);
+  assert.equal(await versionOf(legacy), '0.0.9', '旧 ~/.codex 根不属于当前 codex 宿主组，不参与清理');
+});
+
+test('--to 自定义路径含宿主名（elsewhere/.claude/skills）不按名归属：真 claude 根不动，自定义根内照常清理', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const custom = path.join(f.temporary, 'elsewhere', '.claude', 'skills');
+  const inside = await writeSkill(custom, 'ppt-design', '0.0.9');
+  const real = await writeSkill(root(f, 'claude'), 'ppt-design', '0.1.0');
+  const before = await snapshot(real);
+  const result = await f.run(['install', 'ppt-design-pro', '--to', custom, '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.removed, [inside], '自定义根内的免费版按目录归属清理');
+  await absent(inside);
+  assert.deepEqual(await snapshot(real), before, '路径里含 .claude 段不等于 claude 宿主，真根的免费版不动');
+});
+
+test('skills 根本身是符号链接：清理保留链接作用域，根下免费版按受保护链接跳过（pro-cleanup #7/#8 模式）', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  const shared = path.join(f.temporary, 'shared-skills');
+  const free = await writeSkill(shared, 'ppt-design', '0.0.9');
+  await mkdir(path.join(f.home, '.claude'), { recursive: true });
+  const linkedRoot = path.join(f.home, '.claude', 'skills');
+  await linkDirectory(shared, linkedRoot);
+  const before = await snapshot(free);
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'claude', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  // 免费版位于链接根指向的真实目录：受保护跳过，不因扫描去重漏掉。
+  assert.deepEqual(value.skipped, [{ name: 'ppt-design', path: path.join(linkedRoot, 'ppt-design'), reason: 'symbolic_link' }]);
+  assert.deepEqual(value.removed, []);
+  assert.deepEqual(await snapshot(free), before, '链接根指向的真实免费版不动');
+  assert.equal(await readDirectoryLink(linkedRoot), shared, '根级链接原样保留');
+  // 付费版本体落在链接根位（透过链接写进 shared），免费版共存 → 冲突警告照报。
+  assert.deepEqual(value.installations, [{ name: 'ppt-design-pro', path: path.join(linkedRoot, 'ppt-design-pro'), previous: null, version: '0.2.0' }]);
+  assert.equal(await versionOf(path.join(shared, 'ppt-design-pro')), '0.2.0');
+  assert.equal(value.warnings.length, 1);
+  assert.match(value.warnings[0], /两个版本同时装/);
+});

@@ -246,6 +246,10 @@ export const dictionary = {
   // 全下架占位语义（假设 #4 注记，M1）：latest 指向的版本本身已下架 = 商店无任何可安装版本。
   versionYanked: ['{name}：{version}（商店全部版本已下架）', '{name}: {version} (all store versions yanked)'],
   skippedYanked: ['{name}：商店全部版本已下架，跳过更新（{path}）', '{name}: all store versions yanked; update skipped ({path})'],
+  // 安全加固族（二期任务 6）：M1 备份保留提示、M2 写穿白名单、M4 悬空链接跳过。
+  backupRetained: ['旧版本备份保留在：{path}（下次安装或更新时自动清理，也可手动删除）', 'A previous version is backed up at: {path} (it is cleaned up on the next install or update; you can also delete it manually)'],
+  occupiedOutside: ['主安装位置是链接，真实目标在 CLI 管理范围之外的目录，已保留：{path}。请自行处理该链接后重试。', 'The primary install location is a link whose real target is outside the directories this CLI manages; preserved: {path}. Resolve the link yourself and retry.'],
+  skippedDanglingLink: ['{name}：链接目标不存在（悬空链接），跳过（{path}）', '{name}: the link target does not exist (dangling link), skipped ({path})'],
 };
 
 export function resolveLanguage(argv = [], env = process.env) {

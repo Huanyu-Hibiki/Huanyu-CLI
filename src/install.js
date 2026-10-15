@@ -85,7 +85,18 @@ async function exists(file) {
 // （任务 7 多宿主共享使用，结构保留）。renameFile、linkDirectory 可供测试注入真实的中途失败；
 // onStage 在每个暂存目录创建时上报（二次中断时 cli 侧据此提示备份位置）。
 const systemLink = (target, directory) => symlink(target, directory, process.platform === 'win32' ? 'junction' : 'dir');
-export async function replaceAll(actions, { renameFile = rename, linkDirectory = systemLink, signal, names = [], onStage } = {}) {
+
+// 旧副本备份保留（任务 6 M1 缓解·方案 C）：商店只存最新版发布物，拿不到旧版归档就无法与本地旧
+// 副本做内容差异比对来识别「本地修改」——改为把「提交即销毁」降级为「提交后可恢复」：事务成功的
+// 动作若挪走过旧目录（替换与清理 remove 都算），备份不随暂存目录一起销毁，改名为安装根下的
+// .hy-backup-<stamp> 保留；下一次事务开工前快照、提交后清除更早的备份（「下次安装自动清过期
+// 备份」，每根只留最近一次事务留下的备份）。回滚失败的备份绝不清理（既有守卫不变）；备份改名
+// 失败同样保留暂存目录并警告——宁可残留不可销毁。stamp 含毫秒时间戳与进程内序号（同一事务在
+// 同一根多次备份不撞名；跨进程同毫秒撞名时 rename 失败走保留路径，同样安全）。
+const BACKUP_PREFIX = '.hy-backup-';
+let backupSequence = 0;
+const defaultBackupStamp = () => `${Date.now()}-${++backupSequence}`;
+export async function replaceAll(actions, { renameFile = rename, linkDirectory = systemLink, signal, names = [], onStage, backupStamp = defaultBackupStamp } = {}) {
   // 在暂存前检查整批目标；在每次 rename 前再检查，防止下载期间变成开发目录。
   const protect = async (action) => {
     const directory = action.path;
@@ -102,15 +113,25 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
     }
   }
   const transactions = [];
-  const staging = [];
   let committed = false;
   const warnings = [];
+  // 过期备份快照（M1）：本批触及的每个安装根里既有的 .hy-backup-*，提交成功后清除（本次事务
+  // 新建的备份不在快照里，不受影响）；失败批次不动旧备份。父目录此刻可能尚未创建（ENOENT 跳过）。
+  const staleBackups = [];
+  for (const parent of [...new Set(actions.map((action) => path.dirname(action.path)))]) {
+    let entries;
+    try { entries = await readdir(parent); }
+    catch (error) {
+      if (['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
+      throw new CliError(t('scanRead', { path: parent }), 1, 'skill_read');
+    }
+    staleBackups.push(...entries.filter((name) => name.startsWith(BACKUP_PREFIX)).map((name) => path.join(parent, name)));
+  }
   try {
     for (const action of actions) {
       if (signal?.aborted) throw new CliError(t('canceled'), 1, 'cancelled');
       await mkdir(path.dirname(action.path), { recursive: true });
       const stage = await mkdtemp(path.join(path.dirname(action.path), '.hy-stage-'));
-      staging.push(stage);
       onStage?.(stage);
       const transaction = { ...action, stage, backup: path.join(stage, 'old'), incoming: path.join(stage, 'new'), movedOld: false, movedNew: false };
       transactions.push(transaction);
@@ -139,6 +160,11 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
       }
     }
     committed = true;
+    // 提交成功才清过期备份（M1）：失败批次回滚后一切如旧，旧备份也照旧保留。
+    for (const backup of staleBackups) {
+      try { await rm(backup, { recursive: true, force: true }); }
+      catch { warnings.push(t('cleanupWarning', { path: backup })); }
+    }
   } catch (error) {
     const recovery = [];
     for (const transaction of [...transactions].reverse()) {
@@ -158,11 +184,17 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
     if (error instanceof CliError) throw error;
     throw new CliError(t('replaceFailed'), 1, 'replace');
   } finally {
-    for (const stage of staging) {
+    for (const transaction of transactions) {
+      // 提交成功的动作把备份改名保留（M1）：销毁变可恢复。改名失败则暂存目录连同备份一起保留
+      //（continue 跳过清理）并警告位置——绝不因清理失误丢掉旧内容。
+      if (committed && transaction.movedOld) {
+        try { await rename(path.join(transaction.stage, 'old'), path.join(path.dirname(transaction.path), `${BACKUP_PREFIX}${backupStamp()}`)); }
+        catch { warnings.push(t('cleanupWarning', { path: path.join(transaction.stage, 'old') })); continue; }
+      }
       // 回滚失败的备份绝不能在清理时删除。
-      if (!committed && await exists(path.join(stage, 'old'))) continue;
-      try { await rm(stage, { recursive: true, force: true }); }
-      catch { warnings.push(t('cleanupWarning', { path: stage })); }
+      if (!committed && await exists(path.join(transaction.stage, 'old'))) continue;
+      try { await rm(transaction.stage, { recursive: true, force: true }); }
+      catch { warnings.push(t('cleanupWarning', { path: transaction.stage })); }
     }
   }
   return warnings;

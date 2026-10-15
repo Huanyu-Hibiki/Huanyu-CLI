@@ -9,6 +9,11 @@ import { HOSTS, targetRoot, discoveryRoots, projectRootsOf } from './hosts.js';
 // Windows 保留设备名（con/nul/aux/com1 等，后随点或结尾）不能作为安装目录：
 // 检查从 publish.canonicalName 下沉到这里，参数解析、catalog 契约校验、发布归一化、安装全链一致拒绝。
 const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+
+// 旧版本备份目录前缀（任务 6 M1 缓解）：replaceAll 提交后把被替换/移除目录的备份改名保留在安装根
+// （.hy-backup-<stamp>）。它们不是安装——扫描与配对清理都必须跳过，否则备份会被当成第二份副本
+// 报多副本、甚至被免费版清理再次移除（销毁刚保留的可恢复内容）。
+const BACKUP_PREFIX = '.hy-backup-';
 export const isReservedSkillName = (value) => typeof value === 'string' && RESERVED.test(value);
 export const isSkillName = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(value) && !RESERVED.test(value);
 export const isVersion = (value) => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value);
@@ -170,6 +175,8 @@ export async function freeReplacements(name, roots) {
       throw new CliError(t('scanRead', { path: root }), 1, 'skill_read');
     }
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))) {
+      // 保留的旧版本备份不是可清理的免费版（任务 6 M1）：刚保留的可恢复内容不能被下一轮清理再销毁。
+      if (entry.name.startsWith(BACKUP_PREFIX)) continue;
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const directory = path.join(root, entry.name);
       const item = await inspectSkill(directory, [name]);
@@ -228,12 +235,30 @@ export async function scan(names, roots = discoveryRoots()) {
       throw new CliError(t('scanRead', { path: root }), 1, 'skill_read');
     }
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))) {
+      // 保留的旧版本备份不是安装（任务 6 M1）：含同版 SKILL.md 也不算第二份副本。
+      if (entry.name.startsWith(BACKUP_PREFIX)) continue;
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const skill = await inspectSkill(path.join(root, entry.name), names);
       if (skill && !seen.has(directoryKey(skill.real_path))) { seen.add(directoryKey(skill.real_path)); found.push(skill); }
     }
   }
   return found;
+}
+
+// 安装根里保留的旧版本备份（任务 6 M1 缓解）：replaceAll 提交后把被替换/移除目录的备份改名为
+// .hy-backup-<stamp> 留在安装根；status 据此提示位置与清理方法（下一次安装/更新自动清过期备份）。
+export async function retainedBackups(roots = discoveryRoots()) {
+  const found = [];
+  for (const root of [...new Set(roots)]) {
+    let entries;
+    try { entries = await readdir(root, { withFileTypes: true }); }
+    catch (error) {
+      if (['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
+      throw new CliError(t('scanRead', { path: root }), 1, 'skill_read');
+    }
+    for (const entry of entries) if (entry.isDirectory() && entry.name.startsWith(BACKUP_PREFIX)) found.push(path.join(root, entry.name));
+  }
+  return found.sort();
 }
 
 // scan 已按真实路径去重，同名的多条记录就是多份互不相干的副本。

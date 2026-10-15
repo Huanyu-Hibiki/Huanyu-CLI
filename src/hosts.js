@@ -69,6 +69,13 @@ export function projectRootsOf(hostId, env = process.env, platform = process.pla
   return host?.project ? [paths.resolve(cwd, ...host.project)] : [];
 }
 
+// CLI 管辖根全集（任务 6 M2 写穿白名单）：已存在的用户级宿主根（installationRoots）+ 各宿主项目级根
+// + 调用方显式提供的根（--to 显式根或自动发现根）。realInstallation 解析出的真实目标必须落在其中
+// 之一才允许写穿跟随——用户自建链接指向管理范围之外的目录时按占用拒绝，不借 CLI 之手改写任意目录。
+export async function managedRoots(extra = [], env = process.env, platform = process.platform, cwd = process.cwd()) {
+  return [...new Set([...extra, ...(await installationRoots(env, platform, cwd)), ...HOSTS.flatMap((host) => projectRootsOf(host.id, env, platform, cwd))])];
+}
+
 // 编辑距离（小 DP；宿主 id 最长 8 字符，无需剪枝）。
 function editDistance(a, b) {
   const rows = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);

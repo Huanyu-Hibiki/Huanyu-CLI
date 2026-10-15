@@ -11,10 +11,9 @@ const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 const { version: VERSION } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
 // 任务 4 起 publish、任务 6 起 install、二期任务 1 起 update、二期任务 2 起 product/unpublish/audit、
-// 二期任务 3 起 manage 已实现；仍待实现的命令保持 not_implemented。
-// update/product/unpublish/audit/manage 与 install 一样先做登录/网络前置，本测试不带假商店服务器，
-// 不能再当 not_implemented 样本（行为测试见 test/update.test.js、test/admin.test.js、test/manage.test.js）。
-const PENDING = [];
+// 二期任务 3 起 manage、二期任务 4 起 subscribe 已实现：14 个命令全部转正，不再有 not_implemented 样本。
+// 后续命令与 install 一样先做登录/网络前置，本测试不带假商店服务器，不能当 not_implemented 样本
+// （行为测试见 test/update.test.js、test/admin.test.js、test/manage.test.js、test/purchase.test.js）。
 
 // 语言相关环境固定为确定值（默认中文）；extraEnv 在其后展开以便覆盖测试环境变量通道。
 const BASE_ENV = { HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_TOKEN: '', CI: '' };
@@ -206,24 +205,6 @@ test('publish 参数面：目录与 --repo 互斥、--all/--check 依赖 --repo 
   assert.match((await run(['publish'])).stderr, /publish 需要一个 Skill 目录，或用 --repo <路径> 指向仓库。/);
   assert.match((await run(['publish', '--repo'], { HY_LANG: 'en' })).stderr, /--repo requires a value\./);
   assert.match((await run(['publish', 'dir', '--notes', 'x'.repeat(2001)])).stderr, /--notes 不能超过 2000 字符。/);
-});
-
-test('未实现命令执行时退出码 2，error 为 not_implemented 并使用中性文案', async () => {
-  for (const name of PENDING) {
-    const result = await run([name, '--json']);
-    assert.equal(result.code, 2, name);
-    assert.equal(data(result).error, 'not_implemented', name);
-    assert.match(data(result).message, /尚未实现/, name);
-    assert.ok(data(result).message.includes(name), name);
-  }
-  // install（任务 6 起）会先拉 catalog，本测试不带假商店服务器，不能再当 not_implemented 样本；
-  // subscribe（二期任务 4）同理先走登录/catalog 前置，这里只钉住 not_implemented 文案本身。
-  const result = await run(['subscribe', 'demo-skill', '--plan', 'lifetime', '--json']);
-  assert.equal(result.code, 2);
-  assert.equal(data(result).error, 'not_implemented');
-  assert.match(data(result).message, /尚未实现/);
-  const english = await run(['subscribe', 'demo-skill', '--lang', 'en']);
-  assert.match(english.stderr, /not implemented yet/);
 });
 
 test('错误输出经过密钥遮盖：--token 值与 HY_TOKEN 环境变量都不出现在输出里', async () => {

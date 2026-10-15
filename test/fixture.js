@@ -140,6 +140,19 @@ export async function fixture(t) {
     // 管理门户（二期任务 3）：portalUrl 注入门户响应 URL（null 走默认 /account/；空串模拟缺字段）；
     // subscriptionStatus 覆盖订阅状态、rawSubscriptions 整体替换订阅列表（条目形状残缺的正反例）。
     portalUrl: null, subscriptionStatus: null, rawSubscriptions: null,
+    // 付款会话（二期任务 4）：sessions 按 id 存 {token, skill, plan, amount, currency, status, paid}；
+    // checkoutActiveAfter=N 让 me 轮询第 N 次自动视为“用户已付款”（假浏览器无需真实动作——template
+    // 同款语义：轮询到点即解锁）；checkoutStatusActiveAfter 同理作用于 status 端点（默认永不）；
+    // checkoutPrices 按语言（zh/en）/checkoutPrice 单值覆盖价格（币种核对注入）；checkoutNotice 转告；
+    // checkoutAlreadyActive 注入 409；meSubscriptions 整体替换 me 订阅列表（语义注入，与 rawSubscriptions
+    // 的形状注入互补）；checkoutStatusErrors/checkoutPollErrors 按序注入 5xx；fulfillmentPending 让
+    // status 已付但履约不生效（processing 态）；checkoutUrl/checkoutResponse/checkoutStatusResponse
+    // 覆盖会话 URL/整包响应（形状校验负例）。
+    checkoutPolls: 0, checkoutRequests: 0, checkoutCreated: 0, checkoutActiveAfter: 2, checkoutStatusPolls: 0,
+    checkoutStatusActiveAfter: Infinity, sessions: new Map(), checkoutPrices: null, checkoutPrice: null,
+    checkoutNotice: null, checkoutAlreadyActive: false, checkoutStatusErrors: null, checkoutPollErrors: null,
+    checkoutToken: null, checkoutSkill: null, meSubscriptions: null, checkoutUrl: null,
+    checkoutResponse: null, checkoutStatusResponse: null, fulfillmentPending: false,
     // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
     // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
     publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
@@ -405,9 +418,65 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname === '/api/auth/me') {
         if (!authenticate()) return;
+        // 付款轮询注入位：checkoutToken 匹配时第 N 次 me 视为用户已付款（grant 解锁）；
+        // checkoutPollErrors 按序注入 5xx（轮询容错测试，计数照常推进）。
+        if (state.checkoutToken === token) {
+          state.checkoutPolls++;
+          const pollError = state.checkoutPollErrors?.[state.checkoutPolls - 1];
+          if (pollError) return error(res, 502, 'upstream', '服务连接失败');
+          if (state.checkoutPolls >= state.checkoutActiveAfter) state.grants.set(token, [state.checkoutSkill]);
+        }
         // publisher 是契约字段（设计「接口设计」）；dropPublisher 用于缺字段的 invalid_response 测试；
-        // rawSubscriptions 整体替换订阅列表（security-L2 条目形状残缺的负例注入）。
-        return json(res, 200, { email: EMAIL, subscriptions: state.rawSubscriptions ?? subscriptions(token), ...(state.dropPublisher ? {} : { publisher: state.publishers.has(token) }) });
+        // rawSubscriptions 整体替换订阅列表（security-L2 条目形状残缺的负例注入），
+        // meSubscriptions 为任务 4 的语义注入（如 409 后 me 仍未列出授权）。
+        return json(res, 200, { email: EMAIL, subscriptions: state.rawSubscriptions ?? state.meSubscriptions ?? subscriptions(token), ...(state.dropPublisher ? {} : { publisher: state.publishers.has(token) }) });
+      }
+      // 付款会话创建（二期任务 4，契约：POST 🔒 → { id, url, reused, amount, currency, notice? }）。
+      // 复用语义：同令牌同 skill 同方案同币种的 open 会话原样返回（reused:true，不换付款页）；
+      // 同令牌已有已付会话 → 409 already_active（履约完成）；注入位 checkoutAlreadyActive 强制 409。
+      if (req.method === 'POST' && url.pathname === '/api/store/checkout') {
+        if (!authenticate()) return;
+        state.checkoutRequests++;
+        if (state.checkoutAlreadyActive) {
+          state.grants.set(token, [body.skill]);
+          return error(res, 409, 'already_active', '已经解锁。');
+        }
+        state.checkoutToken = token;
+        state.checkoutSkill = body.skill;
+        const plan = body.plan || state.catalog.find((p) => p.paid?.skill === body.skill)?.offer?.[0] || 'lifetime';
+        const price = state.checkoutPrices?.[body.lang || (english ? 'en' : 'zh')] || state.checkoutPrice || state.catalog.find((p) => p.paid?.skill === body.skill)?.prices[plan];
+        const own = [...state.sessions.values()].filter((s) => s.token === token && s.skill === body.skill);
+        if (own.some((s) => s.paid)) {
+          state.grants.set(token, [...new Set([...(state.grants.get(token) || []), body.skill])]);
+          for (const s of own) if (s.status === 'open' && !s.paid) s.status = 'expired';
+          return error(res, 409, 'already_active', english ? 'Already purchased.' : '已经解锁。');
+        }
+        const reused = own.find((s) => s.status === 'open' && s.plan === plan && s.currency === price?.currency);
+        const notice = state.checkoutNotice ? { notice: state.checkoutNotice } : {};
+        if (reused) return json(res, 200, { id: reused.id, url: reused.url, reused: true, amount: reused.amount, currency: reused.currency, ...notice });
+        state.checkoutPolls = 0;
+        const id = `cs_test_${++state.checkoutCreated}`;
+        const session = { id, url: state.checkoutUrl ?? `${base}/checkout?session=${state.checkoutCreated}`, token, skill: body.skill, plan, amount: price?.amount, currency: price?.currency, status: 'open', paid: false };
+        state.sessions.set(id, session);
+        return json(res, 200, state.checkoutResponse ?? { id, url: session.url, reused: false, amount: session.amount, currency: session.currency, ...notice });
+      }
+      // 付款会话状态（契约：GET 🔒 ?id= → { status, paid, entitled }）：会话归属校验（404/403）；
+      // checkoutStatusActiveAfter=N 时第 N 次查询视为付款完成；fulfillmentPending 让已付但不履约
+      // （paid:true + entitled:false 的 processing 态）；正常履约同时解锁并过期同令牌同 skill 的其他
+      // open 会话（避免旧会话被恢复逻辑误判为可复用）。
+      if (req.method === 'GET' && url.pathname === '/api/store/checkout/status') {
+        if (!authenticate()) return;
+        const session = state.sessions.get(url.searchParams.get('id'));
+        if (!session) return error(res, 404, 'not_found', english ? 'Session not found.' : '没有这个会话。');
+        if (session.token !== token) return error(res, 403, 'access_denied', english ? 'Access denied.' : '无权查询。');
+        state.checkoutStatusPolls++;
+        if (state.checkoutStatusErrors?.[state.checkoutStatusPolls - 1]) return error(res, 502, 'upstream', english ? 'Service unavailable.' : '服务连接失败');
+        if (state.checkoutStatusPolls >= state.checkoutStatusActiveAfter && session.status === 'open') { session.paid = true; session.status = 'complete'; }
+        if (session.paid && !state.fulfillmentPending) {
+          state.grants.set(token, [...new Set([...(state.grants.get(token) || []), session.skill])]);
+          for (const other of state.sessions.values()) if (other.id !== session.id && other.token === token && other.skill === session.skill && other.status === 'open') other.status = 'expired';
+        }
+        return json(res, 200, state.checkoutStatusResponse ?? { status: session.status, paid: session.paid, entitled: subscriptions(token).some((s) => s.skill === session.skill) });
       }
       // 账号管理门户（二期任务 3，契约：POST 🔒 → { url }）：portalUrl 注入响应 URL（空串模拟缺字段）。
       if (req.method === 'POST' && url.pathname === '/api/account/portal') {
@@ -451,6 +520,8 @@ export async function fixture(t) {
         stdout += chunk;
         // 设备码显示后立即杀死进程，模拟 Agent 中断；待领取记录已先行落盘。
         if (runtime.killOnDevice && (stdout.includes('授权码：') || stdout.includes('"event":"device"'))) child.kill('SIGKILL');
+        // 付款页显示后立即杀死进程，模拟 Agent 中断；付款会话已先行落盘（任务 4 恢复语义）。
+        if (runtime.killOnCheckout && (stdout.includes('付款页面：') || stdout.includes('"event":"checkout"'))) child.kill('SIGKILL');
       });
       child.stderr.on('data', (chunk) => { stderr += chunk; });
       child.stdin.end();

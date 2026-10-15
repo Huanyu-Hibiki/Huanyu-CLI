@@ -7,6 +7,7 @@ import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
 import { Client, catalogNames, findSkill, isSkillName, isVersion } from './client.js';
 import { login, loadAuth, requireLogin } from './auth.js';
+import { requirePurchase } from './purchase.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo, reconcileRepo } from './publish.js';
 import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked } from './skills.js';
@@ -314,7 +315,9 @@ async function planActions(ctx, name, roots) {
 // 订阅快照缓存在 ctx.account：混合批量逐 skill 判定只查一次账号；缓存失效经 invalidateAccount。
 async function requireEntitlement(ctx, name) {
   const { product, paid } = findSkill(ctx.catalog, name);
-  if (!paid) return true;
+  // 本进程已确认购买（requirePurchase 的 unlockedSkills 缓存）直接放行：409 already_active 等
+  // me 暂未列出授权的履约窗口里，接续安装不必（也不能）再按订阅快照拦截。
+  if (!paid || ctx.unlockedSkills?.has(name)) return true;
   await requireLogin(ctx);
   if (!ctx.account) ctx.account = await ctx.client.me(ctx.token);
   if (ctx.account.subscriptions.some((item) => item.skill === name && SUBSCRIPTION_STATUSES.includes(item.status))) return true;
@@ -325,6 +328,22 @@ async function requireEntitlement(ctx, name) {
 
 // 订阅快照失效（任务 5 契约）：购买成功后必须调用——否则同进程内后续的权益判定仍按旧快照放行/拦截。
 export const invalidateAccount = (ctx) => { ctx.account = null; };
+
+// hy subscribe（二期任务 4，purchase.js 状态机接线）：免费 skill 拒绝购买引导安装；--plan 与目录
+// 价格核对；登录后走 requirePurchase（已解锁直接完成 → 创建/恢复 checkout 会话 → 浏览器付款页 →
+// 3s 轮询至解锁 → 409 already_active 当已购）；随后确认接续安装——非交互自动确认（沿用 install 的
+// auto_confirmed 警示），答否给 install_hint 与安装命令。
+async function subscribe(ctx) {
+  const name = ctx.options.skill;
+  const { product, paid } = findSkill(ctx.catalog, name);
+  if (!paid) throw new CliError(t('freePurchase', { name: skillLabel(name) }), 2, 'usage');
+  if (ctx.options.plan && !Object.hasOwn(product.prices, ctx.options.plan)) throw new CliError(t('unknownPlan', { plan: ctx.options.plan }), 2, 'usage');
+  await requireLogin(ctx);
+  await requirePurchase(ctx, name, { plan: ctx.options.plan });
+  if (await ctx.confirm(t('installNow', { name: skillLabel(name) }), ctx.options.yes, ctx.interactive, ctx.signal, true)) return await install(ctx, name);
+  ctx.output.write({ event: 'install_hint', install_command: command('install', name) }, [t('installLater', { next: command('install', name) })]);
+  return 0;
+}
 
 // hy manage（二期任务 3，template 移植）：登录后向商店要账号门户 URL 并打开浏览器；
 // 打不开时给可复制链接。响应形状校验：缺/空 url 按 invalid_response 拒绝（openBrowser 内另有 URL 语法校验）。
@@ -600,13 +619,14 @@ async function runCommand(argv, runtime) {
     if (options.command === 'login') return await login(ctx, options.token);
     // manage 只走登录 + 门户接口，不消费 catalog（template 同位）。
     if (options.command === 'manage') return await manage(ctx);
-    if (options.command === 'status' || options.command === 'list' || options.command === 'install' || options.command === 'update') {
-      // catalog 拉取一次并缓存进 ctx；status 扫描与 install/update 等后续命令复用。
+    if (options.command === 'status' || options.command === 'list' || options.command === 'install' || options.command === 'update' || options.command === 'subscribe') {
+      // catalog 拉取一次并缓存进 ctx；status 扫描与 install/update/subscribe 等后续命令复用。
       ctx.catalog = await ctx.client.catalog();
       ctx.names = catalogNames(ctx.catalog);
       if (options.command === 'status') return await status(ctx);
       if (options.command === 'install') return await install(ctx);
       if (options.command === 'update') return await update(ctx);
+      if (options.command === 'subscribe') return await subscribe(ctx);
       return await list(ctx);
     }
     if (options.command === 'publish') {

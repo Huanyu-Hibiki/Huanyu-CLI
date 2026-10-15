@@ -1,7 +1,7 @@
 import { t } from './i18n.js';
 import path from 'node:path';
 import { mkdir, readFile, rename, rm, open } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { CliError } from './io.js';
 import { pathsFor, userHome, restrictPermissions, absoluteDirectory } from './platform.js';
 import { DEFAULT_API } from './client.js';
@@ -23,6 +23,17 @@ export function isPendingDevice(device) {
     && Number.isFinite(device.expires_at) && device.expires_at > 0 && Number.isFinite(device.interval) && device.interval > 0;
 }
 
+// 付款会话只存非敏感字段 + 令牌摘要（sha256，64 位十六进制）：url 必须是 http(s) 且不带凭据，
+// 恢复时才允许把会话 id 发给商店查询。明文令牌绝不落盘。
+const tokenHash = (token) => createHash('sha256').update(token).digest('hex');
+export function isPendingCheckout(checkout) {
+  if (!checkout || !['id', 'url', 'skill', 'plan', 'api', 'token_hash'].every((key) => typeof checkout[key] === 'string' && checkout[key])) return false;
+  try {
+    const url = new URL(checkout.url);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && /^[a-f0-9]{64}$/.test(checkout.token_hash);
+  } catch { return false; }
+}
+
 async function readConfig() {
   try {
     const file = configPath();
@@ -32,7 +43,8 @@ async function readConfig() {
     if (hasAuth && (typeof data.token !== 'string' || !data.token || typeof data.email !== 'string' || !data.email)) throw new Error('invalid config');
     if (data.api !== undefined && typeof data.api !== 'string') throw new Error('invalid config');
     if (data.pending_device !== undefined && !isPendingDevice(data.pending_device)) throw new Error('invalid config');
-    if (!hasAuth && !data.pending_device) throw new Error('invalid config');
+    if (data.pending_checkout !== undefined && !isPendingCheckout(data.pending_checkout)) throw new Error('invalid config');
+    if (!hasAuth && !data.pending_device && !data.pending_checkout) throw new Error('invalid config');
     await restrictPermissions(file);
     return data;
   } catch (error) {
@@ -64,6 +76,24 @@ export async function readPendingDevice() {
   return (await readConfig())?.pending_device ?? null;
 }
 
+// 会话只能由创建它的令牌（摘要比对）向同一服务器（origin 比对）恢复；换令牌/换服务器都不沿用。
+export async function readPendingCheckout(skill, token, api) {
+  const checkout = (await readConfig())?.pending_checkout;
+  return checkout?.skill === skill && checkout.token_hash === tokenHash(token) && origin(checkout.api) === origin(api) ? checkout : null;
+}
+
+export async function savePendingCheckout(checkout, token, api) {
+  return await saveConfig({ ...await readConfig(), pending_checkout: { ...checkout, api, token_hash: tokenHash(token) } });
+}
+
+export async function clearPendingCheckout(id) {
+  const data = await readConfig();
+  if (data?.pending_checkout?.id !== id) return;
+  delete data.pending_checkout;
+  if (data.token || data.pending_device) await saveConfig(data);
+  else await logout();
+}
+
 async function saveConfig(data) {
   const file = configPath();
   const temp = `${file}.${randomUUID()}.tmp`;
@@ -87,9 +117,18 @@ async function saveConfig(data) {
   return file;
 }
 
-// 保存令牌时一并清掉待领取记录；saveConfig 不读旧文件，显式令牌登录也能修复坏配置。
+// 保存令牌时一并清掉待领取记录；saveConfig 不读旧文件，显式令牌登录也能修复坏配置——
+// 但同一令牌向同一服务器重新登录时保留付款进度（重跑不重复收费）。
 export async function saveAuth(token, email, api) {
-  return await saveConfig({ token, email, api });
+  let pending;
+  try {
+    const checkout = (await readConfig())?.pending_checkout;
+    if (checkout && checkout.token_hash === tokenHash(token) && origin(checkout.api) === origin(api)) pending = checkout;
+  } catch (error) {
+    // 坏配置仍可被显式令牌登录修复；其余读写故障照常透出。
+    if (!(error instanceof CliError) || error.error !== 'config_read') throw error;
+  }
+  return await saveConfig({ token, email, api, ...(pending ? { pending_checkout: pending } : {}) });
 }
 
 export async function savePendingDevice(device) {
@@ -100,7 +139,7 @@ export async function clearPendingDevice() {
   const data = await readConfig();
   if (!data?.pending_device) return;
   delete data.pending_device;
-  if (data.token) await saveConfig(data);
+  if (data.token || data.pending_checkout) await saveConfig(data);
   else await logout();
 }
 

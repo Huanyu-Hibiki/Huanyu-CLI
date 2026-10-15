@@ -132,6 +132,13 @@ export class Client {
     if (!data.subscriptions.every((item) => item && typeof item === 'object' && typeof item.skill === 'string' && item.skill && typeof item.status === 'string' && item.status)) throw invalid(t('invalidAccount'));
     return data;
   }
+  // 付款会话状态（二期任务 4，设计「接口设计」）：status ∈ open/complete/expired，
+  // paid（是否已收款）与 entitled（履约是否生效）必须是布尔——残缺响应按 invalid_response 拒绝。
+  async checkoutStatus(id, token, options = {}) {
+    const data = await this.request(`/api/store/checkout/status?id=${encodeURIComponent(id)}`, { token, ...options });
+    if (!['open', 'complete', 'expired'].includes(data?.status) || typeof data.paid !== 'boolean' || typeof data.entitled !== 'boolean') throw invalid(t('invalidCheckoutStatus'));
+    return data;
+  }
   // 发布上传（设计「接口设计·发布端」）：体为 tar.gz 二进制（Web 流式，不整体驻留内存），
   // 名字/版本/摘要在 X- 头里；错误语义 409 version_exists / 403 not_a_publisher / 400 invalid_package /
   // 413 too_large 由调用方映射。size 用于响应复核（流式体没有可直接比对的字节数）。

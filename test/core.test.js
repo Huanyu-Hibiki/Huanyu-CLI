@@ -154,7 +154,8 @@ test('Output.remember 补充登记密钥；hide 状态整段隐藏', () => {
 test('package.json 打包字段与仓库现状一致', async () => {
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(pkg.name, 'huanyu-cli');
-  assert.equal(pkg.version, '0.1.0');
+  // 二期收尾（任务 7）：六命令转正后升 0.2.0；升版本时同步本断言（release-checklist 第 4 项）。
+  assert.equal(pkg.version, '0.2.0');
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.bin?.hy, 'bin/hy.js');
   assert.equal(pkg.dependencies, undefined);
@@ -168,29 +169,35 @@ test('package.json 打包字段与仓库现状一致', async () => {
 });
 
 // —— 发布收尾（任务 8）：README/约定文档与仓库实际行为的一致性 ——
+// 二期任务 7 转正：14 命令全部实现，分期标注与 not-implemented 说明一并退场。
 
-test('README 双语与 help 文案一致：14 命令齐备、说明逐字取自词条、二期标注正确', async () => {
+test('README 双语与 help 文案一致：14 命令齐备、用法与说明逐字取自词条、无分期标注', async () => {
   const zh = await readFile(new URL('../README.md', import.meta.url), 'utf8');
   const en = await readFile(new URL('../README.en.md', import.meta.url), 'utf8');
-  // 一期已实现（与 cli.test.js 的执行面一致）；version 与 help 共用一行，只查名字出现。
-  const IMPLEMENTED = ['status', 'list', 'install', 'login', 'logout', 'publish', 'help'];
-  const PENDING = ['update', 'subscribe', 'manage', 'product', 'unpublish', 'audit'];
   for (const [text, index, marker] of [[zh, 0, '二期'], [en, 1, 'Phase 2']]) {
     for (const name of COMMANDS) assert.ok(text.includes(name), `命令名缺失：${name}`);
     assert.ok(text.includes(COMMAND), '应给出 npx github:Huanyu-Hibiki/Huanyu-CLI 直跑方式');
     assert.ok(text.includes('Node.js 18'), '应说明 Node ≥18');
+    assert.ok(!text.includes(marker), '二期命令已全部实现，不应再出现分期标注');
     for (const [key, pair] of Object.entries(dictionary)) {
-      // 词条形如「{command} <用法>  <说明>」：说明部分（首个双空格之后）逐字进 README 命令表。
+      // 词条形如「{command} <用法>  <说明>」：用法与说明（首个双空格前后）逐字进 README 命令表；
+      // 行内比对先去掉反引号与表格里的 \| 转义。
       if (!key.startsWith('help') || key === 'helpIntro' || key === 'helpUsage') continue;
+      const usage = pair[index].split('  ')[0].replaceAll('{command} ', '');
       const description = pair[index].split('  ').slice(1).join('  ');
       assert.ok(text.includes(description), `README 说明与 help 词条不一致（${key}）：${description}`);
+      const row = text.split('\n').find((line) => line.startsWith('|') && line.replaceAll('`', '').replaceAll('\\|', '|').includes(usage));
+      assert.ok(row, `README 命令表缺少用法（${key}）：${usage}`);
     }
-    const rows = text.split('\n').filter((line) => line.startsWith('|'));
-    for (const name of [...IMPLEMENTED, ...PENDING]) {
-      const row = rows.find((line) => line.includes(`\`${name}`));
-      assert.ok(row, `命令表缺少 ${name} 行`);
-      assert.equal(row.includes(marker), PENDING.includes(name), `${name} 的分期标注`);
-    }
+  }
+});
+
+// 二期机制的 README 说明（任务 7）：免费版自动清理、备份保留、购买后重跑指引三块齐备。
+test('README 双语覆盖二期机制说明：免费版自动清理、备份保留、购买后重跑指引', async () => {
+  const zh = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  const en = await readFile(new URL('../README.en.md', import.meta.url), 'utf8');
+  for (const [text, words] of [[zh, ['自动移除', 'removed', '.hy-backup-', '不会重复收费']], [en, ['automatically removes', 'removed', '.hy-backup-', 'not charge twice']]]) {
+    for (const word of words) assert.ok(text.includes(word), `README 机制说明缺少：${word}`);
   }
 });
 
@@ -207,9 +214,9 @@ test('skill 更新检查约定文档完整：端点与 DEFAULT_API 同步、开�
   assert.ok(text.includes('hy publish') && text.includes('--repo') && text.includes('--all'), '发布命令');
 });
 
-test('发布前检查清单覆盖关键项：占位替换、命令名复验、CI、打包、试点上架、二期待办', async () => {
+test('发布前检查清单覆盖关键项：占位替换、命令名复验、CI、打包、试点上架、联调契约评审', async () => {
   const text = await readFile(new URL('../docs/release-checklist.md', import.meta.url), 'utf8');
-  for (const item of ['DEFAULT_API', 'src/client.js', 'HY_API', 'hy', 'PATH', 'npm pack', '--repo', '--all', 'docs/plans/2026-10-15-huanyu-cli-mvp-plan.md']) {
+  for (const item of ['DEFAULT_API', 'src/client.js', 'HY_API', 'hy', 'PATH', 'npm pack', '--repo', '--all', 'docs/designs/2026-10-15-huanyu-cli-design.md', '联调评审补充']) {
     assert.ok(text.includes(item), `清单缺少：${item}`);
   }
 });

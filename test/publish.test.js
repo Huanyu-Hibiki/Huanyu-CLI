@@ -178,8 +178,8 @@ test('validateArchive 恶意归档用例：路径越界、链接条目、拼接 
     await writeFile(file, gzipSync(Buffer.concat([...good, bad, Buffer.alloc(1024)])));
     await assert.rejects(validateArchive(file, 'ppt-design'), { error: 'invalid_archive' }, label);
   }
-  // Windows 分支（保留名/盘符/ADS/尾部点）通过 platform 参数在任意系统钉住。
-  for (const name of ['ppt-design/con', 'ppt-design/com1.txt', 'ppt-design/C:aux', 'ppt-design/space.', 'ppt-design/trailing ']) {
+  // Windows 分支（保留名/盘符/ADS/尾部点/仅大小写不同的条目）通过 platform 参数在任意系统钉住。
+  for (const name of ['ppt-design/con', 'ppt-design/com1.txt', 'ppt-design/C:aux', 'ppt-design/space.', 'ppt-design/trailing ', 'ppt-design/SKILL.MD']) {
     const file = path.join(directory, 'win.tar.gz');
     await writeFile(file, gzipSync(Buffer.concat([...good, tarEntry(name), Buffer.alloc(1024)])));
     await assert.rejects(validateArchive(file, 'ppt-design', 'win32'), { error: 'invalid_archive' }, name);
@@ -190,6 +190,18 @@ test('validateArchive 恶意归档用例：路径越界、链接条目、拼接 
   const clean = path.join(directory, 'clean.tar.gz');
   await writeFile(clean, gzipSync(Buffer.concat([...good, Buffer.alloc(1024)])));
   await validateArchive(clean, 'ppt-design');
+});
+
+test('validateArchive 解压后总量上限：entry 声明 size 之和超限拒绝（默认 400MB 与发布侧对称，注入小阈值钉住）', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'hy-unit-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const good = [tarEntry('ppt-design/', '5'), tarEntry('ppt-design/SKILL.md', '0', 'name: ppt-design')];
+  const file = path.join(directory, 'fat.tar.gz');
+  await writeFile(file, gzipSync(Buffer.concat([...good, tarEntry('ppt-design/assets/blob.bin', '0', 'x'.repeat(4096)), Buffer.alloc(1024)])));
+  // 解压后总量（全部条目声明 size 之和）超阈值：tar 炸弹在预检阶段被拒，不落到磁盘。
+  await assert.rejects(validateArchive(file, 'ppt-design', process.platform, 2048), { error: 'invalid_archive' });
+  // 默认 400MB 上限下同一归档照常通过。
+  await validateArchive(file, 'ppt-design');
 });
 
 test('409 version_exists：同版本不同内容单目录报错；同 sha256 重传幂等（两次 200、服务端只存一份）', async (t) => {

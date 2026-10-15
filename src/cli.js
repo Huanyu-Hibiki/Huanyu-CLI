@@ -1,7 +1,7 @@
 import { t, withLanguage, resolveLanguage, command, helpLines, skillLabel, planLabel, priceLabel as formatPrice } from './i18n.js';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
 import { Client, catalogNames, findSkill, isSkillName, isVersion } from './client.js';
@@ -168,6 +168,7 @@ async function install(ctx) {
   const name = ctx.options.skill;
   const { product, paid } = findSkill(ctx.catalog, name);
   // 付费前置拦截（设计「分期计划」：一期付费=引导非购买）：不进 402/checkout 流程，exit 3 附商品页。
+  // 闸门先于 --to 校验：一期语义下付费 skill 无论参数对错都应先得到购买引导，而不是用法报错。
   if (paid) {
     const url = ctx.client.subscriptionUrl(name, product);
     throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
@@ -192,13 +193,21 @@ async function install(ctx) {
       [t('developmentProtected', { path: target })]);
     return 0;
   }
-  const current = await inspectSkill(target, ctx.names);
+  // 占用预检前移：无关内容或别的 skill 占着目标时，下载整包之前就失败；
+  // replaceAll 内的同名双检保留，作下载期间的竞态防线。
+  const info = await lstat(target).catch((error) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const current = info ? await inspectSkill(target, ctx.names) : null;
+  if (info && (!current || current.name !== name)) throw new CliError(t('occupied', { path: target }), 1, 'occupied', { path: target });
   const versions = await ctx.client.versions(ctx.catalog);
   const release = versions[name];
   const item = await prepare(ctx.client, name, release, ctx.token, paid, product, ctx.signal);
   let warnings;
   try {
     warnings = await replaceAll([{ name, path: target, source: item.source,
+      // previousVersion 任务 7 消费（updated 行的前版本展示）；单目标路径经 current 直接读取。
       previousName: current?.name === name ? name : null, previousVersion: current?.version || null }],
       { signal: ctx.signal, names: ctx.names });
   } finally {

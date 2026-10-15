@@ -47,14 +47,18 @@ function paxFields(buffer) {
   return fields;
 }
 
+// 解压后总量上限（默认 400MB，与发布侧 RAW_SIZE_LIMIT/设计「假设清单」#2 对称）：
+// tar 炸弹靠 entry 声明 size 之和在预检阶段拒绝，不落到磁盘。maxTotalBytes 供测试注入小阈值。
+const DEFAULT_MAX_TOTAL_BYTES = 400 * 1024 * 1024;
+
 // 在系统 tar 解压前流式检查所有实际条目，避免路径穿越及软/硬链接。
-export async function validateArchive(file, name, platform = process.platform) {
+export async function validateArchive(file, name, platform = process.platform, maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES) {
   const input = createReadStream(file);
   const unzip = createGunzip();
   input.on('error', (error) => unzip.destroy(error));
   input.pipe(unzip);
   let buffer = Buffer.alloc(0), remaining = 0, padding = 0, metaType = null, meta = [], extended = {}, longName = null;
-  let ended = false, count = 0, hasSkill = false;
+  let ended = false, count = 0, hasSkill = false, total = 0;
   const windowsEntries = new Set();
   try {
     for await (const chunk of unzip) {
@@ -117,6 +121,8 @@ export async function validateArchive(file, name, platform = process.platform) {
         if (type === '5' && size !== 0) throw archiveError();
         if (entry === `${name}/SKILL.md` && type === '0') hasSkill = true;
         count++;
+        total += size;
+        if (total > maxTotalBytes) throw archiveError();
       }
     }
     if (remaining || padding || buffer.length || !ended || !count || !hasSkill || metaType || longName || Object.keys(extended).length) throw archiveError();

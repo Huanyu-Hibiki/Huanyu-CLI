@@ -113,9 +113,10 @@ export async function fixture(t) {
     // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
     // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
     publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
-    // 下载端（任务 6）：releases 为免费默认发布物；badChecksum 让 versions 下发错误摘要、
+    // 下载端（任务 6）：releases 为免费默认发布物（每 fixture 浅拷贝一层 Map，防跨用例可变共享）；
+    // dropChecksum 让 versions 省略摘要（fail-closed 测试）、badChecksum 让 versions 下发错误摘要、
     // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载。
-    releases: await defaultReleases(), badChecksum: false, corruptBody: false, releaseDelay: 0 };
+    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0 };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -164,8 +165,9 @@ export async function fixture(t) {
           if (!name) continue;
           // 免费默认发布物：latest 对上种子版本时下发 download_url + sha256（设计「数据模型」：免费版摘要必填）。
           const seed = state.releases.get(`${name}:${state.latest}`);
+          const checksum = seed ? (state.dropChecksum ? null : state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
           skills[name] = { latest: state.badVersions ? 'oops' : state.latest, published_at: '2026-10-15T08:00:00Z', history,
-            ...(seed ? { download_url: `${base}/releases/${name}-${state.latest}.tar.gz`, sha256: state.badChecksum ? '0'.repeat(64) : seed.sha256 } : {}) };
+            ...(checksum ? { download_url: `${base}/releases/${name}-${state.latest}.tar.gz`, sha256: checksum } : {}) };
         }
         // 已发布版本合并进版本表：latest 按语义版本提升、history 追加（供 --repo 对账与任务 6/7 安装闭环消费）。
         for (const [key, entry] of state.published) {
@@ -178,7 +180,7 @@ export async function fixture(t) {
           // latest 仍是目录默认版本（发布的版本更低）时回退到种子发布物；两者都没有才省略摘要。
           const top = state.published.get(`${name}:${latest}`);
           const seed = state.releases.get(`${name}:${latest}`);
-          const checksum = top ? top.sha256 : seed ? (state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
+          const checksum = top ? top.sha256 : seed ? (state.dropChecksum ? null : state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
           skills[name] = { latest, published_at: entry.published_at, history: merged,
             download_url: `${base}/releases/${name}-${latest}.tar.gz`, ...(checksum ? { sha256: checksum } : {}) };
         }

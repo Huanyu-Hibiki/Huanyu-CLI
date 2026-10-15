@@ -12,13 +12,15 @@ import { CliError } from './io.js';
 import { inspectSkill, isDevelopmentDirectory, isLinkedInstallation, logicalDirectory } from './skills.js';
 import { validateArchive, checkTree } from './archive.js';
 import { tarInvocation, directoryKey } from './platform.js';
+import { SIZE_LIMIT } from './publish.js';
 
 const exec = promisify(execFile);
 
 // 下载校验管道（设计「publish 管道」的对称面）：下载到临时目录 → 流式 SHA-256 →
 // tar 流式预检（validateArchive 拒绝路径穿越/链接条目/保留名）→ 系统 tar 解压 →
 // checkTree + inspectSkill 复核身份。付费分支结构保留，一期由 CLI 前置拦截不进入。
-export async function prepare(client, name, release, token, paid, product, signal) {
+// sizeLimitBytes/runner 仅供测试注入（下载字节上限与解压失败），CLI 走默认值。
+export async function prepare(client, name, release, token, paid, product, signal, { sizeLimitBytes = SIZE_LIMIT, runner = exec } = {}) {
   const temporary = await mkdtemp(path.join(tmpdir(), 'hy-download-'));
   let dispose, response;
   try {
@@ -27,23 +29,34 @@ export async function prepare(client, name, release, token, paid, product, signa
     const download = await client.request(route, { token: paid ? token : undefined, download: true, skill: name, product });
     dispose = download.dispose;
     response = download.response;
-    // 免费下载的 302 响应头不会保留，使用 versions 给出的摘要；付费走响应头。
-    const expected = paid ? response.headers.get('X-Content-SHA256') : release.sha256 || response.headers.get('X-Content-SHA256');
+    // 摘要来源按信道可信度区分：免费版 302 跟随到公开附件，最终响应头可被重定向目标伪造，
+    // 以 versions 为唯一权威、缺失即 fail-closed；付费走带令牌的直连 200，响应头可信。
+    const expected = paid ? response.headers.get('X-Content-SHA256') : release.sha256;
     if (!/^[a-fA-F0-9]{64}$/.test(expected || '')) throw new CliError(t('missingChecksum'), 1, 'missing_checksum');
     const headerVersion = response.headers.get('X-Skill-Version');
     if ((paid || headerVersion) && headerVersion !== release.latest) throw new CliError(t('versionMismatch'), 1, 'version_mismatch');
     const archive = path.join(temporary, 'release.tar.gz');
     const hash = createHash('sha256');
-    const hashing = new Transform({ transform(chunk, encoding, callback) { hash.update(chunk); callback(null, chunk); } });
+    let downloaded = 0;
+    const hashing = new Transform({ transform(chunk, encoding, callback) {
+      // 下载字节上限与发布侧 100MB 对称：超限立即中止管道，不把包写完。
+      downloaded += chunk.length;
+      if (downloaded > sizeLimitBytes) { callback(new CliError(t('tooLarge', { size: downloaded }), 1, 'too_large')); return; }
+      hash.update(chunk); callback(null, chunk);
+    } });
     try {
       await pipeline(Readable.fromWeb(download.response.body), hashing, createWriteStream(archive, { flags: 'wx', mode: 0o600 }), { signal });
-    } catch { throw new CliError(signal?.aborted ? t('canceled') : t('downloadFailed'), 1, signal?.aborted ? 'cancelled' : 'download'); }
+    } catch (error) {
+      // 注入的上限错误原样透出（临时目录照常清理），其余按取消/下载失败归类。
+      if (error instanceof CliError) throw error;
+      throw new CliError(signal?.aborted ? t('canceled') : t('downloadFailed'), 1, signal?.aborted ? 'cancelled' : 'download');
+    }
     if (hash.digest('hex') !== expected.toLowerCase()) throw new CliError(t('checksumMismatch'), 1, 'checksum_mismatch');
     await validateArchive(archive, name);
     const extracted = path.join(temporary, 'extracted');
     await mkdir(extracted);
     const tar = tarInvocation(archive, extracted);
-    try { await exec(tar.command, tar.args, { cwd: tar.cwd, timeout: 60_000, maxBuffer: 1024 * 1024, signal }); }
+    try { await runner(tar.command, tar.args, { cwd: tar.cwd, timeout: 60_000, maxBuffer: 1024 * 1024, signal }); }
     catch { throw new CliError(t('extractFailed'), 1, 'extract'); }
     const entries = await readdir(extracted);
     if (entries.length !== 1 || entries[0] !== name) throw new CliError(t('invalidArchive'), 1, 'invalid_archive');

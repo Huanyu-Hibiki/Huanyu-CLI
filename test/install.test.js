@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { fixture, writeSkill } from './fixture.js';
-import { replaceAll } from '../src/install.js';
+import { prepare, replaceAll } from '../src/install.js';
+import { Client } from '../src/client.js';
 import { targetRoot } from '../src/hosts.js';
 import { command } from '../src/i18n.js';
 
@@ -14,13 +15,19 @@ const data = (result) => {
   assert.equal(result.stderr, '', result.stderr);
   return JSON.parse(result.stdout);
 };
-const failure = (result) => {
-  assert.equal(result.signal, null, result.stderr);
-  assert.equal(result.stderr, '', result.stderr);
-  return JSON.parse(result.stdout);
-};
 const exists = async (file) => { try { return await lstat(file); } catch { return null; } };
 const stageLeftovers = async (root) => (await readdir(root, { recursive: false })).filter((name) => name.startsWith('.hy-stage-'));
+// prepare 的单元注入位（sizeLimitBytes/runner）：测试进程直连假商店，HY_API 临时指向 fixture。
+const withClient = async (f, fn) => {
+  const previous = process.env.HY_API;
+  process.env.HY_API = f.base;
+  try { return await fn(new Client()); } finally { process.env.HY_API = previous; }
+};
+const releaseOf = async (f, name = 'ppt-design') => {
+  const response = await fetch(`${f.base}/api/store/versions`);
+  return (await response.json()).skills[name];
+};
+const downloadLeftovers = async () => (await readdir(tmpdir())).filter((name) => name.startsWith('hy-download-')).sort();
 
 test('install 免费 skill --to zcode：302 跟随下载落位、版本正确、全程不带令牌', async (t) => {
   const f = await fixture(t);
@@ -124,7 +131,7 @@ test('badChecksum：versions 摘要与正文不符 → checksumMismatch，目标
   f.state.badChecksum = true;
   const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(result.code, 1);
-  const value = failure(result);
+  const value = data(result);
   assert.equal(value.ok, false);
   assert.equal(value.error, 'checksum_mismatch');
   const root = path.join(f.home, '.zcode', 'skills');
@@ -136,7 +143,7 @@ test('corruptBody：下载正文截断 → download 失败，目标不可达', a
   f.state.corruptBody = true;
   const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(result.code, 1);
-  assert.equal(failure(result).error, 'download');
+  assert.equal(data(result).error, 'download');
   assert.equal(await exists(path.join(f.home, '.zcode')), null);
 });
 
@@ -174,7 +181,7 @@ test('付费 skill 一期前置拦截：exit 3 purchase_unavailable + 商品页 
   const f = await fixture(t);
   const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json']);
   assert.equal(result.code, 3);
-  const value = failure(result);
+  const value = data(result);
   assert.equal(value.error, 'purchase_unavailable');
   assert.equal(value.phase2, true);
   assert.equal(value.url, `${f.base}/store/ppt-design-pro/`);
@@ -185,7 +192,7 @@ test('付费 skill 一期前置拦截：exit 3 purchase_unavailable + 商品页 
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download') || r.path.startsWith('/releases/')), '一期不应进入付费下载');
 });
 
-test('occupied：目标目录被无关内容占用 → 保留原样', async (t) => {
+test('occupied：目标目录被无关内容占用 → 占用预检前移（不下整包）且保留原样', async (t) => {
   const f = await fixture(t);
   const root = path.join(f.home, '.zcode', 'skills');
   const target = path.join(root, 'ppt-design');
@@ -193,9 +200,71 @@ test('occupied：目标目录被无关内容占用 → 保留原样', async (t) 
   await writeFile(path.join(target, 'unrelated.txt'), 'keep me');
   const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(result.code, 1);
-  assert.equal(failure(result).error, 'occupied');
+  assert.equal(data(result).error, 'occupied');
   assert.equal(await readFile(path.join(target, 'unrelated.txt'), 'utf8'), 'keep me');
   assert.deepEqual(await readdir(target), ['unrelated.txt']);
+  assert.deepEqual(await stageLeftovers(root), []);
+  // 预检前移：无关内容占着目标时连下载都不该发起（不给重定向目标任何被请求的机会）。
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '占用预检应在下载之前');
+});
+
+test('occupied 前置同样拦截「目录名与内容不符：装着别的 skill」的目标', async (t) => {
+  const f = await fixture(t);
+  const root = path.join(f.home, '.zcode', 'skills');
+  const target = await writeSkill(root, 'ppt-design', '0.0.1');
+  // 目录名是 ppt-design，里面装的却是另一个 skill。
+  await writeFile(path.join(target, 'SKILL.md'), '---\nname: oracle-bone\nmetadata:\n  version: "0.1.0"\n---\n');
+  const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'occupied');
+  assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /oracle-bone/);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+});
+
+test('免费摘要 fail-closed：versions 缺 sha256 → missing_checksum，目标不可达', async (t) => {
+  const f = await fixture(t);
+  f.state.dropChecksum = true;
+  const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'missing_checksum');
+  assert.equal(await exists(path.join(f.home, '.zcode')), null);
+});
+
+test('下载字节上限（与发布侧 100MB 对称）：超限即中止报 too_large，临时目录照常清理', async (t) => {
+  const f = await fixture(t);
+  await withClient(f, async (client) => {
+    const release = await releaseOf(f);
+    const before = await downloadLeftovers();
+    await assert.rejects(prepare(client, 'ppt-design', release, null, false, null, undefined, { sizeLimitBytes: 16 }), { error: 'too_large' });
+    assert.deepEqual(await downloadLeftovers(), before);
+  });
+});
+
+test('解压失败注入缝：runner 抛错 → extract 失败且目标不可达、临时目录清理', async (t) => {
+  const f = await fixture(t);
+  await withClient(f, async (client) => {
+    const release = await releaseOf(f);
+    const before = await downloadLeftovers();
+    await assert.rejects(prepare(client, 'ppt-design', release, null, false, null, undefined,
+      { runner: async () => { throw new Error('tar boom'); } }), { error: 'extract' });
+    assert.deepEqual(await downloadLeftovers(), before);
+  });
+});
+
+test('changed：下载期间目标被删除 → changed 保护，不误装新目录', async (t) => {
+  const f = await fixture(t);
+  const root = path.join(f.home, '.zcode', 'skills');
+  const target = await writeSkill(root, 'ppt-design', '0.0.1');
+  // 前置预检时目标还在（同名旧版本），下载期间被第三方删除。
+  f.state.releaseDelay = 500;
+  const pending = f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/releases/ppt-design-0.1.0.tar.gz')) await delay(20);
+  await rm(target, { recursive: true, force: true });
+  const result = await pending;
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'changed');
+  assert.equal(await exists(target), null, 'changed 保护下不应凭空装出新目录');
   assert.deepEqual(await stageLeftovers(root), []);
 });
 
@@ -203,7 +272,7 @@ test('missingTarget：不带 --to → exit 2 + 推荐命令与真实路径', asy
   const f = await fixture(t);
   const result = await f.run(['install', 'ppt-design', '--json']);
   assert.equal(result.code, 2);
-  const value = failure(result);
+  const value = data(result);
   assert.equal(value.error, 'missing_target');
   const expected = command('install', 'ppt-design', '--to', 'zcode');
   assert.equal(value.recommended_command, expected);
@@ -237,7 +306,7 @@ test('重复 --to 属任务 7 的多目标语义：一期按用法错误拒绝�
   const f = await fixture(t);
   const result = await f.run(['install', 'ppt-design', '--to', 'zcode', '--to', 'claude', '--json']);
   assert.equal(result.code, 2);
-  assert.equal(failure(result).error, 'usage');
+  assert.equal(data(result).error, 'usage');
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '不应发起下载');
 });
 
@@ -249,4 +318,14 @@ test('交互模式拒绝确认 → installCanceled，退出码 0 且未动目标
   assert.equal(result.stdout, '已取消安装。\n');
   assert.equal(await exists(root), null);
   assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')));
+});
+
+test('--to 显式路径（非宿主 id）：装到自定义目录', async (t) => {
+  const f = await fixture(t);
+  const custom = path.join(f.cwd, 'my-skills');
+  const result = await f.run(['install', 'oracle-bone', '--to', custom, '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const target = path.join(custom, 'oracle-bone');
+  assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /version: "0\.1\.0"/);
+  assert.deepEqual(data(result).installations, [{ name: 'oracle-bone', path: target, previous: null, version: '0.1.0' }]);
 });

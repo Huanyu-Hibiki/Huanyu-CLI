@@ -29,8 +29,11 @@ const tokenHash = (token) => createHash('sha256').update(token).digest('hex');
 export function isPendingCheckout(checkout) {
   if (!checkout || !['id', 'url', 'skill', 'plan', 'api', 'token_hash'].every((key) => typeof checkout[key] === 'string' && checkout[key])) return false;
   try {
-    const url = new URL(checkout.url);
-    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && /^[a-f0-9]{64}$/.test(checkout.token_hash);
+    const url = new URL(checkout.url), api = new URL(checkout.api);
+    // 付款页协议与签发服务器对齐（L2）：https API 只接受 https 付款页记录，降级记录按坏配置拒绝。
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
+      && !(api.protocol === 'https:' && url.protocol !== 'https:')
+      && /^[a-f0-9]{64}$/.test(checkout.token_hash);
   } catch { return false; }
 }
 

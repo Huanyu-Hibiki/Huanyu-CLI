@@ -9,12 +9,16 @@ const entitlement = (account, name) => account?.subscriptions.find((s) =>
   s.skill === name && ['active', 'canceling', 'past_due', 'lifetime', 'trialing'].includes(s.status));
 // 轮询期抖动语义（设计「错误处理」）：网络故障与服务端 5xx 不中断等待，重试至期限。
 const retryable = (error) => error instanceof CliError && (error.error === 'network' || error.details.http_status >= 500);
+// 金额出现即须为正的有限数（L3）：0/负数/非数字的“价格”按付款信息不完整拒绝，不进输出与落盘。
+const validAmount = (amount) => amount === undefined || amount === null || (Number.isFinite(amount) && amount > 0);
 
 function purchaseDetails(product, name, plan, checkout) {
   // 付款响应里的金额币种优先于目录（恢复会话时保住实际成交价），否则回落目录价格。
   const price = Number.isFinite(checkout?.amount) && typeof checkout.currency === 'string' && checkout.currency
     ? checkout : product.prices[plan];
-  return { product_name: skillLabel(name), plan, amount: price?.amount ?? price?.unit_amount ?? null,
+  const amount = price?.amount ?? price?.unit_amount ?? null;
+  if (!validAmount(amount)) throw new CliError(t('invalidCheckout'), 1, 'invalid_response');
+  return { product_name: skillLabel(name), plan, amount,
     currency: price?.currency ?? null, purchase_type: plan === 'lifetime' ? 'one_time' : 'subscription',
     purchase_description: planLabel(plan), price_label: priceLabel(price) };
 }
@@ -31,7 +35,14 @@ export async function requirePurchase(ctx, name, { plan, force = false } = {}) {
   // 恢复时先查原会话；未付或状态未知时，再由商店核对本次语言和币种。
   if (checkout) {
     try { state = await ctx.client.checkoutStatus(checkout.id, ctx.token); }
-    catch (error) { if (!retryable(error)) throw error; }
+    catch (error) {
+      // 404：服务端已无此会话（过期清理/数据更替）——本地记录不可恢复，清掉后走新建会话，
+      // 不让用户死锁在每跑必报错的坏记录上（M1 纵深防御；其余非抖动错误照常 fail-closed）。
+      if (error instanceof CliError && error.details.http_status === 404) {
+        await clearPendingCheckout(checkout.id);
+        checkout = null;
+      } else if (!retryable(error)) throw error;
+    }
   }
   if (!force) {
     let account;
@@ -90,11 +101,19 @@ export async function requirePurchase(ctx, name, { plan, force = false } = {}) {
     try {
       const url = new URL(checkout?.url);
       if (typeof checkout.id !== 'string' || !checkout.id || typeof checkout.reused !== 'boolean'
-        || !['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error();
+        || !['http:', 'https:'].includes(url.protocol) || url.username || url.password
+        // 付款页协议与 API 对齐（L2）：https API 只接受 https 付款页，防止服务端把用户引到明文信道。
+        || (new URL(ctx.client.base).protocol === 'https:' && url.protocol !== 'https:')
+        // 金额出现即须合法（L3），拒绝 0/负数/非数字。
+        || !validAmount(checkout.amount)) throw new Error();
     } catch { throw new CliError(t('invalidCheckout'), 1, 'invalid_response'); }
-    // 商店给的购买前提醒：让 Agent 在用户付款前转告，并附上免费开源版的安装命令
-    if (typeof checkout.notice === 'string' && checkout.notice.trim()) {
-      notice = t('purchaseNotice', { notice: checkout.notice.trim() + (product.free ? t('freeInstall', { next: command('install', product.free.skill) }) : '') });
+    // 商店给的购买前提醒：让 Agent 在用户付款前转告，并附上免费开源版的安装命令。
+    // 提醒是服务端文本、会进终端与 JSON 输出：先消毒（L1）——剥离 \r\n\t 之外的控制字符
+    // （终端转义/注入面），500 字封顶，超长截断附省略号。
+    if (typeof checkout.notice === 'string') {
+      const clean = checkout.notice.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+      if (clean) notice = t('purchaseNotice', { notice: (clean.length > 500 ? `${clean.slice(0, 500)}…` : clean)
+        + (product.free ? t('freeInstall', { next: command('install', product.free.skill) }) : '') });
     }
     // 先落盘，再打开浏览器；中断和超时后都能恢复。
     await savePendingCheckout({ id: checkout.id, url: checkout.url, skill: name, plan: selectedPlan, ...(Number.isFinite(checkout.amount) && checkout.currency ? { amount: checkout.amount, currency: checkout.currency } : {}) }, ctx.token, ctx.client.base);

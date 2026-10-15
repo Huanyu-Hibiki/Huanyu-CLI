@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { fixture, writeSkill, readDirectoryLink, TOKEN, TOKEN2, EMAIL, configMode } from './fixture.js';
-import { command } from '../src/i18n.js';
+import { command, withLanguage } from '../src/i18n.js';
+import { isPendingCheckout, readPendingCheckout } from '../src/config.js';
+import { requirePurchase } from '../src/purchase.js';
+import { CliError } from '../src/io.js';
 
 // 二期任务 4（安全敏感：支付·密钥）：hy subscribe 的 checkout 会话状态机。
 // 契约见设计「接口设计」/api/store/checkout(+status) 与「错误处理」：会话先落盘再开浏览器、
@@ -25,6 +30,24 @@ const publishPaid = async (f, version = '0.2.0') => {
 };
 const threeHosts = async (f) => {
   for (const host of ['.zcode', '.claude', '.trae']) await mkdir(path.join(f.home, host), { recursive: true });
+};
+// 进程内直连单元用：把配置目录指到本测试私有目录（APPDATA/XDG 双通道），并摘掉 CI 真值
+// （requirePurchase 的 CI 分支会跳过会话创建）。结束恢复环境并清理。
+const withIsolatedConfig = async (fn) => {
+  const scratch = await mkdtemp(path.join(tmpdir(), 'hy-purchase-unit-'));
+  const names = ['APPDATA', 'XDG_CONFIG_HOME', 'CI'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  process.env.APPDATA = scratch;
+  process.env.XDG_CONFIG_HOME = scratch;
+  delete process.env.CI;
+  try { return await fn(path.join(scratch, 'huanyu', 'config.json')); }
+  finally {
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+    await rm(scratch, { recursive: true, force: true });
+  }
 };
 
 test('同一条 subscribe 命令：登录 → 创建付款会话（落盘）→ 浏览器付款页 → 3 秒轮询解锁 → 自动安装（多宿主链接共享）', async (t) => {
@@ -371,4 +394,189 @@ test('pending_checkout 形状校验：坏 URL 协议/坏摘要 → 配置读取�
     assert.equal(JSON.parse(result.stdout).error, 'config_read');
   }
   assert.equal(f.state.checkoutRequests, 0);
+});
+
+// —— 三路审查补缺与加固（spec 4 + quality 2 + security M1/L1/L2/L3）——
+
+test('交互终端 15 分钟预算：terminal 超时总等待 900 秒、300 次 3 秒轮询', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  const result = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 }, { terminal: true });
+  assert.equal(result.code, 3);
+  const [checkout, pending] = events(result);
+  assert.equal(checkout.max_wait_seconds, 900);
+  assert.equal(pending.max_wait_seconds, 900);
+  assert.equal(totalWait(result), 900000);
+  assert.deepEqual(result.trace.delays, Array(300).fill(3000));
+  const human = await f.run(['subscribe', 'ppt-design-pro'], { HY_TOKEN: TOKEN2 }, { terminal: true });
+  assert.equal(human.code, 3);
+  assert.match(human.stdout, /最长等待 15 分钟/);
+});
+
+test('恢复期 status 暂时 5xx：仍由商店重核本次语言与币种，换新会话不开旧人民币页', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  f.state.checkoutPrices = { zh: { amount: 6900, currency: 'cny' }, en: { amount: 999, currency: 'usd' } };
+  const first = await f.run(['subscribe', 'ppt-design-pro', '--lang', 'zh', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(first.code, 3);
+  const [zhCheckout] = events(first);
+  // 让下一次 status 查询（第二进程的恢复查询）返回 502。
+  f.state.checkoutStatusErrors = [];
+  f.state.checkoutStatusErrors[f.state.checkoutStatusPolls] = true;
+  const second = await f.run(['subscribe', 'ppt-design-pro', '--lang', 'en', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(second.code, 3);
+  const [enCheckout] = events(second);
+  assert.notEqual(enCheckout.id, zhCheckout.id);
+  assert.equal(enCheckout.currency, 'usd');
+  assert.equal(enCheckout.price_label, '$9.99');
+  assert.equal(enCheckout.resumed, false);
+  assert.equal(f.state.checkoutRequests, 2);
+  assert.deepEqual(second.trace.browserUrls, [enCheckout.url], '只打开新会话的付款页');
+});
+
+test('CI 恢复：保留本地会话记录，给本次显式语言的网页入口', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  const first = await f.run(['subscribe', 'ppt-design-pro', '--lang', 'zh', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(first.code, 3);
+  const [checkout] = events(first);
+  const second = await f.run(['subscribe', 'ppt-design-pro', '--lang', 'en', '--json'], { HY_TOKEN: TOKEN2, CI: 'true' });
+  assert.equal(second.code, 3);
+  const pending = events(second)[0];
+  assert.equal(pending.purchase_url, `${f.base}/api/store/checkout?skill=ppt-design-pro&lang=en`);
+  assert.equal(pending.id, undefined);
+  assert.equal(pending.ci, true);
+  assert.equal(f.state.checkoutRequests, 1, 'CI 不创建会话');
+  assert.deepEqual(second.trace.browserUrls, []);
+  assert.deepEqual(second.trace.delays, []);
+  assert.equal(JSON.parse(await readFile(f.configFile, 'utf8')).pending_checkout.id, checkout.id, '本地记录留待交互恢复');
+});
+
+test('saveAuth 保留付款进度：同令牌重登沿用会话；换令牌重登丢弃', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  const first = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(first.code, 3);
+  const [checkout] = events(first);
+  // 同令牌显式重登：付款进度存活。
+  const login = await f.run(['login', '--token', TOKEN2, '--json']);
+  assert.equal(login.code, 0, login.stdout);
+  const kept = JSON.parse(await readFile(f.configFile, 'utf8'));
+  assert.equal(kept.token, TOKEN2);
+  assert.equal(kept.pending_checkout.id, checkout.id);
+  // 重跑沿用同一会话（resumed），不新建。
+  const resume = await f.run(['subscribe', 'ppt-design-pro', '--json']);
+  assert.equal(resume.code, 3);
+  assert.equal(events(resume)[0].id, checkout.id);
+  assert.equal(events(resume)[0].resumed, true);
+  assert.equal(f.state.checkoutCreated, 1);
+  // 换令牌重登：旧令牌的付款记录不跨令牌继承。
+  const relogin = await f.run(['login', '--token', TOKEN, '--json']);
+  assert.equal(relogin.code, 0, relogin.stdout);
+  assert.equal(JSON.parse(await readFile(f.configFile, 'utf8')).pending_checkout, undefined);
+});
+
+test('readPendingCheckout 绑定负例：换令牌或换 api origin 都不恢复会话', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  const first = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(first.code, 3);
+  const [checkout] = events(first);
+  // 换令牌（行为级）：token_hash 不匹配 → 不查原会话状态、直接新建自己的会话。
+  const TOKEN3 = 'hy_Third0123456789abcdefghijklmnopqrstuv';
+  f.state.grants.set(TOKEN3, []);
+  const third = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN3 });
+  assert.equal(third.code, 3);
+  const [byToken] = events(third);
+  assert.notEqual(byToken.id, checkout.id);
+  assert.equal(byToken.resumed, false);
+  assert.ok(!f.state.requests.some((r) => r.path === '/api/store/checkout/status' && r.token === TOKEN3 && r.query.get('id') === checkout.id),
+    '换令牌不得查询原会话状态');
+  assert.equal(f.state.checkoutCreated, 2);
+  // 换 api origin（单元级，隔离配置目录）：同一记录只对创建它的 origin+令牌可见。
+  await withIsolatedConfig(async (configFile) => {
+    await mkdir(path.dirname(configFile), { recursive: true });
+    await writeFile(configFile, JSON.stringify({ pending_checkout: { id: 'cs_1', url: `${f.base}/checkout?session=1`,
+      skill: 'ppt-design-pro', plan: 'lifetime', api: f.base, token_hash: createHash('sha256').update(TOKEN2).digest('hex') } }));
+    assert.equal((await readPendingCheckout('ppt-design-pro', TOKEN2, f.base))?.id, 'cs_1', '同令牌同 origin 可恢复');
+    assert.equal(await readPendingCheckout('ppt-design-pro', TOKEN2, 'https://other.example'), null, '换 api origin 不恢复');
+    assert.equal(await readPendingCheckout('ppt-design-pro', TOKEN, f.base), null, '换令牌不恢复');
+  });
+});
+
+test('恢复时 status 404（会话已被服务端清理）：清除本地记录换新会话，不在坏记录上死锁', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  await mkdir(path.join(f.home, '.zcode', 'skills'), { recursive: true });
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  const first = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(first.code, 3);
+  const [gone] = events(first);
+  f.state.sessions.delete(gone.id); // 服务端已无此会话：status 查询返回 404
+  // 解锁走 status 端点的履约门控（me 轮询钩子保持关闭，避免恢复前的 me 顺带授权）。
+  f.state.checkoutStatusActiveAfter = 1;
+  const second = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(second.code, 0, second.stdout);
+  const output = events(second);
+  assert.deepEqual(output.map((event) => event.event), ['checkout', 'subscribed', undefined]);
+  assert.notEqual(output[0].id, gone.id);
+  assert.equal(output[0].resumed, false);
+  assert.equal(f.state.checkoutCreated, 2, '404 后新建会话');
+  assert.equal(output.at(-1).installations[0].name, 'ppt-design-pro');
+});
+
+test('notice 消毒：剥离 \\r\\n\\t 之外的控制字符，500 字封顶超长截断附省略号', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  f.state.checkoutActiveAfter = Infinity;
+  // X/Y/Z 与 \t\r\n 保留；\u0000、\u0007、\x7F 剥离；总长 608 → 截到 500 + …。
+  f.state.checkoutNotice = `X\u0000Y\u0007Z\t\r\n W\x7F${'x'.repeat(600)}`;
+  const result = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 });
+  assert.equal(result.code, 3);
+  const [checkout] = events(result);
+  const sanitized = 'XYZ\t\r\n W' + 'x'.repeat(492) + '…';
+  assert.equal(checkout.notice, `付款前请转告用户：${sanitized}开源版的安装命令：${command('install', 'ppt-design')}`);
+});
+
+test('checkout 付款页协议与 API 对齐（L2）：https API 拒绝 http 付款页，存储记录同规', async (t) => {
+  // 存储侧：isPendingCheckout 对 https api + http 付款页的记录按坏记录拒绝（http API 不受限）。
+  const record = { id: 'cs_1', skill: 'ppt-design-pro', plan: 'lifetime', token_hash: 'a'.repeat(64) };
+  assert.equal(isPendingCheckout({ ...record, url: 'http://pay.example/x', api: 'https://store.example' }), false);
+  assert.equal(isPendingCheckout({ ...record, url: 'https://pay.example/x', api: 'https://store.example' }), true);
+  assert.equal(isPendingCheckout({ ...record, url: 'http://pay.example/x', api: 'http://store.example' }), true);
+  // 创建侧（进程内桩，不发网络）：https API 返回 http 付款页 → invalid_response，不开浏览器不落盘。
+  await withIsolatedConfig(async () => {
+    const ctx = { catalog: [{ id: 'ppt-design', name: 'PPT 设计', summary: '', free: { skill: 'ppt-design' }, paid: { skill: 'ppt-design-pro' },
+        offer: ['lifetime'], prices: { lifetime: { amount: 6900, currency: 'cny', interval: null } } }],
+      token: TOKEN2, output: { write() {} }, nextCommand: 'hy subscribe ppt-design-pro',
+      client: { base: 'https://store.example', url: (route) => `https://store.example${route}`, lang: 'zh', explicitLanguage: false,
+        me: async () => ({ subscriptions: [] }),
+        request: async () => ({ id: 'cs_1', url: 'http://pay.example/session', reused: false, amount: 6900, currency: 'cny' }) },
+      now: () => 0, sleep: async () => {}, openBrowser: async () => false, terminal: false, signal: new AbortController().signal };
+    await assert.rejects(withLanguage({ lang: 'zh' }, () => requirePurchase(ctx, 'ppt-design-pro', {})),
+      (error) => error instanceof CliError && error.error === 'invalid_response' && error.code === 1);
+  });
+});
+
+test('付款金额校验（L3）：0/负数/非数字金额按 invalid_response 拒绝，不落盘不开浏览器', async (t) => {
+  const f = await fixture(t);
+  inactive(f);
+  for (const amount of [0, -6900, '6900']) {
+    // 注入响应只影响本次 POST：清掉服务端会话，避免下一轮踩进复用分支拿到正常价格。
+    f.state.sessions = new Map();
+    f.state.checkoutResponse = { id: 'cs_bad', url: `${f.base}/checkout?session=9`, reused: false, amount, currency: 'cny' };
+    const result = await f.run(['subscribe', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN2 });
+    assert.equal(result.code, 1, String(amount));
+    const value = JSON.parse(result.stdout);
+    assert.equal(value.error, 'invalid_response', String(amount));
+    assert.match(value.message, /付款信息不完整，请重试。/, String(amount));
+    assert.deepEqual(result.trace.browserUrls, [], String(amount));
+  }
+  await assert.rejects(readFile(f.configFile), { code: 'ENOENT' }, '被拒会话不得落盘');
 });

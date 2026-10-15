@@ -7,4 +7,4 @@
 - [ ] **六格 CI 矩阵全绿**：windows/macos/ubuntu × Node 18/22；首次 push 后复核 workflow 实跑结果（本地全绿不能替代）。
 - [ ] **打包核对**：`npm pack --dry-run` 确认 tarball 只含 bin/、src/、README.md、README.en.md、LICENSE、package.json；核对 package.json 版本号（`test/core.test.js` 有版本断言，升版本时需同步改）；打 git tag。
 - [ ] **试点商品集上架**：2-3 个（至少 1 免费 + 1 付费配对预留）；用 `hy publish --repo <Huanyu-Skills 路径> --check` 先对账，再 `--all` 批量发布。
-- [ ] **联调前契约评审清单**：过一遍 `docs/designs/2026-10-15-huanyu-cli-design.md` 里标注【联调评审补充】与「契约评审」的各条（checkout 响应回显 plan、复用响应重发 notice、新建会话过期旧 open 会话、会话 URL 短 TTL 与不可预测 id、过期用 expired 而非 404；上传幂等的跨机器字节差异；版本单调性；yank 占位语义）。逐条与真实服务端核对，评估假商店 `test/fixture.js` 是否需要跟随调整。
+- [ ] **联调前契约评审清单**：过一遍 `docs/designs/2026-10-15-huanyu-cli-design.md` 里标注【联调评审补充】与「契约评审」的各条（checkout 响应回显 plan、复用响应重发 notice、新建会话过期旧 open 会话、会话 URL 短 TTL 与不可预测 id、过期用 expired 而非 404；上传幂等的跨机器字节差异；版本单调性；yank 占位语义）。另核对二期审查登记的四条：订阅到期翻转时效与 past_due 宽限上限（下载端点必须独立复核订阅，不得只信 me() 快照）、付费下载摘要可否与 versions 交叉核对、portal URL 控制字符剥离（服务端义务）、products PUT 是否支持删除方案/清空 summary（当前客户端只能合并更新）。逐条与真实服务端核对，评估假商店 `test/fixture.js` 是否需要跟随调整。

@@ -71,7 +71,7 @@ test/fixture.js + driver.js  假服务器 + 虚拟时钟【基建平移 + publis
 
 ```
 Product      { id, name, summary, repo?, page?, free: {skill}|null, paid: {skill}|null,
-               offer: [plan...], prices: { plan: { amount, currency } } }
+               offer: [plan...], prices: { plan: { amount, currency, interval? } } }
 SkillRelease versions[name] = { latest, history: [{ version, published_at, notes, yanked? }],
                download_url?, sha256? }        // sha256 对免费版必填
 本地 Skill    SKILL.md frontmatter: name（规范名）+ metadata.version（semver）
@@ -102,7 +102,7 @@ SkillRelease versions[name] = { latest, history: [{ version, published_at, notes
 | `/api/store/download/<name>?version=&format=tar.gz` | 免费：302→公开附件（无令牌）；付费 🔒：200 + `X-Content-SHA256` + `X-Skill-Version` | API 禁止重定向，仅免费发布物 302 允许 follow |
 | `/api/cli/device` `/api/cli/token` | POST | OAuth 设备码（`authorization_pending`/`slow_down`/`expired_token`/`access_denied`） |
 | `/api/auth/me` | GET 🔒 | `{ email, subscriptions, publisher }` |
-| `/api/store/checkout`(+`/status`) | POST/GET 🔒 | `{ id, url, reused, amount, currency, notice? }`；409 `already_active` |
+| `/api/store/checkout`(+`/status`) | POST/GET 🔒 | `{ id, url, reused, amount, currency, notice? }`；409 `already_active`。【联调评审补充（二期任务 4 审查登记）】响应宜回显 `plan`（客户端当前推算 offer[0]，无 offer 多价格时可能与服务端默认分叉）；复用响应必须重发 notice；服务端建新会话时应过期同 token 同 skill 的旧 open 会话；会话 URL 按短 TTL + 不可预测 id + 完成即失效设计（URL 会进 CLI 输出供转告）；status 查询 404 时客户端已做"清除换新"纵深防御，服务端应尽量用 `expired` 状态而非 404 表达过期 |
 | `/api/account/portal` `/api/cli/logout` | POST 🔒 | 管理入口 / 令牌撤销 |
 
 发布端（新增）：
@@ -159,7 +159,7 @@ SkillRelease versions[name] = { latest, history: [{ version, published_at, notes
 | 1 | 上传幂等 | 同机器同检出重传 sha256 稳定（tar 条目 mtime 保留 + zlib 头 mtime=0 的确定字节打包）；**跨机器/重新 git clone 后重打包字节可能不同**（tar 头 uid/gid/条目顺序未归一化），此时同版本重发得 409，属预期，提版本即可。不做断点续传 | 首期联调时按服务端实现微调 |
 | 2 | 包大小上限 | 100MB（`413 too_large` 阈值） | 服务端定稿 |
 | 3 | 版本单调性 | 服务端拒绝重复版本（409）与低于 latest 的版本；允许跳版本 | 契约评审 |
-| 4 | yank 语义 | history 保留 + `yanked` 标记；`latest` 回落到最高未 yank 版本 | 契约评审 |
+| 4 | yank 语义 | history 保留 + `yanked` 标记；`latest` 回落到最高未 yank 版本；全部版本下架时 `latest` 保留最高版本占位（形状完整，但标记为已下架、下载 404，客户端显示"全部版本已下架"且不报可更新） | 契约评审 |
 | 5 | 发布者模型 | 单发布者账号（`me.publisher: bool`），无协作者体系 | 二期如需多人协作 |
 | 6 | DEFAULT_API | 占位常量一处定义，联调前替换 | 域名定稿时 |
 | 7 | 试点定价 | 买断制 `lifetime`（订阅 plan 是将来纯数据扩容） | 二期上订阅时 |

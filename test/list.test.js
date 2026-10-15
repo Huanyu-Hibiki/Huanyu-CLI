@@ -136,6 +136,38 @@ test('网络不可达 → network 错误退出码 1，双语提示', async (t) =
   assert.equal(value.error, 'network');
 });
 
+test('服务端 500 → http_error 退出码 1，服务端文案缺省时用双语兜底', async (t) => {
+  const f = await fixture(t);
+  f.state.failWith = { status: 500 };
+  const zh = await f.run(['list']);
+  assert.equal(zh.code, 1);
+  assert.equal(zh.stdout, '');
+  assert.match(zh.stderr, /请求失败（500）。/);
+  const en = await f.run(['list', '--lang', 'en']);
+  assert.equal(en.code, 1);
+  assert.match(en.stderr, /Request failed \(500\)./);
+  const value = data(await f.run(['list', '--json']));
+  assert.equal(value.ok, false);
+  assert.equal(value.error, 'http_error');
+  assert.equal(value.http_status, 500);
+});
+
+test('服务端 401 → unauthorized 退出码 3（登录引导），双语提示', async (t) => {
+  const f = await fixture(t);
+  f.state.failWith = { status: 401 };
+  const zh = await f.run(['list']);
+  assert.equal(zh.code, 3);
+  assert.equal(zh.stdout, '');
+  assert.match(zh.stderr, /登录已失效，请重新运行 npx github:Huanyu-Hibiki\/Huanyu-CLI login。/);
+  const en = await f.run(['list', '--lang', 'en']);
+  assert.equal(en.code, 3);
+  assert.match(en.stderr, /Sign-in has expired\. Run npx github:Huanyu-Hibiki\/Huanyu-CLI login\./);
+  const value = data(await f.run(['list', '--json']));
+  assert.equal(value.ok, false);
+  assert.equal(value.error, 'unauthorized');
+  assert.equal(value.http_status, 401);
+});
+
 test('versions 逐 skill 校验 latest semver 与 history 数组，非法 → invalid_response', async (t) => {
   const f = await fixture(t);
   const { Client, catalogNames } = await import('../src/client.js');
@@ -150,6 +182,10 @@ test('versions 逐 skill 校验 latest semver 与 history 数组，非法 → in
     assert.ok(Array.isArray(versions['oracle-bone'].history));
     f.state.badVersions = true;
     await assert.rejects(() => client.versions(catalog), (error) => error instanceof CliError && error.code === 1 && error.error === 'invalid_response');
+    // versions 端点同样受 failWith 注入控制。
+    f.state.badVersions = false;
+    f.state.failWith = { status: 500 };
+    await assert.rejects(() => client.versions(catalog), (error) => error instanceof CliError && error.code === 1 && error.error === 'http_error');
   } finally {
     // previous 为 undefined 时删除键，而不是把字符串 "undefined" 写进环境。
     if (previous === undefined) delete process.env.HY_API;

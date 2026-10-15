@@ -94,6 +94,22 @@ async function defaultReleases() {
   return seedCache;
 }
 
+// 进程内直连组件的单元测试用：把 os.tmpdir 指到本测试私有目录（TMPDIR/TEMP/TMP 三通道覆盖
+// POSIX 与 Windows 的解析顺序），临时目录残留断言不再与并行测试文件共享系统 tmpdir 竞态。
+export async function withPrivateTmp(fn) {
+  const scratch = await mkdtemp(path.join(tmpdir(), 'hy-unit-'));
+  const names = ['TMPDIR', 'TEMP', 'TMP'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) process.env[name] = scratch;
+  try { return await fn(); } finally {
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 // 假商店：绑定 127.0.0.1 随机端口，提供 catalog/versions/publish/releases 与 device/token/me/logout/approve 端点（契约见设计「接口设计」）；
 // 请求全部记入 state.requests，目录与设备流数据可直接改写用于错误注入。
 export async function fixture(t) {
@@ -101,8 +117,11 @@ export async function fixture(t) {
   // macOS 的 /var 是 /private/var 的别名、Windows 有 8.3 短路径：一律 realpath，
   // 让 f.* 派生路径与产品内部的 canonical 解析一致（否则期望值与 real_path 断言会差一个别名前缀）。
   temporary = await realpath(temporary);
-  const home = path.join(temporary, 'home'), cwd = path.join(temporary, 'project'), config = path.join(temporary, 'config'), mockBin = path.join(temporary, 'bin');
-  for (const directory of [home, cwd, config, mockBin]) await mkdir(directory);
+  const home = path.join(temporary, 'home'), cwd = path.join(temporary, 'project'), config = path.join(temporary, 'config'), mockBin = path.join(temporary, 'bin'),
+    // 子进程私有 tmpdir：全部 CLI/驱动子进程的下载/打包临时目录都落在 fixture 自己的地盘，
+    // 残留断言扫描这里即可，根除并行测试文件共享系统 tmpdir 的竞态（二期任务 3 审查 MAJOR）。
+    tmp = path.join(temporary, 'tmp');
+  for (const directory of [home, cwd, config, mockBin, tmp]) await mkdir(directory);
   // 真 CLI 也使用假浏览器。Windows 不能执行 shebang，使用 Node 的 exe 和预加载脚本。
   let nodeOptions = process.env.NODE_OPTIONS || '';
   let commandProcessor = process.env.ComSpec;
@@ -119,8 +138,8 @@ export async function fixture(t) {
     interval: 5, expiresIn: 600, deviceApproved: false, requireApproval: false, deviceToken: null, deviceErrorMessage: null,
     deviceCode: null, userCode: null, logoutFailure: false, revoked: new Set(), grants: new Map(),
     // 管理门户（二期任务 3）：portalUrl 注入门户响应 URL（null 走默认 /account/；空串模拟缺字段）；
-    // subscriptionStatus 覆盖订阅状态（权益判定的有效/无效状态正反例）。
-    portalUrl: null, subscriptionStatus: null,
+    // subscriptionStatus 覆盖订阅状态、rawSubscriptions 整体替换订阅列表（条目形状残缺的正反例）。
+    portalUrl: null, subscriptionStatus: null, rawSubscriptions: null,
     // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
     // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
     publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
@@ -132,8 +151,9 @@ export async function fixture(t) {
     // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载、
     // versionsDelay 压住版本表响应（构造 scan 之后、下载之前的目标变动窗口，update 预检测试用）。
     releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0, versionsDelay: 0,
-    // 付费下载（二期任务 3）：badDownloadVersion 让下载端点回错误的 X-Skill-Version（头校验正例）。
-    badDownloadVersion: false };
+    // 付费下载（二期任务 3）：badDownloadVersion 让下载端点回错误的 X-Skill-Version（头校验正例）；
+    // badDownloadChecksum 回错误的 X-Content-SHA256、dropDownloadChecksum 省略该头（摘要负例）。
+    badDownloadVersion: false, badDownloadChecksum: false, dropDownloadChecksum: false };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -325,7 +345,12 @@ export async function fixture(t) {
           if (!authenticate()) return;
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
           // X-Skill-Version 声明所发内容的版本：badDownloadVersion 注入不匹配值（客户端头校验正例）。
-          res.writeHead(200, { 'Content-Type': 'application/gzip', 'X-Content-SHA256': entry.sha256, 'X-Skill-Version': state.badDownloadVersion ? '9.9.9' : version });
+          // X-Content-SHA256 是付费信道的摘要权威：badDownloadChecksum 注入错误值、dropDownloadChecksum 省略头。
+          res.writeHead(200, {
+            'Content-Type': 'application/gzip',
+            ...(state.dropDownloadChecksum ? {} : { 'X-Content-SHA256': state.badDownloadChecksum ? '0'.repeat(64) : entry.sha256 }),
+            'X-Skill-Version': state.badDownloadVersion ? '9.9.9' : version,
+          });
           return res.end(entry.body);
         }
         res.writeHead(302, { Location: `${base}/releases/${name}-${version}.tar.gz` });
@@ -380,8 +405,9 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname === '/api/auth/me') {
         if (!authenticate()) return;
-        // publisher 是契约字段（设计「接口设计」）；dropPublisher 用于缺字段的 invalid_response 测试。
-        return json(res, 200, { email: EMAIL, subscriptions: subscriptions(token), ...(state.dropPublisher ? {} : { publisher: state.publishers.has(token) }) });
+        // publisher 是契约字段（设计「接口设计」）；dropPublisher 用于缺字段的 invalid_response 测试；
+        // rawSubscriptions 整体替换订阅列表（security-L2 条目形状残缺的负例注入）。
+        return json(res, 200, { email: EMAIL, subscriptions: state.rawSubscriptions ?? subscriptions(token), ...(state.dropPublisher ? {} : { publisher: state.publishers.has(token) }) });
       }
       // 账号管理门户（二期任务 3，契约：POST 🔒 → { url }）：portalUrl 注入响应 URL（空串模拟缺字段）。
       if (req.method === 'POST' && url.pathname === '/api/account/portal') {
@@ -400,13 +426,18 @@ export async function fixture(t) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${server.address().port}`;
   // 环境隔离：home/config 指向临时目录；语言固定默认中文（extraEnv 可覆盖）；CI 交互关闭。
+  // TMPDIR/TEMP/TMP 三通道把子进程的 os.tmpdir() 指到 fixture 私有目录（下载/打包临时目录
+  // 全部落在那里，不再与并行测试文件共享系统 tmpdir 竞态）。
   const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: config, APPDATA: config, CODEX_HOME: '',
     HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_API: base, HY_TOKEN: '', CI: '', HY_TEST_BROWSER: '',
     NODE_OPTIONS: nodeOptions, PATH: `${mockBin}${path.delimiter}${process.env.PATH || ''}`,
+    TMPDIR: tmp, TEMP: tmp, TMP: tmp,
     ...(commandProcessor ? { ComSpec: commandProcessor, ...(process.platform === 'win32' ? { HY_TEST_BROWSER_EXE: commandProcessor } : {}) } : {}) };
-  // Windows 的 env 键大小写不敏感，spawn 展开后可能同时出现 PATH/Path、ComSpec/comspec；只保留显式写入的这一份。
-  for (const key of Object.keys(env)) if (key !== 'PATH' && key.toLowerCase() === 'path') delete env[key];
-  for (const key of Object.keys(env)) if (key !== 'ComSpec' && key.toLowerCase() === 'comspec') delete env[key];
+  // Windows 的 env 键大小写不敏感，spawn 展开后可能同时出现 PATH/Path、ComSpec/comspec、TEMP/temp；
+  // 每组只保留显式写入的这一份，否则子进程读到的 tmpdir 取决于展开顺序。
+  for (const [canonical, lower] of [['PATH', 'path'], ['ComSpec', 'comspec'], ['TMPDIR', 'tmpdir'], ['TEMP', 'temp'], ['TMP', 'tmp']]) {
+    for (const key of Object.keys(env)) if (key !== canonical && key.toLowerCase() === lower) delete env[key];
+  }
   const configFile = path.join(config, 'huanyu', 'config.json');
   let runNumber = 0;
   // 真 CLI 子进程会自己经 ComSpec 启动假浏览器，得先确保 node.exe 副本存在；driver 路径由 driver 惰性准备。
@@ -438,5 +469,5 @@ export async function fixture(t) {
     await rm(temporary, { recursive: true, force: true });
   };
   t?.after(close);
-  return { temporary, home, cwd, config, configFile, mockBin, env, base, state, run, close };
+  return { temporary, home, cwd, config, configFile, mockBin, tmp, env, base, state, run, close };
 }

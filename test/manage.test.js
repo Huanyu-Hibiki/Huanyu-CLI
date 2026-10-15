@@ -71,3 +71,19 @@ test('manage 门户响应缺 url：invalid_response 拒绝，不打开浏览器'
   assert.equal(value.ok, false);
   assert.equal(value.error, 'invalid_response');
 });
+
+test('portal 恶意 URL（security-L4）：file:// 与带凭据 URL → invalid_response，绝不打开浏览器', async (t) => {
+  const f = await fixture(t);
+  for (const url of ['file:///C:/Windows/system32/config', 'http://user:secret@127.0.0.1/account/']) {
+    f.state.portalUrl = url;
+    const result = await f.run(['manage', '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(result.code, 1, url);
+    const value = data(result);
+    assert.equal(value.ok, false, url);
+    // openBrowser 在 spawn 之前做协议/凭据校验，拒绝即证明没有浏览器进程被拉起。
+    assert.equal(value.error, 'invalid_response', url);
+    assert.equal('opened' in value, false, '不应走到打开结果输出');
+    assert.equal('url' in value, false, '恶意 URL 不应透传到输出');
+    assert.ok(!result.stdout.includes(url) && !result.stderr.includes(url), '恶意 URL 不出现在输出里');
+  }
+});

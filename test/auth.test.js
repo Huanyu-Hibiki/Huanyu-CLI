@@ -277,6 +277,19 @@ test('login --token 显式令牌非交互登录成功保存；无效令牌退出
   assert.deepEqual(await config(f), { token: TOKEN, email: EMAIL, api: f.base });
 });
 
+test('--token=<令牌> 等号形式同样登记遮盖：token_prefix 走 secrets 前 8 字符截断，输出完好可解析', async (t) => {
+  const f = await fixture(t);
+  const result = await f.run(['login', `--token=${TOKEN}`, '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  // 修复前（审查 quality-LOW 实 bug）：tokenValues 误用 argv.slice(8) 切出数组而非 arg.slice(8)
+  // 切出令牌值，空数组混入 secrets 令 redact 在每个字符间插入占位，整段输出损坏、JSON 无法解析。
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.ok, true);
+  assert.equal(value.token_prefix, `${TOKEN.slice(0, 8)}…`);
+  assert.ok(!result.stdout.includes(TOKEN));
+  assert.ok(!result.stderr.includes(TOKEN));
+});
+
 test('status 未登录显示占位与开源版提示；登录后显示邮箱与订阅；令牌失效透出 unauthorized', async (t) => {
   const f = await fixture(t);
   const anon = await f.run(['status']);

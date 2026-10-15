@@ -4,8 +4,8 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN } from './fixture.js';
-import { interruptBackups } from '../src/cli.js';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN, withPrivateTmp } from './fixture.js';
+import { interruptBackups, invalidateAccount } from '../src/cli.js';
 import { isSkillName } from '../src/skills.js';
 import { prepare, replaceAll } from '../src/install.js';
 import { Client } from '../src/client.js';
@@ -246,19 +246,64 @@ test('未购付费 skill：exit 3 inactive + subscribe_command/subscription_url�
   assert.ok(human.stderr.includes(`${f.base}/store/ppt-design-pro/`));
 });
 
-test('订阅状态无效（canceled）同视为未购；有效状态（trialing）放行', async (t) => {
+test('订阅状态表驱动：五种有效状态逐一放行；未知/失效状态 fail-closed 视为未购', async (t) => {
   const f = await fixture(t);
   await publishPaid(f);
   f.state.grants.set(TOKEN, ['ppt-design-pro']);
-  f.state.subscriptionStatus = 'canceled';
-  const rejected = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
-  assert.equal(rejected.code, 3);
-  assert.equal(data(rejected).error, 'inactive');
-  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '失效订阅不应进入付费下载');
-  f.state.subscriptionStatus = 'trialing';
-  const accepted = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
-  assert.equal(accepted.code, 0, accepted.stdout + accepted.stderr);
-  assert.equal(data(accepted).installations[0].version, '0.2.0');
+  for (const status of ['active', 'canceling', 'past_due', 'lifetime', 'trialing']) {
+    f.state.subscriptionStatus = status;
+    const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(result.code, 0, `${status}: ${result.stdout + result.stderr}`);
+    assert.equal(data(result).installations[0].version, '0.2.0', status);
+  }
+  const downloadsAfterPositive = f.state.requests.filter((r) => r.path.startsWith('/api/store/download')).length;
+  for (const status of ['canceled', 'expired', 'unknown-status']) {
+    f.state.subscriptionStatus = status;
+    const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(result.code, 3, status);
+    assert.equal(data(result).error, 'inactive', status);
+  }
+  assert.equal(f.state.requests.filter((r) => r.path.startsWith('/api/store/download')).length, downloadsAfterPositive,
+    '失效订阅不应进入付费下载');
+});
+
+test('me 订阅条目形状校验：null 条目/缺 status/非对象/空 skill → invalid_response（fail-closed）', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  // 残缺条目在 me() 处按 invalid_response 拒绝（security-L2）：requireEntitlement 消费端不再防御
+  // null 条目（修复前 null 条目会在 subscriptions.some 里 TypeError 退化为通用 failed）。
+  // 注意首个用例是"列表里含 null 条目"（[null]）——bare null 是 fixture 注入位的"未设置"哨兵。
+  for (const entries of [[null], [undefined], [{ skill: 'ppt-design-pro' }], ['bogus'], [{ skill: '', status: 'active' }], [{ skill: 'ppt-design-pro', status: '' }]]) {
+    f.state.rawSubscriptions = entries;
+    const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(result.code, 1, JSON.stringify(entries));
+    const value = data(result);
+    assert.equal(value.ok, false, JSON.stringify(entries));
+    assert.equal(value.error, 'invalid_response', JSON.stringify(entries));
+  }
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '形状残缺不应进入下载');
+});
+
+test('付费头摘要负例：X-Content-SHA256 错误 → checksum_mismatch；头缺失 → missing_checksum', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.badDownloadChecksum = true;
+  const wrong = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(wrong.code, 1);
+  assert.equal(data(wrong).error, 'checksum_mismatch');
+  assert.equal(await exists(path.join(f.home, '.zcode')), null, '校验失败时目标不可达');
+  f.state.badDownloadChecksum = false;
+  f.state.dropDownloadChecksum = true;
+  const missing = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(missing.code, 1);
+  assert.equal(data(missing).error, 'missing_checksum');
+  assert.equal(await exists(path.join(f.home, '.zcode')), null, '头缺失时目标不可达');
+});
+
+test('invalidateAccount 契约：清空 requireEntitlement 的订阅快照（任务 5 购买成功后失效缓存用）', () => {
+  const ctx = { account: { subscriptions: [{ skill: 'ppt-design-pro', status: 'lifetime' }] } };
+  invalidateAccount(ctx);
+  assert.equal(ctx.account, null, '失效后下一次权益判定必须重新拉取 me()');
 });
 
 test('无令牌安装付费 skill：设备码登录引导 exit 3，不进入下载', async (t) => {
@@ -324,21 +369,8 @@ test('免费摘要 fail-closed：versions 缺 sha256 → missing_checksum，目�
 });
 
 // 下载临时目录残留断言：系统 tmpdir 被并行测试文件的 CLI 子进程共享（它们同时在创建/清理
-// hy-download-*，前后快照相等会竞态误报）。把 os.tmpdir 指到本测试私有目录，断言才是确定性的。
-const withPrivateTmp = async (fn) => {
-  const scratch = await mkdtemp(path.join(tmpdir(), 'hy-unit-'));
-  const names = ['TMPDIR', 'TEMP', 'TMP'];
-  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
-  for (const name of names) process.env[name] = scratch;
-  try { return await fn(); } finally {
-    for (const name of names) {
-      if (previous[name] === undefined) delete process.env[name];
-      else process.env[name] = previous[name];
-    }
-    await rm(scratch, { recursive: true, force: true });
-  }
-};
-
+// hy-download-*，前后快照相等会竞态误报）。withPrivateTmp（fixture 共享助手）把 os.tmpdir
+// 指到本测试私有目录，断言才是确定性的。
 test('下载字节上限（与发布侧 100MB 对称）：超限即中止报 too_large，临时目录照常清理', async (t) => {
   const f = await fixture(t);
   await withClient(f, async (client) => {

@@ -311,7 +311,7 @@ async function planActions(ctx, name, roots) {
 // 付费权益闸门（install/update 共用，二期任务 3）：免费 skill 直接放行；付费先 requireLogin，
 // 再以 me().subscriptions 判定——已购（状态有效）放行令牌下载，未购 exit 3 'inactive' 附
 // subscribe_command/subscription_url（与下载端 402 同语义、同词条，任务 5 在此接内联购买）。
-// 订阅快照缓存在 ctx.account：混合批量逐 skill 判定只查一次账号。
+// 订阅快照缓存在 ctx.account：混合批量逐 skill 判定只查一次账号；缓存失效经 invalidateAccount。
 async function requireEntitlement(ctx, name) {
   const { product, paid } = findSkill(ctx.catalog, name);
   if (!paid) return true;
@@ -322,6 +322,9 @@ async function requireEntitlement(ctx, name) {
   const next = command('subscribe', name);
   throw new CliError(t('inactive', { name: skillLabel(name), next, url }), 3, 'inactive', { subscribe_command: next, subscription_url: url });
 }
+
+// 订阅快照失效（任务 5 契约）：购买成功后必须调用——否则同进程内后续的权益判定仍按旧快照放行/拦截。
+export const invalidateAccount = (ctx) => { ctx.account = null; };
 
 // hy manage（二期任务 3，template 移植）：登录后向商店要账号门户 URL 并打开浏览器；
 // 打不开时给可复制链接。响应形状校验：缺/空 url 按 invalid_response 拒绝（openBrowser 内另有 URL 语法校验）。
@@ -553,7 +556,9 @@ export function interruptBackups(stages) {
 }
 
 async function runCommand(argv, runtime) {
-  const tokenValues = argv.flatMap((arg, i) => arg === '--token' ? [argv[i + 1]] : arg.startsWith('--token=') ? [argv.slice(8)] : []);
+  // --token 的两种形式都要登记进遮盖名单：arg.slice(8) 取等号后的值（误用 argv.slice 会切出
+  // 数组混入 secrets，空数组让 redact 的 replaceAll('') 在每个字符间插占位、损坏全部输出）。
+  const tokenValues = argv.flatMap((arg, i) => arg === '--token' ? [argv[i + 1]] : arg.startsWith('--token=') ? [arg.slice(8)] : []);
     const output = new Output(argv.includes('--json'), 'unknown', [process.env.HY_TOKEN, ...tokenValues]);
     const controller = new AbortController();
     // 事务期间经 ctx.observeStage 上报的暂存目录：二次中断时据此提示备份位置。

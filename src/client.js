@@ -127,6 +127,9 @@ export class Client {
     const data = await this.request('/api/auth/me', { token, ...options });
     // publisher 是设计契约字段（发布端鉴权）：缺字段按 invalid_response 拒绝（任务 3 审查登记）。
     if (typeof data?.email !== 'string' || !data.email || !Array.isArray(data.subscriptions) || typeof data.publisher !== 'boolean') throw invalid(t('invalidAccount'));
+    // 订阅条目形状（二期任务 3 审查 security-L2）：skill/status 必须是非空字符串，残缺条目在传输层
+    // 按 invalid_response 拒绝——消费端（权益判定/订阅展示）不再防御 null 条目。
+    if (!data.subscriptions.every((item) => item && typeof item === 'object' && typeof item.skill === 'string' && item.skill && typeof item.status === 'string' && item.status)) throw invalid(t('invalidAccount'));
     return data;
   }
   // 发布上传（设计「接口设计·发布端」）：体为 tar.gz 二进制（Web 流式，不整体驻留内存），

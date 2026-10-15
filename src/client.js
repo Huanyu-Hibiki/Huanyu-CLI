@@ -142,4 +142,17 @@ export class Client {
       || !Number.isSafeInteger(data?.size) || data.size !== size || typeof data?.url !== 'string' || !data.url) throw invalid(t('publishResponse'));
     return data;
   }
+  // 商品注册/更新（二期任务 2，设计「接口设计·发布端」）：fields 只含调用方提供的键；
+  // 响应为更新后的商品对象，形状校验复用目录归一化（id/name/free/paid/prices 全套检查）。
+  async product(token, skill, fields) {
+    const data = await this.request(`/api/store/products/${encodeURIComponent(skill)}`, { token, method: 'PUT', body: fields });
+    try { return normalizeCatalog([data])[0]; }
+    catch { throw invalid(t('productResponse')); }
+  }
+  // 版本下架（二期任务 2）：yank 幂等由服务端保证（重复下架仍 200），已装用户不受影响。
+  async unpublish(token, skill, version) {
+    const data = await this.request(`/api/store/releases/${encodeURIComponent(skill)}/${encodeURIComponent(version)}`, { token, method: 'DELETE' });
+    if (data?.skill !== skill || data?.version !== version || data?.yanked !== true) throw invalid(t('unpublishResponse'));
+    return data;
+  }
 }

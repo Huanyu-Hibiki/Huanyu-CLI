@@ -19,9 +19,9 @@ export const dictionary = {
   helpSubscribe: ['{command} subscribe <skill> [--plan <方案>]  购买并安装', '{command} subscribe <skill> [--plan <plan>]  Purchase and install'],
   helpManage: ['{command} manage  管理购买', '{command} manage  Manage purchases'],
   helpPublish: ['{command} publish <目录> [--notes <说明>]  发布；--repo <路径> --all 批量、--check 只对账', '{command} publish <directory> [--notes <text>]  Publish; --repo <path> --all batch, --check audit only'],
-  helpProduct: ['{command} product  管理商品信息', '{command} product  Manage product details'],
-  helpUnpublish: ['{command} unpublish  下架某个版本', '{command} unpublish  Yank a release'],
-  helpAudit: ['{command} audit  对账本地与商店', '{command} audit  Reconcile local skills with the store'],
+  helpProduct: ['{command} product <skill> --set <字段>=<值>  管理商品信息', '{command} product <skill> --set <field>=<value>  Manage product details'],
+  helpUnpublish: ['{command} unpublish <skill> <版本>  下架某个版本', '{command} unpublish <skill> <version>  Yank a release'],
+  helpAudit: ['{command} audit [--repo <路径>]  对账本地与商店', '{command} audit [--repo <path>]  Reconcile local skills with the store'],
   helpHelp: ['{command} help / {command} --version  帮助 / 版本', '{command} help / {command} --version  Help / version'],
   missingArgument: ['{flag} 缺少值。', '{flag} requires a value.'],
   duplicateArgument: ['{flag} 只能写一次。', '{flag} can only be used once.'],
@@ -201,6 +201,17 @@ export const dictionary = {
   auditSummary: ['共 {total} 个 Skill：待发布 {publishable}，一致 {current}。', '{total} skills: {publishable} to publish, {current} up to date.'],
   publishBatchSummary: ['批量发布完成：成功 {published} 个，跳过 {skipped} 个。', 'Batch publish finished: {published} published, {skipped} skipped.'],
   skippedVersionExists: ['跳过 {name} {version}：该版本已发布。', 'Skipped {name} {version}: already published.'],
+  // 管理命令族（二期任务 2）
+  productUsage: ['product 需要一个 Skill 名和至少一个 --set <字段>=<值>，例如 --set summary=... 或 --set prices.lifetime=6900,cny。', 'product requires a skill name and at least one --set <field>=<value>, for example --set summary=... or --set prices.lifetime=6900,cny.'],
+  productFields: ['--set 字段值无效：summary/name 需为非空文本；prices.<方案>=<分>,<币种>（如 prices.lifetime=6900,cny）；free/paid 需为规范名且互异。', '--set has an invalid value: summary/name must be non-empty text; prices.<plan>=<cents>,<currency> (for example prices.lifetime=6900,cny); free/paid must be canonical skill names and differ from each other.'],
+  productUpdated: ['已更新商品：{name}', 'Product updated: {name}'],
+  productResponse: ['商品信息不完整，请重试。', 'The product response is incomplete. Please retry.'],
+  unpublishUsage: ['unpublish 需要 <skill> 和 <版本>（x.y.z）。', 'unpublish requires <skill> and <version> (x.y.z).'],
+  unpublishDone: ['已下架：{name} {version}', 'Yanked: {name} {version}'],
+  unpublishEffect: ['已安装的用户不受影响；新安装该版本将返回 404。', 'Existing installations are unaffected; new installs of this version will return 404.'],
+  unpublishMissing: ['没有 {name} {version} 这个版本，请核对后重试。', 'There is no {name} {version} release. Check it and retry.'],
+  unpublishResponse: ['下架结果不完整，请重试。', 'The unpublish response is incomplete. Please retry.'],
+  auditYanked: ['已下架：{name} {version}（历史保留，新安装 404）', 'Yanked: {name} {version} (kept in history; new installs return 404)'],
 };
 
 export function resolveLanguage(argv = [], env = process.env) {

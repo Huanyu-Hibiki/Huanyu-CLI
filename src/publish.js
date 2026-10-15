@@ -218,7 +218,7 @@ export async function publishSkill(ctx, directory, { notes } = {}) {
   }
 }
 
-// 对账行与汇总：状态顺序 商店缺 → 待发布 → 本地落后 → 一致 → 商店多。
+// 对账行与汇总：状态顺序 商店缺 → 待发布 → 本地落后 → 一致 → 商店多 → 已下架提示。
 function reportLines(report, counts) {
   const by = (status) => report.filter((item) => item.status === status);
   return [
@@ -227,13 +227,15 @@ function reportLines(report, counts) {
     ...by('local_behind').map((item) => t('auditLocalBehind', { name: item.skill, local: item.local_version, latest: item.store_latest })),
     ...by('current').map((item) => t('auditCurrent', { name: item.skill, version: item.local_version })),
     ...by('store_only').map((item) => t('auditStoreOnly', { name: item.skill })),
+    ...report.flatMap((item) => (item.yanked ?? []).map((version) => t('auditYanked', { name: item.skill, version }))),
     t('auditSummary', counts),
   ];
 }
 
-// 仓库模式：扫描一级 skill 目录（含指向 Skill 的链接）→ 规范名全集与冲突检测（一次列全）
-// → catalog+versions 对账 → --check 只报告；否则确认后批量发布“商店缺或待发布”，409 自动跳过。
-export async function publishRepo(ctx, repoArgument, { all, check, notes } = {}) {
+// 仓库扫描 + 规范名冲突检测 + 对账（publish --repo 与 audit 共享，二期任务 2 抽取）：
+// 扫描一级 skill 目录（含指向 Skill 的链接）→ 规范名全集与冲突检测（一次列全，本地错误先于网络请求）
+// → catalog+versions 比对出五态分类 + yanked 提示（假设 #4：下架版本 history 保留）。
+export async function reconcileRepo(client, repoArgument) {
   const repo = resolveDirectory(repoArgument);
   let entries;
   try { entries = await readdir(repo, { withFileTypes: true }); }
@@ -258,30 +260,42 @@ export async function publishRepo(ctx, repoArgument, { all, check, notes } = {})
   if (conflicts.length) {
     throw new CliError(t('nameConflict', { conflicts: conflicts.map((conflict) => `${conflict.name}（${conflict.paths.join('、')}）`).join('；') }), 1, 'name_conflict', { conflicts });
   }
-  const catalog = await ctx.client.catalog();
-  const versions = await ctx.client.versions(catalog);
+  const catalog = await client.catalog();
+  const versions = await client.versions(catalog);
   const status = (item) => {
     const latest = versions[item.name]?.latest;
     if (!latest) return 'missing';
     const comparison = compare(item.metadata.version, latest);
     return comparison > 0 ? 'behind' : comparison === 0 ? 'current' : 'local_behind';
   };
+  const yankedVersions = (name) => (versions[name]?.history ?? []).filter((entry) => entry.yanked).map((entry) => entry.version);
   const report = found.map((item) => ({ skill: item.name, directory: item.base, local_version: item.metadata.version, store_latest: versions[item.name]?.latest ?? null, status: status(item) }));
   for (const name of [...new Set([...catalogNames(catalog), ...Object.keys(versions)])]) {
     if (!report.some((item) => item.skill === name)) report.push({ skill: name, directory: null, local_version: null, store_latest: versions[name]?.latest ?? null, status: 'store_only' });
+  }
+  // yanked 提示统一挂到每个条目（本地与商店多都可能有下架版本）。
+  for (const item of report) {
+    const yanked = yankedVersions(item.skill);
+    if (yanked.length) item.yanked = yanked;
   }
   const counts = { total: report.length, publishable: report.filter((item) => ['missing', 'behind'].includes(item.status)).length,
     current: report.filter((item) => item.status === 'current').length,
     local_behind: report.filter((item) => item.status === 'local_behind').length,
     store_only: report.filter((item) => item.status === 'store_only').length };
+  return { repo, found, report, counts, lines: reportLines(report, counts) };
+}
+
+// 仓库模式：对账（reconcileRepo 共享件）→ --check 只报告；否则确认后批量发布“商店缺或待发布”，409 自动跳过。
+export async function publishRepo(ctx, repoArgument, { all, check, notes } = {}) {
+  const { repo, found, report, counts, lines } = await reconcileRepo(ctx.client, repoArgument);
   if (check) {
-    ctx.output.write({ repo, mode: 'check', skills: report, counts }, reportLines(report, counts));
+    ctx.output.write({ repo, mode: 'check', skills: report, counts }, lines);
     return 0;
   }
   // 非交互且未显式 --yes 时批量发布会自动确认：输出提示行保持可见性。
   const auto = counts.publishable > 0 && !ctx.options.yes && !ctx.interactive;
   ctx.output.write({ repo, mode: all ? 'all' : 'repo', skills: report, counts, ...(auto ? { auto_confirmed: true } : {}) },
-    [...reportLines(report, counts), ...(auto ? [t('autoConfirmed')] : [])]);
+    [...lines, ...(auto ? [t('autoConfirmed')] : [])]);
   if (!counts.publishable) {
     ctx.output.write({ published: [], skipped: [] }, [t('nothingToPublish')]);
     return 0;

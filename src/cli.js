@@ -8,7 +8,7 @@ import { readSavedAuth, logout as deleteConfig } from './config.js';
 import { Client, catalogNames, findSkill, isSkillName, isVersion } from './client.js';
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
-import { publishSkill, publishRepo } from './publish.js';
+import { publishSkill, publishRepo, reconcileRepo } from './publish.js';
 import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory } from './skills.js';
 import { targetRoot, installationRoots, nearestHostId } from './hosts.js';
 import { directoryKey, sameDirectory, resolveDirectory } from './platform.js';
@@ -18,7 +18,7 @@ import { prepare, replaceAll } from './install.js';
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
 
 export function parseArgs(argv) {
-  const options = { command: null, json: false, yes: false, to: [], token: null, plan: null, path: null, skill: null, lang: null, repo: null, notes: null, all: false, check: false };
+  const options = { command: null, json: false, yes: false, to: [], token: null, plan: null, path: null, skill: null, lang: null, repo: null, notes: null, all: false, check: false, set: [] };
   const positions = [];
   let version = false, helpFlag = false;
   for (let i = 0; i < argv.length; i++) {
@@ -38,6 +38,11 @@ export function parseArgs(argv) {
         if (options[field] !== null) throw new CliError(t('duplicateArgument', { flag }), 2, 'usage');
         options[field] = value;
       }
+    } else if (/^--set(=|$)/.test(arg)) {
+      // --set 可多次出现（product 专用）；值本身含 '='，只在第一个 '=' 处拆分。
+      const value = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : argv[++i];
+      if (!value || value.startsWith('-')) throw new CliError(t('missingArgument', { flag: '--set' }), 2, 'missing_argument');
+      options.set.push(value);
     } else if (arg.startsWith('-')) throw new CliError(t('unknownArgument'), 2, 'usage');
     else positions.push(arg);
   }
@@ -62,8 +67,46 @@ export function parseArgs(argv) {
     // 说明文本经 HTTP 头上传，长度有硬上限。
     if (options.notes !== null && options.notes.length > 2000) throw new CliError(t('notesTooLong'), 2, 'usage');
   }
-  if (positions.length || (options.to.length && options.command !== 'install') || (options.token !== null && options.command !== 'login') || (options.plan !== null && options.command !== 'subscribe') || (options.path !== null && options.command !== 'update') || (options.repo !== null && options.command !== 'publish') || (options.notes !== null && options.command !== 'publish') || ((options.all || options.check) && options.command !== 'publish')) throw new CliError(t('wrongArgument'), 2, 'usage');
+  // product（二期任务 2）：位置参数 skill + 至少一个 --set；字段值属纯参数校验，登录与网络之前拒绝。
+  if (options.command === 'product') {
+    options.skill = positions.shift() || null;
+    if (!options.skill || !options.set.length) throw new CliError(t('productUsage'), 2, 'usage');
+    if (!isSkillName(options.skill)) throw new CliError(t('invalidSkill'), 2, 'usage');
+    parseProductFields(options.set);
+  }
+  // unpublish（二期任务 2）：位置参数 skill + version（x.y.z）。
+  if (options.command === 'unpublish') {
+    options.skill = positions.shift() || null;
+    options.version = positions.shift() || null;
+    if (!options.skill || !options.version || !isVersion(options.version)) throw new CliError(t('unpublishUsage'), 2, 'usage');
+    if (!isSkillName(options.skill)) throw new CliError(t('invalidSkill'), 2, 'usage');
+  }
+  if (positions.length || (options.to.length && options.command !== 'install') || (options.token !== null && options.command !== 'login') || (options.plan !== null && options.command !== 'subscribe') || (options.path !== null && options.command !== 'update') || (options.repo !== null && !['publish', 'audit'].includes(options.command)) || (options.notes !== null && options.command !== 'publish') || (options.set.length && options.command !== 'product') || ((options.all || options.check) && options.command !== 'publish')) throw new CliError(t('wrongArgument'), 2, 'usage');
   return options;
+}
+
+// --set 字段解析（product 专用，二期任务 2）：发布者可编辑面 = name/summary 文本、prices.<方案>=<分>,<币种>、
+// free/paid 配对声明（设计「数据模型」Product 结构）。纯本地校验给快速反馈；服务端仍是最终验证者（400）。
+function parseProductFields(sets) {
+  const fields = {};
+  for (const entry of sets) {
+    const separator = entry.indexOf('=');
+    const key = separator > 0 ? entry.slice(0, separator) : '', value = separator > 0 ? entry.slice(separator + 1) : '';
+    const invalidField = () => new CliError(t('productFields'), 2, 'usage');
+    if (key === 'summary' || key === 'name') {
+      if (!value.trim() || value.length > 500) throw invalidField();
+      fields[key] = value;
+    } else if (key.startsWith('prices.')) {
+      const plan = key.slice('prices.'.length), match = value.match(/^(\d+),([A-Za-z]{3})$/), amount = Number(match?.[1]);
+      if (!/^[a-z][a-z0-9_-]*$/.test(plan) || !match || !(amount > 0) || !Number.isSafeInteger(amount)) throw invalidField();
+      fields.prices = { ...fields.prices, [plan]: { amount, currency: match[2].toLowerCase(), interval: null } };
+    } else if (key === 'free' || key === 'paid') {
+      if (!isSkillName(value)) throw invalidField();
+      fields[key] = value;
+    } else throw invalidField();
+  }
+  if (fields.free && fields.paid && fields.free === fields.paid) throw new CliError(t('productFields'), 2, 'usage');
+  return fields;
 }
 
 function priceLabel(prices) {
@@ -167,12 +210,18 @@ async function logout(ctx) {
   return 0;
 }
 
+// 商品展示词条（list 与 product 输出共用，二期任务 2 抽取）：名称 + 免费/付费（价格）+ 摘要。
+const catalogLineOf = (skill, type, product) => t('catalogLine', {
+  name: skillLabel(skill), type: type === 'free' ? t('free') : t('paid', { price: priceLabel(product.prices) }),
+  summary: product.summary ? t('summary', { summary: product.summary }) : '',
+});
+
 // list 展示目录里每个商品的免费/付费 Skill：名称、类型、价格与摘要。
 async function list(ctx) {
   const skills = ctx.catalog.flatMap((product) => ['free', 'paid'].filter((type) => product[type]).map((type) => ({
     skill: product[type].skill, name: product.name, summary: product.summary || '', type, prices: type === 'paid' ? product.prices : {}, page: ctx.client.subscriptionUrl(product[type].skill, product),
   })));
-  ctx.output.write({ skills }, skills.length ? skills.map((s) => t('catalogLine', { name: skillLabel(s.skill), type: s.type === 'free' ? t('free') : t('paid', { price: priceLabel(s.prices) }), summary: s.summary ? t('summary', { summary: s.summary }) : '' })) : [t('emptyCatalog')]);
+  ctx.output.write({ skills }, skills.length ? skills.map((s) => catalogLineOf(s.skill, s.type, s)) : [t('emptyCatalog')]);
   return 0;
 }
 
@@ -388,6 +437,67 @@ async function update(ctx) {
   return 0;
 }
 
+// 认证·管理操作共用前置（publish/product/unpublish）：先完成登录，再确认账号有 publisher 角色
+//（无角色 → 退出码 3 登录引导）。
+async function requirePublisher(ctx) {
+  await requireLogin(ctx);
+  const account = await ctx.client.me(ctx.token);
+  if (account.publisher !== true) throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
+}
+
+// hy product（二期任务 2）：注册/更新商品元数据。--set 值已在参数层校验；未知 skill 用公开目录+版本表
+// 预检（拼错名直接引导，不发 PUT）；服务端 upsert 与版本发布解耦（发布过或已在目录即可注册）。
+async function product(ctx) {
+  const skill = ctx.options.skill;
+  const fields = parseProductFields(ctx.options.set);
+  const catalog = await ctx.client.catalog();
+  const versions = await ctx.client.versions(catalog);
+  const known = Boolean(versions[skill]) || catalog.some((item) => [item.id, item.free?.skill, item.paid?.skill].includes(skill));
+  if (!known) throw new CliError(t('unknownSkill', { name: skillLabel(skill) }), 2, 'unknown_skill');
+  let updated;
+  try {
+    updated = await ctx.client.product(ctx.token, skill, fields);
+  } catch (error) {
+    if (error instanceof CliError) {
+      // 404/400/403 语义映射（设计「接口设计·发布端」）：404 与本地预检同义，403 与未登录同走登录引导。
+      if (error.details.http_status === 404) throw new CliError(t('unknownSkill', { name: skillLabel(skill) }), 2, 'unknown_skill');
+      if (error.error === 'invalid_field') throw new CliError(t('productFields'), 1, 'invalid_field');
+      if (error.error === 'not_a_publisher') throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
+    }
+    throw error;
+  }
+  ctx.output.write({ event: 'product', skill, product: updated, fields }, [
+    t('productUpdated', { name: updated.name || updated.id }),
+    ...['free', 'paid'].filter((type) => updated[type]).map((type) => catalogLineOf(updated[type].skill, type, updated)),
+  ]);
+  return 0;
+}
+
+// hy unpublish（二期任务 2）：下架某个版本（yank）。已装用户不受影响；新安装该版本 404（假设 #4）。
+async function unpublishSkill(ctx) {
+  const skill = ctx.options.skill, version = ctx.options.version;
+  try {
+    await ctx.client.unpublish(ctx.token, skill, version);
+  } catch (error) {
+    if (error instanceof CliError) {
+      if (error.details.http_status === 404) throw new CliError(t('unpublishMissing', { name: skillLabel(skill), version }), 1, 'not_found', { skill, version });
+      if (error.error === 'not_a_publisher') throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
+    }
+    throw error;
+  }
+  ctx.output.write({ event: 'unpublish', skill, version, yanked: true },
+    [t('unpublishDone', { name: skillLabel(skill), version }), t('unpublishEffect')]);
+  return 0;
+}
+
+// hy audit（二期任务 2）：对账报告独立入口（publish.js 的 reconcileRepo 共享件）——
+// 只读公开 catalog+versions，无需登录；--repo 缺省为当前目录。
+async function audit(ctx) {
+  const { repo, report, counts, lines } = await reconcileRepo(ctx.client, ctx.options.repo ?? '.');
+  ctx.output.write({ repo, skills: report, counts }, lines);
+  return 0;
+}
+
 // runtime 用于测试时注入时钟和终端交互；可执行入口不传测试选项。
 export const run = (argv, runtime = {}) => withLanguage(resolveLanguage(argv), () => runCommand(argv, runtime));
 
@@ -450,13 +560,21 @@ async function runCommand(argv, runtime) {
     }
     if (options.command === 'publish') {
       // 发布是鉴权操作：先完成登录，再确认账号有 publisher 角色（无角色 → 退出码 3 登录引导）。
-      await requireLogin(ctx);
-      const account = await ctx.client.me(ctx.token);
-      if (account.publisher !== true) throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
+      await requirePublisher(ctx);
       if (options.repo !== null) return await publishRepo(ctx, options.repo, { all: options.all, check: options.check, notes: options.notes });
       await publishSkill(ctx, options.directory, { notes: options.notes });
       return 0;
     }
+    // 管理命令（二期任务 2）：与 publish 同样的登录 + publisher 前置；audit 只读公开接口，无需登录。
+    if (options.command === 'product') {
+      await requirePublisher(ctx);
+      return await product(ctx);
+    }
+    if (options.command === 'unpublish') {
+      await requirePublisher(ctx);
+      return await unpublishSkill(ctx);
+    }
+    if (options.command === 'audit') return await audit(ctx);
     throw new CliError(t('notImplemented', { name: options.command }), 2, 'not_implemented');
   } catch (error) {
     if (controller.signal.aborted) return output.fail(new CliError(t('canceled'), 1, 'cancelled'));

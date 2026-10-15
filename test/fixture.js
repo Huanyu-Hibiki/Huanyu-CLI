@@ -121,6 +121,9 @@ export async function fixture(t) {
     // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
     // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
     publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
+    // 管理端（二期任务 2）：yanked 按 `name:version` 记下架标记（history 保留 + latest 回落，假设 #4）；
+    // productStatus/unpublishStatus 对 PUT products / DELETE releases 注入 400/403/404（数字持续、数组按序消耗）。
+    yanked: new Set(), productStatus: null, unpublishStatus: null,
     // 下载端（任务 6）：releases 为免费默认发布物（每 fixture 浅拷贝一层 Map，防跨用例可变共享）；
     // dropChecksum 让 versions 省略摘要（fail-closed 测试）、badChecksum 让 versions 下发错误摘要、
     // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载、
@@ -154,7 +157,7 @@ export async function fixture(t) {
         // 通用错误注入：failWith 命中 catalog/versions 时按它返回错误 JSON（error/message 可省略）。
         if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);
         // 外层形状可切换：{products}（默认）/ 裸数组 / {catalog} / 无法识别，客户端前三种都要接受。
-        const products = state.catalog.map(({ summaryEn, ...product }) => ({ ...product, summary: english ? summaryEn : product.summary }));
+        const products = state.catalog.map(({ summaryEn, ...product }) => ({ ...product, summary: english ? summaryEn ?? product.summary : product.summary }));
         if (state.catalogShape === 'array') return json(res, 200, products);
         if (state.catalogShape === 'catalog') return json(res, 200, { catalog: products });
         if (state.catalogShape === 'none') return json(res, 200, { weird: true });
@@ -165,10 +168,12 @@ export async function fixture(t) {
         if (state.versionsDelay) await new Promise((resolve) => setTimeout(resolve, state.versionsDelay));
         // state.history 可覆盖默认两条版本（条目为字符串或 {version, notes}），供 status 的更新/截断测试改写。
         const entry = (item) => typeof item === 'string' ? { version: item, notes: null } : item;
-        const history = (state.history || ['0.1.0', '0.0.9']).map((item) => {
+        const baseHistory = (state.history || ['0.1.0', '0.0.9']).map((item) => {
           const { version, notes } = entry(item);
           return { version, published_at: '2026-10-15T08:00:00Z', notes: notes ?? (english ? `${version}: First pilot release.` : `${version}：首个试点版本。`) };
         });
+        // yank 标记按 skill 分别落到 history 条目上（假设 #4：history 保留 + yanked 标记）。
+        const markYanked = (name, items) => items.map((item) => state.yanked.has(`${name}:${item.version}`) ? { ...item, yanked: true } : item);
         const skills = {};
         for (const product of state.catalog) for (const type of ['free', 'paid']) {
           const name = typeof product[type] === 'string' ? product[type] : product[type]?.skill;
@@ -176,7 +181,7 @@ export async function fixture(t) {
           // 免费默认发布物：latest 对上种子版本时下发 download_url + sha256（设计「数据模型」：免费版摘要必填）。
           const seed = state.releases.get(`${name}:${state.latest}`);
           const checksum = seed ? (state.dropChecksum ? null : state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
-          skills[name] = { latest: state.badVersions ? 'oops' : state.latest, published_at: '2026-10-15T08:00:00Z', history,
+          skills[name] = { latest: state.badVersions ? 'oops' : state.latest, published_at: '2026-10-15T08:00:00Z', history: markYanked(name, baseHistory),
             ...(checksum ? { download_url: `${base}/releases/${name}-${state.latest}.tar.gz`, sha256: checksum } : {}) };
         }
         // 已发布版本合并进版本表：latest 按语义版本提升、history 追加（供 --repo 对账与任务 6/7 安装闭环消费）。
@@ -191,8 +196,20 @@ export async function fixture(t) {
           const top = state.published.get(`${name}:${latest}`);
           const seed = state.releases.get(`${name}:${latest}`);
           const checksum = top ? top.sha256 : seed ? (state.dropChecksum ? null : state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
-          skills[name] = { latest, published_at: entry.published_at, history: merged,
+          skills[name] = { latest, published_at: entry.published_at, history: markYanked(name, merged),
             download_url: `${base}/releases/${name}-${latest}.tar.gz`, ...(checksum ? { sha256: checksum } : {}) };
+        }
+        // yank 回落（假设 #4）：有下架记录的 skill，latest 取候选（默认 latest + 已发布版本）中最高的
+        // 未下架版本；全部下架时保留最高版本占位（下载端 404 挡住新安装），版本表形状保持完整。
+        for (const name of Object.keys(skills)) {
+          if (![...state.yanked].some((key) => key.startsWith(`${name}:`))) continue;
+          const candidates = [...new Set([state.latest, ...[...state.published.keys()].filter((key) => key.startsWith(`${name}:`)).map((key) => key.split(':')[1])])];
+          const standing = candidates.filter((version) => !state.yanked.has(`${name}:${version}`));
+          const latest = (standing.length ? standing : candidates).sort(compareVersions).at(-1);
+          const top = state.published.get(`${name}:${latest}`);
+          const seed = state.releases.get(`${name}:${latest}`);
+          const checksum = top ? top.sha256 : seed ? (state.dropChecksum ? null : state.badChecksum ? '0'.repeat(64) : seed.sha256) : null;
+          skills[name] = { ...skills[name], latest, download_url: `${base}/releases/${name}-${latest}.tar.gz`, ...(checksum ? { sha256: checksum } : {}) };
         }
         return json(res, 200, { skills });
       }
@@ -228,6 +245,66 @@ export async function fixture(t) {
         state.published.set(`${name}:${version}`, { body: raw, sha256, size: raw.length, notes: decodeURIComponent(req.headers['x-notes'] || ''), published_at: new Date().toISOString() });
         return json(res, 200, { skill: name, version, sha256, size: raw.length, url: `${base}/releases/${name}-${version}.tar.gz` });
       }
+      // 商品注册/更新（二期任务 2，设计「接口设计·发布端」）：与版本发布解耦——合法规范名可直接注册
+      // （客户端对未知名预检引导，服务端保持 upsert）；字段白名单 = 发布者可编辑面，非法 400 invalid_field。
+      if (req.method === 'PUT' && url.pathname.startsWith('/api/store/products/')) {
+        if (!authenticate()) return;
+        const injected = Array.isArray(state.productStatus) ? state.productStatus.shift() : state.productStatus;
+        const injectedError = injected ? { 400: 'invalid_field', 403: 'not_a_publisher', 404: 'not_found' }[injected] : null;
+        if (injectedError) return error(res, injected, injectedError, '注入的商品更新失败。');
+        if (!state.publishers.has(token)) return error(res, 403, 'not_a_publisher', '没有发布权限。');
+        const name = decodeURIComponent(url.pathname.slice('/api/store/products/'.length));
+        const fields = body && typeof body === 'object' && !Array.isArray(body) ? body : null;
+        const fieldError = (message) => error(res, 400, 'invalid_field', message);
+        if (!fields || !/^[a-z0-9][a-z0-9-]*$/.test(name) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) return fieldError('Skill 名无效。');
+        const priceShape = (price) => price && typeof price === 'object' && !Array.isArray(price)
+          && Number.isSafeInteger(price.amount) && price.amount > 0
+          && typeof price.currency === 'string' && /^[a-z]{3}$/i.test(price.currency);
+        for (const [key, value] of Object.entries(fields)) {
+          if (key === 'summary' || key === 'name') {
+            if (typeof value !== 'string' || !value.trim() || value.length > 500) return fieldError(`${key} 无效。`);
+          } else if (key === 'prices') {
+            if (!value || typeof value !== 'object' || Array.isArray(value)
+              || !Object.entries(value).every(([plan, price]) => /^[a-z][a-z0-9_-]*$/.test(plan) && priceShape(price))) return fieldError('prices 无效。');
+          } else if (key === 'free' || key === 'paid') {
+            if (!/^[a-z0-9][a-z0-9-]*$/.test(String(value)) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(String(value))) return fieldError(`${key} 无效。`);
+          } else return fieldError(`未知字段 ${key}。`);
+        }
+        // upsert：id/free/paid 任一命中即更新，否则以该规范名注册新商品（free 缺省指向自身）。
+        const product = state.catalog.find((item) => item.id === name || item.free?.skill === name || item.paid?.skill === name)
+          ?? { id: name, name, summary: '', free: { skill: name }, paid: null, offer: [], prices: {} };
+        const next = { ...product,
+          ...(fields.name !== undefined ? { name: fields.name } : {}),
+          ...(fields.summary !== undefined ? { summary: fields.summary, summaryEn: undefined } : {}),
+          ...(fields.free !== undefined ? { free: { skill: fields.free } } : {}),
+          ...(fields.paid !== undefined ? { paid: { skill: fields.paid } } : {}),
+          ...(fields.prices !== undefined ? { prices: { ...product.prices, ...fields.prices } } : {}) };
+        next.offer = Object.keys(next.prices);
+        if (next.free && next.paid && next.free.skill === next.paid.skill) return fieldError('free 与 paid 不能相同。');
+        if (!next.free && !next.paid) return fieldError('商品缺少 free/paid。');
+        // 目录的 skill 名全局唯一是客户端 normalizeCatalog 的契约：配对值不得与其他商品冲突。
+        for (const skillName of [next.free?.skill, next.paid?.skill]) {
+          if (skillName && state.catalog.some((item) => item !== product && [item.id, item.free?.skill, item.paid?.skill].includes(skillName))) return fieldError(`${skillName} 已属于其他商品。`);
+        }
+        const index = state.catalog.indexOf(product);
+        if (index === -1) state.catalog.push(next);
+        else state.catalog[index] = next;
+        const { summaryEn, ...clean } = next;
+        return json(res, 200, clean);
+      }
+      // 版本下架（二期任务 2）：yank 幂等（重复下架仍 200）；history 保留 + latest 回落由 versions 端点体现。
+      if (req.method === 'DELETE' && url.pathname.startsWith('/api/store/releases/')) {
+        if (!authenticate()) return;
+        const injected = Array.isArray(state.unpublishStatus) ? state.unpublishStatus.shift() : state.unpublishStatus;
+        const injectedError = injected ? { 400: 'invalid_field', 403: 'not_a_publisher', 404: 'not_found' }[injected] : null;
+        if (injectedError) return error(res, injected, injectedError, '注入的下架失败。');
+        if (!state.publishers.has(token)) return error(res, 403, 'not_a_publisher', '没有发布权限。');
+        const [name, version] = url.pathname.slice('/api/store/releases/'.length).split('/').map(decodeURIComponent);
+        const key = `${name}:${version}`;
+        if (!state.published.has(key) && !state.releases.has(key)) return error(res, 404, 'not_found', '没有该版本。');
+        state.yanked.add(key);
+        return json(res, 200, { skill: name, version, yanked: true });
+      }
       if (req.method === 'GET' && url.pathname.startsWith('/api/store/download/')) {
         // 下载端（契约：免费 302→公开附件不带令牌；付费 200 + X-Content-SHA256 + X-Skill-Version 走订阅鉴权）。
         // 一期客户端对付费前置拦截不会走到这里，端点先备齐供任务 7/二期。
@@ -236,6 +313,8 @@ export async function fixture(t) {
         const product = state.catalog.find((p) => [p.free?.skill, p.paid?.skill].includes(name));
         const entry = state.releases.get(`${name}:${version}`) || state.published.get(`${name}:${version}`);
         if (!product || !entry || url.searchParams.get('format') !== 'tar.gz') return error(res, 404, 'not_found', '没有该版本。');
+        // 已下架版本新安装不可达（yank 语义）：已装用户不经过这里，本地不受影响。
+        if (state.yanked.has(`${name}:${version}`)) return error(res, 404, 'not_found', '该版本已下架。');
         if (product.paid?.skill === name) {
           if (!authenticate()) return;
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
@@ -250,6 +329,8 @@ export async function fixture(t) {
         const name = match?.[1];
         const entry = match ? state.releases.get(`${name}:${match[2]}`) || state.published.get(`${name}:${match[2]}`) : null;
         if (!entry) return error(res, 404, 'not_found', '没有该版本。');
+        // 已下架版本新安装不可达（yank 语义），公开附件同样拒绝。
+        if (state.yanked.has(`${name}:${match[2]}`)) return error(res, 404, 'not_found', '该版本已下架。');
         // 付费 skill 的发布物走订阅鉴权（与下载端语义一致，任务 6/7 铺垫）；免费与未入目录的保持公开。
         if (state.catalog.some((product) => product.paid?.skill === name)) {
           if (!authenticate()) return;

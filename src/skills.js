@@ -205,11 +205,11 @@ export function compare(a, b) {
   return 0;
 }
 
-// current 之后、latest 之前的可升级列表（含更新说明），按版本升序。
+// current 之后、latest 之前的可升级列表（含更新说明），按版本升序；yanked 标记随条目透出（假设 #4）。
 export function updates(current, release) {
   return release.history.filter((item) => isVersion(item.version) && (!current || compare(item.version, current) > 0) && compare(item.version, release.latest) <= 0)
     .sort((a, b) => compare(a.version, b.version))
-    .map(({ version, published_at, notes }) => ({ version, published_at, notes: typeof notes === 'string' ? notes : '' }));
+    .map(({ version, published_at, notes, yanked }) => ({ version, published_at, notes: typeof notes === 'string' ? notes : '', ...(yanked ? { yanked: true } : {}) }));
 }
 
 // 配对数据驱动（设计「领域层重组」③）：对每个 free+paid 齐备的商品，同宿主根同时装了两个版本即警告。

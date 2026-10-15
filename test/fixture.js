@@ -27,6 +27,15 @@ export const CATALOG = [
     free: { skill: 'oracle-bone' }, paid: null, offer: [], prices: {} },
 ];
 
+// 测试侧落一个可被 scan/inspectSkill 识别的 Skill 目录；folder 允许目录名与规范名不同。
+export async function writeSkill(root, name, version, folder = name) {
+  const directory = path.join(root, folder);
+  await mkdir(path.join(directory, 'assets'), { recursive: true });
+  await writeFile(path.join(directory, 'SKILL.md'), `---\nname: ${name}\ndescription: 测试 Skill\nmetadata:\n  version: "${version}"\n---\n\n# 测试\n`);
+  await writeFile(path.join(directory, 'assets', 'example.txt'), `${name} ${version}\n`);
+  return directory;
+}
+
 // 假浏览器脚本：HY_TEST_BROWSER=approve 时对设备授权页自动点“允许”；默认退出 1 模拟打开失败。
 const browserScript = `(async () => {\nif (process.env.HY_TEST_BROWSER !== 'approve') process.exit(1);\nconst url = new URL(process.env.HY_BROWSER_URL || process.argv.at(-1));\nif (url.pathname.endsWith('/device/')) {\nconst response = await fetch(new URL('/api/cli/device/approve', url), {method: 'POST', headers: {'Content-Type': 'application/json', Cookie: 'hy_session=fake'}, body: JSON.stringify({user_code: url.searchParams.get('code'), approve: true})});\nif (!response.ok) process.exit(1);\n}\nprocess.exit(0);\n})().catch(() => process.exit(1));\n`;
 
@@ -73,7 +82,7 @@ export async function fixture(t) {
   } else {
     for (const name of ['open', 'xdg-open']) await writeFile(path.join(mockBin, name), `#!${process.execPath}\n${browserScript}`, { mode: 0o755 });
   }
-  const state = { catalog: structuredClone(CATALOG), catalogShape: 'products', latest: '0.1.0', badVersions: false, failWith: null, requests: [],
+  const state = { catalog: structuredClone(CATALOG), catalogShape: 'products', latest: '0.1.0', history: null, badVersions: false, failWith: null, requests: [],
     deviceStatuses: ['authorization_pending', 'success'], deviceStatusesByRequest: null, devicePolls: 0, deviceRequests: 0,
     interval: 5, expiresIn: 600, deviceApproved: false, requireApproval: false, deviceToken: null, deviceErrorMessage: null,
     deviceCode: null, userCode: null, logoutFailure: false, revoked: new Set(), grants: new Map(),
@@ -116,7 +125,12 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname === '/api/store/versions') {
         if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);
-        const history = ['0.1.0', '0.0.9'].map((version) => ({ version, published_at: '2026-10-15T08:00:00Z', notes: english ? `${version}: First pilot release.` : `${version}：首个试点版本。` }));
+        // state.history 可覆盖默认两条版本（条目为字符串或 {version, notes}），供 status 的更新/截断测试改写。
+        const entry = (item) => typeof item === 'string' ? { version: item, notes: null } : item;
+        const history = (state.history || ['0.1.0', '0.0.9']).map((item) => {
+          const { version, notes } = entry(item);
+          return { version, published_at: '2026-10-15T08:00:00Z', notes: notes ?? (english ? `${version}: First pilot release.` : `${version}：首个试点版本。`) };
+        });
         const skills = {};
         for (const product of state.catalog) for (const type of ['free', 'paid']) {
           const name = typeof product[type] === 'string' ? product[type] : product[type]?.skill;

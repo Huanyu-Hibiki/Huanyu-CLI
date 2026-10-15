@@ -7,6 +7,7 @@ import { Client, catalogNames, isSkillName } from './client.js';
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo } from './publish.js';
+import { scan, compare, updates, conflicts, duplicateCopies } from './skills.js';
 
 // 14 个命令全部在参数解析层合法；help/version/list/login/logout/status/publish 之外的执行逻辑随后续任务落地。
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
@@ -75,10 +76,30 @@ const subscriptionLines = (subscriptions) => subscriptions.length ? subscription
     name: s.name || skillLabel(s.skill), status: subscriptionLabel(s.status), plan: planLabel(s.plan),
   }) + (s.renews != null ? t('renews', { date: localDate(s.renews) }) : '') + (s.ends != null ? t('ends', { date: localDate(s.ends) }) : '')) : [t('noPurchases')];
 
-// 已安装列表的宿主扫描属任务 5；本任务先以占位行呈现，账号部分完整可用。
+function installationLines(installed) {
+  return installed.flatMap((item) => {
+    const key = item.development ? 'versionSkipped' : item.current === item.latest ? 'versionCurrent' : item.current && compare(item.current, item.latest) > 0 ? 'versionNewer' : 'versionUpdate';
+    return [t(key, { name: skillLabel(item.name), version: item.current || t('unknownVersion'), latest: item.latest }),
+      t('location', { path: item.path }), ...item.updates.flatMap((entry) => [t('releaseNotes', { version: entry.version }), entry.notes || t('noReleaseNotes')])];
+  });
+}
+const duplicateLines = (copies) => copies.map((item) => t('duplicateCopies', { name: skillLabel(item.name), count: item.paths.length, next: command('install', item.name) }));
+
+// 扫描九宿主的用户级目录报告已装商店 skill：版本、可更新、警告（配对冲突/多副本/历史截断）；未登录也可用。
 async function status(ctx) {
   await loadAuth(ctx);
-  const installations = [], warnings = [], lines = [t('noInstallations')];
+  const found = await scan(ctx.names);
+  const versions = await ctx.client.versions(ctx.catalog);
+  const installations = found.map((item) => ({ name: item.name, path: item.path, current: item.version, latest: versions[item.name].latest, development: item.development, real_path: item.real_path,
+    update_available: !item.development && (!item.version || compare(item.version, versions[item.name].latest) < 0), updates: updates(item.version, versions[item.name]) }));
+  const warnings = await conflicts(found, ctx.catalog);
+  warnings.push(...duplicateLines(duplicateCopies(found)));
+  for (const item of found) {
+    const history = versions[item.name].history;
+    const oldest = history.filter((entry) => /^\d+\.\d+\.\d+$/.test(entry.version)).sort((a, b) => compare(a.version, b.version))[0];
+    if (history.length >= 20 && item.version && oldest && compare(item.version, oldest.version) < 0) warnings.push(t('historyWarning', { path: item.path }));
+  }
+  const lines = installations.length ? installationLines(installations) : [t('noInstallations')];
   let account = null;
   if (ctx.token) {
     try {
@@ -169,11 +190,11 @@ async function runCommand(argv, runtime) {
       confirm: runtime.confirm || confirm, ask: runtime.ask || ask };
     if (options.command === 'logout') return await logout(ctx);
     if (options.command === 'login') return await login(ctx, options.token);
-    if (options.command === 'status') return await status(ctx);
-    if (options.command === 'list') {
-      // catalog 拉取一次并缓存进 ctx；install/update 等后续命令复用。
+    if (options.command === 'status' || options.command === 'list') {
+      // catalog 拉取一次并缓存进 ctx；status 扫描与 install/update 等后续命令复用。
       ctx.catalog = await ctx.client.catalog();
       ctx.names = catalogNames(ctx.catalog);
+      if (options.command === 'status') return await status(ctx);
       return await list(ctx);
     }
     if (options.command === 'publish') {

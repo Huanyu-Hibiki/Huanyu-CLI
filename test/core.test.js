@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { resolveLanguage, withLanguage, t, helpLines, formatCommand, command, COMMAND } from '../src/i18n.js';
 import { CliError, Output } from '../src/io.js';
-import { parseSkill, compare } from '../src/skills.js';
+import { parseSkill, compare, duplicateCopies } from '../src/skills.js';
 import { canonicalName } from '../src/publish.js';
+import { HOSTS, targetRoot, discoveryRoots, installationRoots, projectRootsOf } from '../src/hosts.js';
 
 const TOKEN = 'hy_Abcd0123456789abcdefghijklmnopqrstuvXYZ';
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
@@ -160,4 +163,88 @@ test('package.json 打包字段与仓库现状一致', async () => {
     assert.ok(!/^readme/i.test(entry), `files 不应包含尚不存在的条目：${entry}`);
     assert.ok(existsSync(new URL(`../${entry}`, import.meta.url)), `files 条目应存在：${entry}`);
   }
+});
+
+// —— 宿主表（任务 5）：数据驱动的目标解析 ——
+
+test('宿主表：九宿主按设计优先序排列，zcode 置顶', () => {
+  assert.equal(HOSTS.length, 9);
+  assert.deepEqual(HOSTS.map((host) => host.id), ['zcode', 'agents', 'claude', 'codex', 'cursor', 'opencode', 'trae', 'qwenwork', 'workbuddy']);
+  assert.ok(HOSTS.every((host) => Array.isArray(host.user) && host.user.length === 2));
+});
+
+test('targetRoot：宿主 id 解析到主目录；opencode 走 XDG 配置目录；未知值按路径解析', () => {
+  const windows = { USERPROFILE: 'C:\\Users\\Test', HOME: '', XDG_CONFIG_HOME: '', CODEX_HOME: '' };
+  assert.equal(targetRoot('zcode', windows, 'win32'), 'C:\\Users\\Test\\.zcode\\skills');
+  assert.equal(targetRoot('agents', windows, 'win32'), 'C:\\Users\\Test\\.agents\\skills');
+  assert.equal(targetRoot('claude', windows, 'win32'), 'C:\\Users\\Test\\.claude\\skills');
+  assert.equal(targetRoot('codex', windows, 'win32'), 'C:\\Users\\Test\\.codex\\skills');
+  assert.equal(targetRoot('cursor', windows, 'win32'), 'C:\\Users\\Test\\.cursor\\skills');
+  // opencode 实测：全局根在 $XDG_CONFIG_HOME|~/.config 下的 opencode/，目录名用单数 skill。
+  assert.equal(targetRoot('opencode', windows, 'win32'), 'C:\\Users\\Test\\.config\\opencode\\skill');
+  assert.equal(targetRoot('opencode', { ...windows, XDG_CONFIG_HOME: 'D:\\xdg config' }, 'win32'), 'D:\\xdg config\\opencode\\skill');
+  assert.equal(targetRoot('trae', windows, 'win32'), 'C:\\Users\\Test\\.trae\\skills');
+  assert.equal(targetRoot('qwenwork', windows, 'win32'), 'C:\\Users\\Test\\.qwenworkcn\\skills');
+  assert.equal(targetRoot('workbuddy', windows, 'win32'), 'C:\\Users\\Test\\.workbuddy\\skills');
+  // 未知值按路径解析：绝对路径原样，相对路径按 cwd，~ 展开到主目录。
+  assert.equal(targetRoot('E:\\Any Dir', windows, 'win32', 'D:\\Project'), 'E:\\Any Dir');
+  assert.equal(targetRoot('custom skills', windows, 'win32', 'D:\\Project'), 'D:\\Project\\custom skills');
+  assert.equal(targetRoot('~/mine', windows, 'win32'), 'C:\\Users\\Test\\mine');
+  assert.equal(targetRoot('agents', { HOME: '/home/u' }, 'linux'), '/home/u/.agents/skills');
+  assert.equal(targetRoot('opencode', { HOME: '/home/u', XDG_CONFIG_HOME: '' }, 'linux'), '/home/u/.config/opencode/skill');
+});
+
+test('targetRoot：CODEX_HOME 支持绝对、~ 与相对目录，覆盖 .codex 主目录', () => {
+  const windows = { USERPROFILE: 'C:\\Users\\Test', HOME: '', XDG_CONFIG_HOME: '', CODEX_HOME: '' };
+  for (const [value, expected] of [
+    ['D:\\Custom Codex', 'D:\\Custom Codex\\skills'],
+    ['~/codex', 'C:\\Users\\Test\\codex\\skills'],
+    ['.codex-home', 'D:\\Project\\.codex-home\\skills'],
+  ]) assert.equal(targetRoot('codex', { ...windows, CODEX_HOME: value }, 'win32', 'D:\\Project'), expected);
+  assert.equal(targetRoot('codex', { HOME: '/home/u', CODEX_HOME: '/x/codex' }, 'linux'), '/x/codex/skills');
+});
+
+test('discoveryRoots：只有九个用户级根，按优先序去重，项目级目录不进默认扫描', () => {
+  const env = { HOME: '/home/u', USERPROFILE: 'C:\\Users\\Test', XDG_CONFIG_HOME: '', CODEX_HOME: '' };
+  const roots = discoveryRoots(env, 'linux', '/work/project');
+  assert.equal(roots.length, 9);
+  assert.equal(roots[0], '/home/u/.zcode/skills');
+  assert.ok(roots.includes('/home/u/.config/opencode/skill'));
+  assert.ok(!roots.includes('/work/project/.claude/skills'));
+  assert.ok(!roots.includes('/work/project/.opencode/skill'));
+});
+
+test('projectRootsOf：显式 --to/--path 解析项目级根（任务 6 用）；无项目目录的宿主返回空', () => {
+  assert.deepEqual(projectRootsOf('claude', '/work/project', {}, 'linux'), ['/work/project/.claude/skills']);
+  assert.deepEqual(projectRootsOf('opencode', '/work/project', {}, 'linux'), ['/work/project/.opencode/skill']);
+  assert.deepEqual(projectRootsOf('zcode', '/work/project', {}, 'linux'), ['/work/project/.zcode/skills']);
+  assert.deepEqual(projectRootsOf('cursor', '/work/project', {}, 'linux'), []);
+  assert.deepEqual(projectRootsOf('workbuddy', '/work/project', {}, 'linux'), []);
+  assert.deepEqual(projectRootsOf('unknown', '/work/project', {}, 'linux'), []);
+});
+
+test('installationRoots：只报告已存在的宿主目录、不创建，按优先序', async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), 'hy-hosts-'));
+  t.after(async () => { await rm(home, { recursive: true, force: true }); });
+  await mkdir(path.join(home, '.zcode'));
+  await mkdir(path.join(home, '.config', 'opencode'), { recursive: true });
+  const env = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: '', CODEX_HOME: '' };
+  const roots = await installationRoots(env);
+  const join = process.platform === 'win32' ? path.win32.join : path.posix.join;
+  assert.deepEqual(roots, [join(home, '.zcode', 'skills'), join(home, '.config', 'opencode', 'skill')]);
+  await assert.rejects(access(join(home, '.claude')), { code: 'ENOENT' });
+  await assert.rejects(access(join(home, '.claude', 'skills')), { code: 'ENOENT' });
+});
+
+test('duplicateCopies：只统计用户级宿主里的独立副本；项目目录与开发目录不算', () => {
+  const env = { HOME: '/home/u', USERPROFILE: '/home/u', XDG_CONFIG_HOME: '', CODEX_HOME: '' };
+  const found = [
+    { name: 'ppt-design', path: '/home/u/.zcode/skills/ppt-design', root: '/home/u/.zcode/skills' },
+    { name: 'ppt-design', path: '/home/u/.claude/skills/ppt-design', root: '/home/u/.claude/skills' },
+    { name: 'ppt-design', path: '/work/.claude/skills/ppt-design', root: '/work/.claude/skills' },
+    { name: 'ppt-design', path: '/home/u/.trae/skills/ppt-design', root: '/home/u/.trae/skills', development: true },
+  ];
+  assert.deepEqual(duplicateCopies(found, env, 'linux'),
+    [{ name: 'ppt-design', paths: ['/home/u/.zcode/skills/ppt-design', '/home/u/.claude/skills/ppt-design'] }]);
+  assert.deepEqual(duplicateCopies([{ name: 'oracle-bone', path: '/home/u/.codex/skills/oracle-bone', root: '/home/u/.codex/skills' }], env, 'linux'), []);
 });

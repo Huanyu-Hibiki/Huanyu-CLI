@@ -20,7 +20,7 @@
 - **验收标准**:
   - [x] help/version/--lang/--json 的行为与退出码符合契约，参数误用（未知参数、重复参数、参数缺值）全部退出码 2 且给出双语提示
   - [x] 输出双通道：文本模式走人类行，--json 走结构化对象，错误输出走 stderr 且经过密钥遮盖框架
-  - [x] CI 在 windows/macos/ubuntu × Node 18/22 六格全绿 —— **证据暂缓至首次 push**（仓库尚无远端；workflow 文件就位、本地 23/23 绿，首推后复核）
+  - [x] CI 在 windows/macos/ubuntu × Node 18/22 六格全绿 —— **已验证**（2026-10-15 首推 GitHub 后第三跑全绿：run 38716612146；首跑暴露三处跨平台测试缺陷——macOS /var 别名、Linux inode 复用、runner LANG=en_US——均已修复，产品代码零改动）
 - **阻塞边**: 无（可立即开始）
 - **安全**: 否
 - **审查记录**: spec AC1/AC2 通过（20 项条款级核对）；quality 可合入（0 CRITICAL/HIGH）；已修复 notImplemented 文案、helpPublish 对齐、package.json 打包一致性；LOW 项（短密钥遮盖、hy_ 前缀误伤、--lang 宽松校验）留后续任务顺手处理
@@ -95,7 +95,7 @@
 - **验收标准**:
   - [x] README 双语与实际命令行为一致（逐命令与 help 词条实跑核对 + core.test.js 自动钉住，词条改动即红）
   - [x] 版本检查约定文档完整（fenced 模板可整段抄进 SKILL.md；端点与 DEFAULT_API 测试级同步）
-  - [x] 六格 CI 矩阵全绿——**证据暂缓至首次 push**（与任务 1 同口径；workflow 就位含 pack 校验步骤，本地 149 测试全绿）；发布检查清单入 docs/release-checklist.md
+  - [x] 六格 CI 矩阵全绿 —— **已验证**（run 38716612146 六格 success，含 npm pack 打包校验步骤）；发布检查清单入 docs/release-checklist.md
 - **前置（审查登记）**: ✅ npm test 入口约定固化（README 开发节 + scripts 注释）；files 加回 README×2 + LICENSE（MIT）
 - **阻塞边**: 任务 7
 - **安全**: 否

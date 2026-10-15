@@ -1,22 +1,21 @@
-import path from 'node:path';
 import { stat } from 'node:fs/promises';
 import { t } from './i18n.js';
 import { CliError } from './io.js';
-import { pathsFor, userHome } from './platform.js';
-import { resolveDirectory } from './skills.js';
+import { pathsFor, userHome, absoluteDirectory, resolveDirectory } from './platform.js';
 
-// 宿主表（设计「宿主表」，zcode 优先序）数据化：user 是相对基目录的路径段，project 是项目级目录段，
+// 宿主表（设计「宿主表」，zcode 优先序）数据化：user 是相对基目录的路径段，project 是项目级目录的完整段
+// （点前缀目录名也入数据，不由 id 推导——qwenwork 的用户级 .qwenworkcn 即是目录名≠id 的先例），
 // env 声明整体替换宿主目录的环境变量（CODEX_HOME 覆盖 .codex）。
 // opencode 实测（2026-10-15，本机 @opencode 1.17.x 二进制反查）：skill 目录在 {skill,skills} 通配下都被扫描，
 // 全局根为 $XDG_CONFIG_HOME|~/.config 的 opencode/（跨平台一致，Windows 下不用 APPDATA；官方文档用单数 skill），项目级 .opencode/skill。
 export const HOSTS = [
-  { id: 'zcode', user: ['.zcode', 'skills'], project: 'skills' },
-  { id: 'agents', user: ['.agents', 'skills'], project: 'skills' },
-  { id: 'claude', user: ['.claude', 'skills'], project: 'skills' },
-  { id: 'codex', user: ['.codex', 'skills'], project: 'skills', env: 'CODEX_HOME' },
+  { id: 'zcode', user: ['.zcode', 'skills'], project: ['.zcode', 'skills'] },
+  { id: 'agents', user: ['.agents', 'skills'], project: ['.agents', 'skills'] },
+  { id: 'claude', user: ['.claude', 'skills'], project: ['.claude', 'skills'] },
+  { id: 'codex', user: ['.codex', 'skills'], project: ['.codex', 'skills'], env: 'CODEX_HOME' },
   { id: 'cursor', user: ['.cursor', 'skills'] },
-  { id: 'opencode', user: ['opencode', 'skill'], project: 'skill', base: 'config' },
-  { id: 'trae', user: ['.trae', 'skills'], project: 'skills' },
+  { id: 'opencode', user: ['opencode', 'skill'], project: ['.opencode', 'skill'], base: 'config' },
+  { id: 'trae', user: ['.trae', 'skills'], project: ['.trae', 'skills'] },
   { id: 'qwenwork', user: ['.qwenworkcn', 'skills'] },
   { id: 'workbuddy', user: ['.workbuddy', 'skills'] },
 ];
@@ -27,7 +26,8 @@ const hostById = (value) => HOSTS.find((host) => host.id === value);
 function hostBase(host, env, platform, cwd) {
   if (host.base === 'config') {
     const home = userHome(env, platform), paths = pathsFor(platform);
-    return env.XDG_CONFIG_HOME ? resolveDirectory(env.XDG_CONFIG_HOME, env, platform, cwd) : paths.join(home, '.config');
+    // 相对 XDG_CONFIG_HOME 忽略并回落 ~/.config（与 config.js 的绝对目录判定共用），宿主根不随 cwd 漂移。
+    return absoluteDirectory(env.XDG_CONFIG_HOME, paths) || paths.join(home, '.config');
   }
   return userHome(env, platform);
 }
@@ -64,7 +64,7 @@ export async function installationRoots(env = process.env, platform = process.pl
 }
 
 // 项目级根：供 --to/--path 显式解析与宿主归属判断（任务 6 安装用）；无项目目录的宿主返回空。
-export function projectRootsOf(hostId, cwd = process.cwd(), env = process.env, platform = process.platform) {
+export function projectRootsOf(hostId, env = process.env, platform = process.platform, cwd = process.cwd()) {
   const host = hostById(hostId), paths = pathsFor(platform);
-  return host?.project ? [paths.resolve(cwd, `.${host.id}`, host.project)] : [];
+  return host?.project ? [paths.resolve(cwd, ...host.project)] : [];
 }

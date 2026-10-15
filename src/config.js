@@ -3,10 +3,8 @@ import path from 'node:path';
 import { mkdir, readFile, rename, rm, open } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { CliError } from './io.js';
-import { pathsFor, userHome, restrictPermissions } from './platform.js';
+import { pathsFor, userHome, restrictPermissions, absoluteDirectory } from './platform.js';
 import { DEFAULT_API } from './client.js';
-
-const absoluteDirectory = (value, paths) => typeof value === 'string' && value.trim() && paths.isAbsolute(value) ? value : null;
 
 export function configPath(env = process.env, platform = process.platform) {
   const paths = pathsFor(platform);

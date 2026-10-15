@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fixture, writeSkill } from './fixture.js';
 import { HOSTS, targetRoot } from '../src/hosts.js';
+import { scan, conflicts } from '../src/skills.js';
 import { command } from '../src/i18n.js';
 
 const exec = promisify(execFile);
@@ -74,12 +75,12 @@ test('8.3 短路径 HOME 与链接宿主一起扫到的安装只报一次', { sk
   await writeSkill(zcode, 'ppt-design', '0.1.0');
   await mkdir(path.join(f.home, '.agents'));
   await symlink(zcode, path.join(f.home, '.agents', 'skills'), 'junction');
-  const result = await exec(process.env.ComSpec || 'cmd.exe', ['/d', '/v:off', '/s', '/c', '"for %I in ("%OIL_TEST_HOME%") do @echo %~sI"'], {
-    windowsVerbatimArguments: true, windowsHide: true, timeout: 5000, env: { ...process.env, OIL_TEST_HOME: f.home },
+  const result = await exec(process.env.ComSpec || 'cmd.exe', ['/d', '/v:off', '/s', '/c', '"for %I in ("%HY_TEST_HOME%") do @echo %~sI"'], {
+    windowsVerbatimArguments: true, windowsHide: true, timeout: 5000, env: { ...process.env, HY_TEST_HOME: f.home },
   });
   const shortHome = result.stdout.trim();
-  // 8.3 名称生成被禁用的机器上拿不到短路径，跳过而不是误报。
-  if (!shortHome || path.resolve(shortHome).toLowerCase() === path.resolve(f.home).toLowerCase()) return;
+  // CI 的 Windows 卷需启用 8.3 短名生成（windows-latest 默认启用）；被禁用的机器显式跳过，不静默早退。
+  if (!shortHome || path.resolve(shortHome).toLowerCase() === path.resolve(f.home).toLowerCase()) return t.skip('8.3 短名生成被禁用，短路径场景在本机不可测');
   const status = await f.run(['status', '--json'], { HOME: shortHome, USERPROFILE: shortHome });
   assert.equal(status.code, 0, status.stdout + status.stderr);
   const copies = data(status).installations.filter((item) => item.name === 'ppt-design');
@@ -157,6 +158,25 @@ test('history 截断：history≥20 且本地版早于最早可得版时警告',
   assert.equal(value.installations[0].update_available, true);
 });
 
+test('配对冲突按宿主组归并：付费在项目级、免费在同宿主用户级也警告（堵 oil 式硬编码回退）', async (t) => {
+  const f = await fixture(t);
+  // 同宿主跨层级：免费装在用户级 ~/.claude/skills，付费装在项目级 .claude/skills。
+  // 只有 sameAgentRoots 把两级根归并成一组才会报冲突；只看付费所在根（oil 对单个商品的硬编码特判）不会。
+  const free = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.1.0');
+  const paid = await writeSkill(path.join(f.cwd, '.claude', 'skills'), 'ppt-design-pro', '0.1.0');
+  const found = await scan(['ppt-design', 'ppt-design-pro'], [path.dirname(free), path.dirname(paid)]);
+  assert.equal(found.length, 2);
+  const warnings = await conflicts(found, f.state.catalog, f.env, process.platform, f.cwd);
+  assert.deepEqual(warnings, [`${path.dirname(paid)}: ppt-design 和 ppt-design-pro 两个版本同时装会抢着接同一类请求`]);
+  // 反例：付费在项目级 .claude、免费在用户级 .zcode——不同宿主组不警告。
+  const other = await fixture(t);
+  const otherFree = await writeSkill(path.join(other.home, '.zcode', 'skills'), 'ppt-design', '0.1.0');
+  const otherPaid = await writeSkill(path.join(other.cwd, '.claude', 'skills'), 'ppt-design-pro', '0.1.0');
+  const otherFound = await scan(['ppt-design', 'ppt-design-pro'], [path.dirname(otherFree), path.dirname(otherPaid)]);
+  assert.equal(otherFound.length, 2);
+  assert.deepEqual(await conflicts(otherFound, other.state.catalog, other.env, process.platform, other.cwd), []);
+});
+
 test('无安装时输出 noInstallations，宿主目录存在但为空也一样', async (t) => {
   const f = await fixture(t);
   await mkdir(path.join(f.home, '.zcode', 'skills'), { recursive: true });
@@ -166,4 +186,6 @@ test('无安装时输出 noInstallations，宿主目录存在但为空也一样'
   const value = data(await f.run(['status', '--json']));
   assert.deepEqual(value.installations, []);
   assert.deepEqual(value.warnings, []);
+  // 没有安装就不请求版本表：空目录场景不该白打一次网络。
+  assert.ok(!f.state.requests.some((request) => request.path === '/api/store/versions'), '无安装时不应请求 /api/store/versions');
 });

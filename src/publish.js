@@ -10,9 +10,9 @@ import { pipeline } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CliError } from './io.js';
-import { inspectSkill, parseSkill, isSkillName, compare, resolveDirectory } from './skills.js';
+import { inspectSkill, parseSkill, isSkillName, compare } from './skills.js';
 import { validateArchive } from './archive.js';
-import { tarInvocation } from './platform.js';
+import { tarInvocation, resolveDirectory } from './platform.js';
 import { catalogNames } from './client.js';
 
 const exec = promisify(execFile);
@@ -243,7 +243,7 @@ export async function publishRepo(ctx, repoArgument, { all, check, notes } = {})
     throw error;
   }
   const found = [];
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))) {
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
     const source = await readSkillSource(path.join(repo, entry.name));
     if (source) found.push({ directory: source.resolved, base: path.basename(source.resolved), metadata: source.metadata });

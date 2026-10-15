@@ -2,7 +2,7 @@ import { t, skillLabel } from './i18n.js';
 import { lstat, realpath, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { CliError } from './io.js';
-import { pathsFor, userHome, directoryKey } from './platform.js';
+import { directoryKey } from './platform.js';
 import { HOSTS, targetRoot, discoveryRoots, projectRootsOf } from './hosts.js';
 
 // 规范名（设计「数据模型」）：^[a-z0-9][a-z0-9-]*$；语义化版本（无前缀/后缀）。
@@ -110,13 +110,6 @@ export async function inspectSkill(directory, names) {
   }
 }
 
-export function resolveDirectory(value, env = process.env, platform = process.platform, cwd = process.cwd()) {
-  const home = userHome(env, platform), paths = pathsFor(platform);
-  if (value === '~') return home;
-  if (/^~[/\\]/.test(value)) return paths.resolve(home, value.slice(2));
-  return paths.resolve(cwd, value);
-}
-
 // 目标可能还没创建，沿父目录解析软链接，用于重复/嵌套目标检查。
 export async function canonicalDirectory(directory) {
   const absolute = path.resolve(directory);
@@ -156,12 +149,12 @@ async function hasDirectoryLink(directories) {
 export const isLinkedInstallation = (directory) => hasDirectoryLink([directory, ...installationParents(path.dirname(directory))]);
 
 function agentRootGroups(env = process.env, platform = process.platform, cwd = process.cwd()) {
-  return HOSTS.map((host) => [targetRoot(host.id, env, platform, cwd), ...projectRootsOf(host.id, cwd, env, platform)]);
+  return HOSTS.map((host) => [targetRoot(host.id, env, platform, cwd), ...projectRootsOf(host.id, env, platform, cwd)]);
 }
 
 // 显式路径也按宿主识别；无法归属的自定义目录只算自身。
-export async function sameAgentRoots(directory) {
-  const groups = agentRootGroups();
+export async function sameAgentRoots(directory, env = process.env, platform = process.platform, cwd = process.cwd()) {
+  const groups = agentRootGroups(env, platform, cwd);
   // 先按逻辑位置归属宿主，避免多个宿主的链接指向同一目录时误选宿主。
   const exact = groups.find((roots) => roots.some((root) => directoryKey(root, process.platform, null) === directoryKey(directory, process.platform, null)));
   if (exact) return [...new Set([directory, ...exact])];
@@ -183,7 +176,7 @@ export async function scan(names, roots = discoveryRoots()) {
       if (['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
       throw new CliError(t('scanRead', { path: root }), 1, 'skill_read');
     }
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const skill = await inspectSkill(path.join(root, entry.name), names);
       if (skill && !seen.has(directoryKey(skill.real_path))) { seen.add(directoryKey(skill.real_path)); found.push(skill); }
@@ -217,12 +210,12 @@ export function updates(current, release) {
 
 // 配对数据驱动（设计「领域层重组」③）：对每个 free+paid 齐备的商品，同宿主根同时装了两个版本即警告。
 // 宿主归属用 sameAgentRoots（含项目级根），免费版经链接共享到付费版宿主也能识别。
-export async function conflicts(installed, catalog) {
+export async function conflicts(installed, catalog, env = process.env, platform = process.platform, cwd = process.cwd()) {
   const warnings = [];
   for (const product of catalog.filter((product) => product.free && product.paid)) {
     const seen = new Set();
     for (const pro of installed.filter((item) => item.name === product.paid.skill)) {
-      const roots = await sameAgentRoots(pro.root);
+      const roots = await sameAgentRoots(pro.root, env, platform, cwd);
       const canonical = [...new Set(await Promise.all(roots.map(async (root) => directoryKey(await canonicalDirectory(root)))))];
       const key = [...canonical].sort().join('\0');
       if (seen.has(key)) continue;

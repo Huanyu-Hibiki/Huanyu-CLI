@@ -171,6 +171,8 @@ test('宿主表：九宿主按设计优先序排列，zcode 置顶', () => {
   assert.equal(HOSTS.length, 9);
   assert.deepEqual(HOSTS.map((host) => host.id), ['zcode', 'agents', 'claude', 'codex', 'cursor', 'opencode', 'trae', 'qwenwork', 'workbuddy']);
   assert.ok(HOSTS.every((host) => Array.isArray(host.user) && host.user.length === 2));
+  // project 字段数据化为完整的点前缀目录段：项目级目录名不由 id 推导（qwenwork 的 .qwenworkcn 教训）。
+  assert.ok(HOSTS.every((host) => host.project === undefined || (Array.isArray(host.project) && host.project.length === 2 && host.project[0].startsWith('.'))), 'project 应为 [".<目录名>", "<段名>"]');
 });
 
 test('targetRoot：宿主 id 解析到主目录；opencode 走 XDG 配置目录；未知值按路径解析', () => {
@@ -183,6 +185,9 @@ test('targetRoot：宿主 id 解析到主目录；opencode 走 XDG 配置目录�
   // opencode 实测：全局根在 $XDG_CONFIG_HOME|~/.config 下的 opencode/，目录名用单数 skill。
   assert.equal(targetRoot('opencode', windows, 'win32'), 'C:\\Users\\Test\\.config\\opencode\\skill');
   assert.equal(targetRoot('opencode', { ...windows, XDG_CONFIG_HOME: 'D:\\xdg config' }, 'win32'), 'D:\\xdg config\\opencode\\skill');
+  // 相对 XDG_CONFIG_HOME 忽略并回落 ~/.config：宿主根不随 cwd 漂移（与 config.js 的绝对目录判定一致）。
+  assert.equal(targetRoot('opencode', { ...windows, XDG_CONFIG_HOME: 'relative/xdg' }, 'win32'), 'C:\\Users\\Test\\.config\\opencode\\skill');
+  assert.equal(targetRoot('opencode', { HOME: '/home/u', XDG_CONFIG_HOME: 'xdg' }, 'linux', '/work'), '/home/u/.config/opencode/skill');
   assert.equal(targetRoot('trae', windows, 'win32'), 'C:\\Users\\Test\\.trae\\skills');
   assert.equal(targetRoot('qwenwork', windows, 'win32'), 'C:\\Users\\Test\\.qwenworkcn\\skills');
   assert.equal(targetRoot('workbuddy', windows, 'win32'), 'C:\\Users\\Test\\.workbuddy\\skills');
@@ -214,13 +219,14 @@ test('discoveryRoots：只有九个用户级根，按优先序去重，项目级
   assert.ok(!roots.includes('/work/project/.opencode/skill'));
 });
 
-test('projectRootsOf：显式 --to/--path 解析项目级根（任务 6 用）；无项目目录的宿主返回空', () => {
-  assert.deepEqual(projectRootsOf('claude', '/work/project', {}, 'linux'), ['/work/project/.claude/skills']);
-  assert.deepEqual(projectRootsOf('opencode', '/work/project', {}, 'linux'), ['/work/project/.opencode/skill']);
-  assert.deepEqual(projectRootsOf('zcode', '/work/project', {}, 'linux'), ['/work/project/.zcode/skills']);
-  assert.deepEqual(projectRootsOf('cursor', '/work/project', {}, 'linux'), []);
-  assert.deepEqual(projectRootsOf('workbuddy', '/work/project', {}, 'linux'), []);
-  assert.deepEqual(projectRootsOf('unknown', '/work/project', {}, 'linux'), []);
+test('projectRootsOf：参数序与其他解析函数一致 (id, env, platform, cwd)；无项目目录的宿主返回空', () => {
+  assert.deepEqual(projectRootsOf('claude', {}, 'linux', '/work/project'), ['/work/project/.claude/skills']);
+  assert.deepEqual(projectRootsOf('opencode', {}, 'linux', '/work/project'), ['/work/project/.opencode/skill']);
+  assert.deepEqual(projectRootsOf('zcode', {}, 'linux', '/work/project'), ['/work/project/.zcode/skills']);
+  assert.deepEqual(projectRootsOf('cursor', {}, 'linux', '/work/project'), []);
+  assert.deepEqual(projectRootsOf('workbuddy', {}, 'linux', '/work/project'), []);
+  assert.deepEqual(projectRootsOf('unknown', {}, 'linux', '/work/project'), []);
+  assert.deepEqual(projectRootsOf('claude', {}, 'win32', 'D:\\Project'), ['D:\\Project\\.claude\\skills']);
 });
 
 test('installationRoots：只报告已存在的宿主目录、不创建，按优先序', async (t) => {

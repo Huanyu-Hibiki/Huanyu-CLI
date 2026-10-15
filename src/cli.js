@@ -3,7 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
-import { Client, catalogNames, isSkillName } from './client.js';
+import { Client, catalogNames, isSkillName, isVersion } from './client.js';
 import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo } from './publish.js';
@@ -84,20 +84,24 @@ function installationLines(installed) {
   });
 }
 const duplicateLines = (copies) => copies.map((item) => t('duplicateCopies', { name: skillLabel(item.name), count: item.paths.length, next: command('install', item.name) }));
+// 服务端 versions.history 的截断长度：超过后更早版本不可见，本地版早于最早可得版要提醒
+// （与词条 historyWarning 文案里的「20 条」耦合，改动需同步）。
+const HISTORY_LIMIT = 20;
 
 // 扫描九宿主的用户级目录报告已装商店 skill：版本、可更新、警告（配对冲突/多副本/历史截断）；未登录也可用。
 async function status(ctx) {
   await loadAuth(ctx);
   const found = await scan(ctx.names);
-  const versions = await ctx.client.versions(ctx.catalog);
+  // 没有安装就不打版本表：空场景省一次网络请求。
+  const versions = found.length ? await ctx.client.versions(ctx.catalog) : {};
   const installations = found.map((item) => ({ name: item.name, path: item.path, current: item.version, latest: versions[item.name].latest, development: item.development, real_path: item.real_path,
     update_available: !item.development && (!item.version || compare(item.version, versions[item.name].latest) < 0), updates: updates(item.version, versions[item.name]) }));
   const warnings = await conflicts(found, ctx.catalog);
   warnings.push(...duplicateLines(duplicateCopies(found)));
   for (const item of found) {
     const history = versions[item.name].history;
-    const oldest = history.filter((entry) => /^\d+\.\d+\.\d+$/.test(entry.version)).sort((a, b) => compare(a.version, b.version))[0];
-    if (history.length >= 20 && item.version && oldest && compare(item.version, oldest.version) < 0) warnings.push(t('historyWarning', { path: item.path }));
+    const oldest = history.filter((entry) => isVersion(entry.version)).sort((a, b) => compare(a.version, b.version))[0];
+    if (history.length >= HISTORY_LIMIT && item.version && oldest && compare(item.version, oldest.version) < 0) warnings.push(t('historyWarning', { path: item.path }));
   }
   const lines = installations.length ? installationLines(installations) : [t('noInstallations')];
   let account = null;

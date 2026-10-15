@@ -7,6 +7,18 @@ export const pathsFor = (platform = process.platform) => platform === 'win32' ? 
 export const userHome = (env = process.env, platform = process.platform) =>
   (platform === 'win32' ? env.USERPROFILE || env.HOME : env.HOME) || homedir();
 
+// 绝对目录判定：环境变量给相对路径时视为无效，位置不随 cwd 漂移（config.js 的凭据目录与 hosts.js 的宿主根共用）。
+export const absoluteDirectory = (value, paths = pathsFor()) =>
+  typeof value === 'string' && value.trim() && paths.isAbsolute(value) ? value : null;
+
+// 路径解析：~ 与 ~/ 展开，其余按当前目录（或显式 cwd）解析为绝对路径。
+export function resolveDirectory(value, env = process.env, platform = process.platform, cwd = process.cwd()) {
+  const home = userHome(env, platform), paths = pathsFor(platform);
+  if (value === '~') return home;
+  if (/^~[/\\]/.test(value)) return paths.resolve(home, value.slice(2));
+  return paths.resolve(cwd, value);
+}
+
 // Windows 的路径比较忽略大小写、分隔符和 Win32 扩展路径前缀。
 // resolvePath 只在「以 win32 语义比较且本机真是 win32」时默认启用 8.3 还原；跨平台测试可注入或置空。
 export function directoryKey(value, platform = process.platform, resolvePath = platform === 'win32' && process.platform === 'win32' ? realpathSync.native : null) {

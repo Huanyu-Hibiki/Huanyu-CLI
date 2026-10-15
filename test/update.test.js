@@ -221,7 +221,7 @@ test('下载前占用预检：scan 与执行之间目标被换成无关内容 �
   const f = await fixture(t);
   const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
   // 版本表响应被门控压住（Promise 门控，任务 7）：scan 已完成（看到的还是旧版本），窗口内第三方把目标换成无关内容。
-  const held = gate();
+  const held = gate(t);
   f.state.holdVersions = held.promise;
   const pending = f.run(['update', '--json']);
   await waitForRequest(f, (r) => r.path === '/api/store/versions');
@@ -243,7 +243,7 @@ test('下载前占用预检：scan 与执行之间目标被换成无关内容 �
 test('M4：声明过 previousName 的位变悬空链接（下载前竞态）→ occupied 拒绝且不下载', async (t) => {
   const f = await fixture(t);
   const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
-  const held = gate();
+  const held = gate(t);
   f.state.holdVersions = held.promise;
   const pending = f.run(['update', '--json']);
   await waitForRequest(f, (r) => r.path === '/api/store/versions');

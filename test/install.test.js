@@ -172,7 +172,7 @@ test('下载期间目标变成开发目录 → rename 前双重保护拦截并�
   const root = path.join(f.home, '.zcode', 'skills');
   const target = await writeSkill(root, 'ppt-design', '0.0.1');
   // 发布物响应被门控压住（Promise 门控，任务 7）：请求已到、响应未发，测试在此窗口把目标变成开发目录。
-  const held = gate();
+  const held = gate(t);
   f.state.holdRelease = held.promise;
   const pending = f.run(['install', 'ppt-design', '--to', 'zcode']);
   await waitForRequest(f, (r) => r.path === '/releases/ppt-design-0.1.0.tar.gz');
@@ -184,6 +184,19 @@ test('下载期间目标变成开发目录 → rename 前双重保护拦截并�
   // 原目录与旧版本完整保留，无暂存残留。
   assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /0\.0\.1/);
   assert.deepEqual(await stageLeftovers(root), []);
+});
+
+// 审查修复（gate 兜底契约）：手动 release 生效且幂等；gate(t) 注册的 t.after 兜底释放不干扰
+// 手动路径——测试体在窗口内失败时收尾钩子放行门控，被压住的子进程与 fixture 关闭不悬挂。
+test('gate：释放前保持关闭、手动 release 放行且幂等（t.after 兜底注册）', async (t) => {
+  const held = gate(t);
+  let done = false;
+  held.promise.then(() => { done = true; });
+  assert.equal(done, false, '释放前门控保持关闭');
+  held.release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(done, true, '手动 release 放行');
+  held.release(); // 收尾钩子的二次释放：幂等不抛
 });
 
 // —— 付费下载路径（二期任务 3）：requireEntitlement 已购放行、未购 exit 3 inactive 引导 ——
@@ -412,7 +425,7 @@ test('changed：下载期间目标被删除 → changed 保护，不误装新目
   const root = path.join(f.home, '.zcode', 'skills');
   const target = await writeSkill(root, 'ppt-design', '0.0.1');
   // 前置预检时目标还在（同名旧版本）；发布物响应被门控压住，窗口内被第三方删除。
-  const held = gate();
+  const held = gate(t);
   f.state.holdRelease = held.promise;
   const pending = f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   await waitForRequest(f, (r) => r.path === '/releases/ppt-design-0.1.0.tar.gz');

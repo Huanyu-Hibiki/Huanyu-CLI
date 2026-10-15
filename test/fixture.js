@@ -94,11 +94,12 @@ async function defaultReleases() {
   return seedCache;
 }
 
-// 响应门控（任务 7 登记落地，任务 1 审查登记的助手上移）：gate() 返回 { promise, release }；
+// 响应门控（任务 7 登记落地，任务 1 审查登记的助手上移）：gate(t) 返回 { promise, release }；
 // 把 promise 赋给 state.holdVersions / state.holdRelease 压住对应端点的响应，测试在窗口内完成
 // 目标变更后 release()——响应严格在变更之后发出，消除「固定 500ms 内改完」的竞态余量。
-// waitForRequest 轮询 fixture 记录的请求作为窗口入口（请求已到、响应未发的那一刻）。
-export const gate = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
+// 兜底（审查修复）：t.after 自动 release——测试体在手动释放前失败时门控也在收尾放行，被压住的
+// 子进程请求与 fixture 关闭不会被悬挂，失败诊断干净；手动释放后钩子二次释放幂等。
+export const gate = (t) => { let release; const promise = new Promise((resolve) => { release = resolve; }); t?.after(() => release()); return { promise, release }; };
 export async function waitForRequest(f, predicate, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -186,7 +187,9 @@ export async function fixture(t) {
     // badDownloadChecksum 回错误的 X-Content-SHA256、dropDownloadChecksum 省略该头（摘要负例）。
     // downloadInactiveCount（二期任务 5）：前 N 次付费下载先清空授权再判权——模拟「me 已列但
     // 服务端扣款/履约竞态未生效」的 402 窗口（install/update 的内联购买重试路径，template 同款）。
-    badDownloadVersion: false, badDownloadChecksum: false, dropDownloadChecksum: false, downloadInactiveCount: 0 };
+    // downloadUnauthorizedCount（任务 7 审查）：前 N 次付费下载直接回 401——令牌吊销/失效落在
+    // 重试下载上，hint 附加条件（401 不附「重跑即装」）的判别例用。
+    badDownloadVersion: false, badDownloadChecksum: false, dropDownloadChecksum: false, downloadInactiveCount: 0, downloadUnauthorizedCount: 0 };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -379,6 +382,9 @@ export async function fixture(t) {
           // 402 竞态注入：授权被清空后按订阅判定，本次下载返回 402（购买后重试即恢复）。
           if (state.downloadInactiveCount > 0) { state.downloadInactiveCount--; state.grants.set(token, []); }
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
+          // 401 注入（排在判权之后）：令牌失效落在本可成功的下载上——认证已过、履约竞态窗口内
+          // 被吊销，客户端的重试路径（而非首个 402 路径）遇到它。
+          if (state.downloadUnauthorizedCount > 0) { state.downloadUnauthorizedCount--; return error(res, 401, 'unauthorized', '令牌已失效。'); }
           // X-Skill-Version 声明所发内容的版本：badDownloadVersion 注入不匹配值（客户端头校验正例）。
           // X-Content-SHA256 是付费信道的摘要权威：badDownloadChecksum 注入错误值、dropDownloadChecksum 省略头。
           res.writeHead(200, {

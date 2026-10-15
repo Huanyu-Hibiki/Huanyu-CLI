@@ -267,6 +267,11 @@ async function list(ctx) {
   return 0;
 }
 
+// 「重跑即装」hint 的适用错误族（任务 7 审查收窄）：购买已确认后的重试失败里，只有重跑原命令
+// 有意义的那类才附 hint——inactive（履约竞态）、网络与下载/校验类（checksum/version/extract 等）。
+// 401（令牌吊销/失效）重跑无用，需要的是重新登录，按原语义透出不误导。
+const RERUN_HINT_ERRORS = new Set(['inactive', 'network', 'download', 'missing_checksum', 'checksum_mismatch', 'version_mismatch', 'too_large', 'extract', 'invalid_archive', 'skill_mismatch']);
+
 // 批量应用：按 Skill 名去重只准备（下载校验）一次，replaceAll 单事务覆盖全部目标——
 // 多动作共享备份与整批回滚（设计「错误处理」）。remove/link 动作不需要下载源。
 // 付费 skill 在入口已过权益闸门（requireEntitlement），这里的令牌下载（200 直连 + 响应头校验）
@@ -287,9 +292,9 @@ async function apply(ctx, actions, versions, { purchaseOnInactive = false, manag
         invalidateAccount(ctx);
         try { item = await prepare(ctx.client, name, versions[name], ctx.token, paid, product, ctx.signal); }
         catch (retry) {
-          // 购买已确认但重试仍失败（履约竞态/下载中断，任务 7 登记）：错误附 hint——重跑原命令即完成
-          // 安装，不会重复收费。购买已在服务端落地，用户此时最需要的是这句话而不是重走付款流程的暗示。
-          if (retry instanceof CliError) throw new CliError(retry.message, retry.code, retry.error, { ...retry.details, hint: t('purchasedRerunHint', { name: skillLabel(name) }) });
+          // 购买已确认但重试仍失败（任务 7 登记）：适用错误族附 hint——重跑原命令即完成安装，不会
+          // 重复收费。购买已在服务端落地，用户此时最需要的是这句话而不是重走付款流程的暗示。
+          if (retry instanceof CliError && RERUN_HINT_ERRORS.has(retry.error)) throw new CliError(retry.message, retry.code, retry.error, { ...retry.details, hint: t('purchasedRerunHint', { name: skillLabel(name) }) });
           throw retry;
         }
       }

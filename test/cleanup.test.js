@@ -108,14 +108,51 @@ test('重复 402 不重复购买：购买后重试仍 402 → 原错误透出（
 
 // 任务 7 登记落地（文案面）：已购后的重试失败在人类输出里带独立 hint 行——刚付完款的用户
 // 第一眼该看到「重跑即装、不会重复收费」，而不是只有「尚未购买」。
+// 审查修复（恒真断言）：真验证分行——末行是 hint、首行是原错误消息。
 test('购买后重试失败的人类输出：hint 作为独立行跟随错误消息（stderr）', async (t) => {
   const f = await fixture(t);
   await publishPaid(f);
   f.state.downloadInactiveCount = 2;
   const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN });
   assert.equal(human.code, 3);
-  assert.match(human.stderr, /已购买 ppt-design-pro：重新运行原命令即可完成安装，不会重复收费。/);
-  assert.ok(human.stderr.includes('\n'), 'hint 与错误消息分行');
+  const lines = human.stderr.trimEnd().split('\n');
+  assert.equal(lines.length, 2, `两行输出：${human.stderr}`);
+  assert.match(lines.at(-1), /^已购买 ppt-design-pro：重新运行原命令即可完成安装，不会重复收费。$/, 'hint 独立成行');
+  assert.match(lines[0], /^尚未购买 ppt-design-pro。/, '首行是原错误消息');
+});
+
+// 审查修复（英文路径）：hint 词条走 --lang en 的完整英文句。
+test('购买后重试失败的 hint 英文路径（--lang en）：末行英文词条、首行英文错误消息', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.downloadInactiveCount = 2;
+  const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--lang', 'en'], { HY_TOKEN: TOKEN });
+  assert.equal(human.code, 3);
+  const lines = human.stderr.trimEnd().split('\n');
+  assert.equal(lines.length, 2, `two lines expected: ${human.stderr}`);
+  assert.match(lines.at(-1), /^Already purchased ppt-design-pro: rerun the same command to finish installing; you will not be charged twice\.$/);
+  assert.match(lines[0], /^ppt-design-pro has not been purchased\./);
+});
+
+// 审查修复（hint 附加条件）：401（令牌吊销/失效）落在重试下载上时不附「重跑即装」hint——
+// 重跑无用，需要的是重新登录；hint 只对 inactive/网络/校验类（重跑有意义的）失败附加。
+test('重试失败的 401 不附 hint：令牌失效按原 unauthorized 语义透出（引导重新登录）', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.downloadInactiveCount = 1;      // 首次下载 402 → 内联购买（force）完成
+  f.state.downloadUnauthorizedCount = 1;  // 购买完成后的重试下载：令牌失效 → 401
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 3);
+  const last = events(result).at(-1);
+  assert.equal(last.error, 'unauthorized');
+  assert.equal(last.hint, undefined, '401 不得附「重跑即装」hint（重跑无用）');
+  // 人类输出同判别：重新注入同一竞态序列（首跑已消耗计数、轮询已恢复授权）。
+  f.state.downloadInactiveCount = 1;
+  f.state.downloadUnauthorizedCount = 1;
+  const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN });
+  assert.equal(human.code, 3);
+  assert.ok(!human.stderr.includes('不会重复收费'), '人类输出同样不带 hint');
+  assert.match(human.stderr, /登录已失效，请重新运行/, '按 401 原语义引导重新登录');
 });
 
 test('update 付费更新清理同宿主用户与项目根的免费版；跨宿主（qwenwork）不误清', async (t) => {

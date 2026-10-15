@@ -196,8 +196,8 @@ test('README 双语与 help 文案一致：14 命令齐备、说明逐字取自�
 
 test('skill 更新检查约定文档完整：端点与 DEFAULT_API 同步、开关与自更新命令齐备', async () => {
   const text = await readFile(new URL('../docs/skill-convention.md', import.meta.url), 'utf8');
-  assert.ok(text.includes('${HY_API:-https://store.huanyu.example}/api/store/versions'), '查询端点模板');
-  // DEFAULT_API 替换（发布检查清单第一项）时该文档必须同步，测试在此钉住。
+  // 端点模板由 DEFAULT_API 拼出：发布前替换占位地址（release-checklist 第 1 项）后本断言依然成立。
+  assert.ok(text.includes(`\${HY_API:-${DEFAULT_API}}/api/store/versions`), '查询端点模板');
   assert.ok(text.includes(DEFAULT_API), '端点默认值应与 src/client.js 的 DEFAULT_API 一致');
   assert.ok(text.includes('HY_NO_AUTO_UPDATE') && text.includes('HY_NO_UPDATE_CHECK'), '两个关闭开关');
   assert.ok(text.includes('npx github:Huanyu-Hibiki/Huanyu-CLI update <skill> --path "<安装路径>"'), '自更新命令模板');

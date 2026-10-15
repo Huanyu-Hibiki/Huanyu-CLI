@@ -58,7 +58,7 @@ Use `--to <host>` (an id from the table above) or `--to <path>` to choose target
 
 - Output follows your system language; use `--lang zh` / `--lang en` or the `HY_LANG` environment variable.
 - `--json` prints structured JSON (with `next_command` and friends for agents); errors go to stderr.
-- Exit codes: `0` success; `2` usage errors (including not-yet-implemented commands); `3` sign-in or purchase required.
+- Exit codes: `0` success; `1` general failures (network/verification/install/publish, with error details); `2` usage errors (including not-yet-implemented commands); `3` sign-in or purchase required; `130` forced exit on a second Ctrl+C (backup paths are printed to stderr).
 - Environment variables: `HY_API` overrides the store base URL (HTTPS required, except localhost); `HY_TOKEN` supplies a token directly (takes priority over local sign-in; for CI).
 
 ## Development

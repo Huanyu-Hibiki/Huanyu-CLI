@@ -565,7 +565,17 @@ export async function fixture(t) {
   };
   const close = async () => {
     await new Promise((resolve, reject) => { server.close((err) => err ? reject(err) : resolve()); server.closeAllConnections(); });
-    await rm(temporary, { recursive: true, force: true });
+    // Windows 收尾竞态（CI 实证，run 38773213795）：假浏览器的 node.exe 副本（~85MB）句柄在子进程
+    // 退出后短暂滞留，rm 偶发 ENOTEMPTY/EBUSY/EPERM——有界重试；仍失败则放弃清理（临时目录带
+    // hy-test- 前缀可辨认，宁可残留一个目录也不让收尾钩子假红），非句柄类错误照常抛出。
+    for (let attempt = 1; ; attempt++) {
+      try { await rm(temporary, { recursive: true, force: true }); return; }
+      catch (error) {
+        if (!['ENOTEMPTY', 'EBUSY', 'EPERM'].includes(error.code)) throw error;
+        if (attempt >= 3) { console.warn(`hy fixture: 收尾清理放弃（${error.code}）：${temporary}`); return; }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
   };
   t?.after(close);
   return { temporary, home, cwd, config, configFile, mockBin, tmp, env, base, state, run, close };

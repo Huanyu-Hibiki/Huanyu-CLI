@@ -151,6 +151,8 @@ test('versions 逐 skill 校验 latest semver 与 history 数组，非法 → in
     f.state.badVersions = true;
     await assert.rejects(() => client.versions(catalog), (error) => error instanceof CliError && error.code === 1 && error.error === 'invalid_response');
   } finally {
-    process.env.HY_API = previous;
+    // previous 为 undefined 时删除键，而不是把字符串 "undefined" 写进环境。
+    if (previous === undefined) delete process.env.HY_API;
+    else process.env.HY_API = previous;
   }
 });

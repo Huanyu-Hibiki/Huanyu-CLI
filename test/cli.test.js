@@ -10,8 +10,8 @@ const BIN = fileURLToPath(new URL('../bin/hy.js', import.meta.url));
 const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 const { version: VERSION } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
-// 任务 3 起登录域（login/logout/status）已实现；仍待实现的命令保持 not_implemented。
-const PENDING = ['update', 'manage', 'publish', 'product', 'unpublish', 'audit'];
+// 任务 4 起 publish 已实现；仍待实现的命令保持 not_implemented。
+const PENDING = ['update', 'manage', 'product', 'unpublish', 'audit'];
 
 // 语言相关环境固定为确定值（默认中文）；extraEnv 在其后展开以便覆盖测试环境变量通道。
 const BASE_ENV = { HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_TOKEN: '', CI: '' };
@@ -61,13 +61,12 @@ test('hy help 中英双语列出全部命令；--help 与 -h 同效', async () =
   assert.match(en.stdout, /status \(default\)/);
   for (const name of COMMANDS) assert.ok(en.stdout.includes(name), name);
   assert.ok(!en.stdout.includes('用法：'));
-  // help 只宣传解析层当前接受的参数；publish 的 --repo/--all/--check 随任务 4 扩展解析层后再写全。
-  assert.ok(zh.stdout.includes('npx github:Huanyu-Hibiki/Huanyu-CLI publish  发布 Skill'));
-  assert.ok(en.stdout.includes('npx github:Huanyu-Hibiki/Huanyu-CLI publish  Publish a skill'));
-  for (const flag of ['--repo', '--all', '--check']) {
-    assert.ok(!zh.stdout.includes(flag), flag);
-    assert.ok(!en.stdout.includes(flag), flag);
-  }
+  // publish 参数面在任务 4 补全：目录位置参数 + --repo/--all/--check/--notes（任务 1 审查预留的回归点）。
+  assert.ok(zh.stdout.includes('npx github:Huanyu-Hibiki/Huanyu-CLI publish <目录>'));
+  assert.ok(zh.stdout.includes('--repo'));
+  assert.ok(zh.stdout.includes('--all'));
+  assert.ok(zh.stdout.includes('--check'));
+  assert.ok(en.stdout.includes('npx github:Huanyu-Hibiki/Huanyu-CLI publish <directory>'));
   assert.equal((await run(['--help'])).stdout, zh.stdout);
   assert.equal((await run(['-h'])).stdout, zh.stdout);
 });
@@ -178,6 +177,30 @@ test('install/subscribe 缺 Skill 名或非法 Skill 名退出码 2', async () =
     assert.equal(data(result).error, error, args.join(' '));
   }
   assert.match((await run(['install'])).stderr, /需要 Skill 名/);
+});
+
+test('publish 参数面：目录与 --repo 互斥、--all/--check 依赖 --repo 且互斥、其他命令不接受发布参数', async () => {
+  for (const [args, error] of [
+    [['publish'], 'usage'],
+    [['publish', '--repo'], 'missing_argument'],
+    [['publish', '--notes'], 'missing_argument'],
+    [['publish', 'dir', '--repo', 'repo'], 'usage'],
+    [['publish', 'dir', '--check'], 'usage'],
+    [['publish', 'dir', '--all'], 'usage'],
+    [['publish', 'dir', 'extra'], 'usage'],
+    [['publish', '--repo', 'repo', '--all', '--check'], 'usage'],
+    [['list', '--repo', 'x'], 'usage'],
+    [['list', '--all'], 'usage'],
+    [['status', '--check'], 'usage'],
+    [['login', '--notes', '说明'], 'usage'],
+    [['--version', '--repo', 'x'], 'usage'],
+  ]) {
+    const result = await run([...args, '--json']);
+    assert.equal(result.code, 2, args.join(' '));
+    assert.equal(data(result).error, error, args.join(' '));
+  }
+  assert.match((await run(['publish'])).stderr, /publish 需要一个 Skill 目录，或用 --repo <路径> 指向仓库。/);
+  assert.match((await run(['publish', '--repo'], { HY_LANG: 'en' })).stderr, /--repo requires a value\./);
 });
 
 test('未实现命令执行时退出码 2，error 为 not_implemented 并使用中性文案', async () => {

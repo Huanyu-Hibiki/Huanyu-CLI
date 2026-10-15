@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, copyFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,7 +47,14 @@ export async function mockCommandProcessor(directory) {
   return { executable: path.join(directory, 'cmd.exe'), nodeOptions: `--require "${helper.replaceAll('\\', '/')}"` };
 }
 
-// 假商店：绑定 127.0.0.1 随机端口，提供 catalog/versions 与 device/token/me/logout/approve 端点（契约见设计「接口设计」）；
+// 语义化版本比较：versions 合并已发布内容时提升 latest（任务 4）。
+const compareVersions = (a, b) => {
+  const aa = a.split('.').map(Number), bb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (aa[i] !== bb[i]) return aa[i] > bb[i] ? 1 : -1;
+  return 0;
+};
+
+// 假商店：绑定 127.0.0.1 随机端口，提供 catalog/versions/publish/releases 与 device/token/me/logout/approve 端点（契约见设计「接口设计」）；
 // 请求全部记入 state.requests，目录与设备流数据可直接改写用于错误注入。
 export async function fixture(t) {
   let temporary = await mkdtemp(path.join(tmpdir(), 'hy-test-'));
@@ -67,7 +75,10 @@ export async function fixture(t) {
   const state = { catalog: structuredClone(CATALOG), catalogShape: 'products', latest: '0.1.0', badVersions: false, failWith: null, requests: [],
     deviceStatuses: ['authorization_pending', 'success'], deviceStatusesByRequest: null, devicePolls: 0, deviceRequests: 0,
     interval: 5, expiresIn: 600, deviceApproved: false, requireApproval: false, deviceToken: null, deviceErrorMessage: null,
-    deviceCode: null, userCode: null, logoutFailure: false, revoked: new Set(), grants: new Map() };
+    deviceCode: null, userCode: null, logoutFailure: false, revoked: new Set(), grants: new Map(),
+    // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
+    // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
+    publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -83,9 +94,11 @@ export async function fixture(t) {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, base);
-      let text = '';
-      for await (const chunk of req) text += chunk;
-      const body = text ? JSON.parse(text) : null;
+      // 请求体按原始字节收集：publish 上传的是 gzip 二进制，JSON 只对 JSON 端点解析。
+      let raw = Buffer.alloc(0);
+      for await (const chunk of req) raw = Buffer.concat([raw, chunk]);
+      let body = null;
+      if (raw.length) { try { body = JSON.parse(raw.toString('utf8')); } catch { body = null; } }
       const token = req.headers.authorization?.replace(/^Bearer /, '');
       const english = req.headers['accept-language'] === 'en';
       state.requests.push({ method: req.method, path: url.pathname, query: url.searchParams, token, body, headers: req.headers });
@@ -108,7 +121,47 @@ export async function fixture(t) {
           const name = typeof product[type] === 'string' ? product[type] : product[type]?.skill;
           if (name) skills[name] = { latest: state.badVersions ? 'oops' : state.latest, published_at: '2026-10-15T08:00:00Z', history };
         }
+        // 已发布版本合并进版本表：latest 按语义版本提升、history 追加（供 --repo 对账与任务 6/7 安装闭环消费）。
+        for (const [key, entry] of state.published) {
+          const [name, version] = key.split(':');
+          const current = skills[name] ?? { latest: '0.0.0', published_at: entry.published_at, history: [] };
+          const latest = compareVersions(version, current.latest) > 0 ? version : current.latest;
+          const merged = [...current.history.filter((item) => item.version !== version),
+            { version, published_at: entry.published_at, notes: entry.notes || (english ? `${version}: Published with hy CLI.` : `${version}：经 hy CLI 发布。`) }]
+            .sort((a, b) => -compareVersions(a.version, b.version));
+          // latest 仍是目录默认版本（发布的版本更低）时没有对应发布物，摘要字段省略。
+          const top = state.published.get(`${name}:${latest}`);
+          skills[name] = { latest, published_at: entry.published_at, history: merged,
+            download_url: `${base}/releases/${name}-${latest}.tar.gz`, ...(top ? { sha256: top.sha256 } : {}) };
+        }
         return json(res, 200, { skills });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/store/publish') {
+        if (!authenticate()) return;
+        // publishStatus 注入：数字为持续生效；数组按请求顺序消耗（模拟对账后、上传前被别人抢先发布的 409 等）。
+        const status = Array.isArray(state.publishStatus) ? state.publishStatus.shift() : state.publishStatus;
+        const injected = status ? { 400: 'invalid_package', 403: 'not_a_publisher', 409: 'version_exists', 413: 'too_large' }[status] : null;
+        if (injected) return error(res, status, injected, '注入的发布失败。');
+        if (!state.publishers.has(token)) return error(res, 403, 'not_a_publisher', '没有发布权限。');
+        const name = req.headers['x-skill-name'], version = req.headers['x-skill-version'], sha256 = req.headers['x-content-sha256'];
+        if (!/^[a-z0-9][a-z0-9-]*$/.test(String(name || '')) || !/^\d+\.\d+\.\d+$/.test(String(version || ''))
+          || !/^[0-9a-f]{64}$/.test(String(sha256 || '')) || !String(req.headers['content-type'] || '').startsWith('application/gzip')) return error(res, 400, 'invalid_package', '发布头不完整。');
+        if (createHash('sha256').update(raw).digest('hex') !== sha256) return error(res, 400, 'invalid_package', '摘要不一致。');
+        const existing = state.published.get(`${name}:${version}`);
+        if (existing) {
+          // 设计「假设清单」#1：同 sha256 重传幂等成功；内容不同才是版本冲突。
+          if (existing.sha256 === sha256) return json(res, 200, { skill: name, version, sha256, size: existing.size, url: `${base}/releases/${name}-${version}.tar.gz`, existing: true });
+          return error(res, 409, 'version_exists', '该版本已发布。');
+        }
+        state.published.set(`${name}:${version}`, { body: raw, sha256, size: raw.length, notes: decodeURIComponent(req.headers['x-notes'] || ''), published_at: new Date().toISOString() });
+        return json(res, 200, { skill: name, version, sha256, size: raw.length, url: `${base}/releases/${name}-${version}.tar.gz` });
+      }
+      if (req.method === 'GET' && url.pathname.startsWith('/releases/')) {
+        const match = url.pathname.match(/^\/releases\/(.+)-(\d+\.\d+\.\d+)\.tar\.gz$/);
+        const entry = match ? state.published.get(`${match[1]}:${match[2]}`) : null;
+        if (!entry) return error(res, 404, 'not_found', '没有该版本。');
+        res.writeHead(200, { 'Content-Type': 'application/gzip' });
+        return res.end(entry.body);
       }
       if (req.method === 'POST' && url.pathname === '/api/cli/device') {
         state.deviceRequests++;
@@ -136,7 +189,8 @@ export async function fixture(t) {
       }
       if (req.method === 'GET' && url.pathname === '/api/auth/me') {
         if (!authenticate()) return;
-        return json(res, 200, { email: EMAIL, subscriptions: subscriptions(token) });
+        // publisher 是契约字段（设计「接口设计」）；dropPublisher 用于缺字段的 invalid_response 测试。
+        return json(res, 200, { email: EMAIL, subscriptions: subscriptions(token), ...(state.dropPublisher ? {} : { publisher: state.publishers.has(token) }) });
       }
       if (req.method === 'POST' && url.pathname === '/api/cli/logout') {
         if (state.logoutFailure) return error(res, 503, 'unavailable', '模拟网络失败。');

@@ -4,23 +4,26 @@ import { readFile } from 'node:fs/promises';
 import { Output, CliError, ask, canPrompt, confirm } from './io.js';
 import { readSavedAuth, logout as deleteConfig } from './config.js';
 import { Client, catalogNames, isSkillName } from './client.js';
-import { login, loadAuth } from './auth.js';
+import { login, loadAuth, requireLogin } from './auth.js';
 import { openBrowser } from './browser.js';
+import { publishSkill, publishRepo } from './publish.js';
 
-// 14 个命令全部在参数解析层合法；help/version/list/login/logout/status 之外的执行逻辑随后续任务落地。
+// 14 个命令全部在参数解析层合法；help/version/list/login/logout/status/publish 之外的执行逻辑随后续任务落地。
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
 
 export function parseArgs(argv) {
-  const options = { command: null, json: false, yes: false, to: [], token: null, plan: null, path: null, skill: null, lang: null };
+  const options = { command: null, json: false, yes: false, to: [], token: null, plan: null, path: null, skill: null, lang: null, repo: null, notes: null, all: false, check: false };
   const positions = [];
   let version = false, helpFlag = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--json') options.json = true;
     else if (arg === '--yes') options.yes = true;
+    else if (arg === '--all') options.all = true;
+    else if (arg === '--check') options.check = true;
     else if (arg === '--version') version = true;
     else if (['--help', '-h'].includes(arg)) helpFlag = true;
-    else if (/^--(to|token|plan|path|lang)(=|$)/.test(arg)) {
+    else if (/^--(to|token|plan|path|lang|repo|notes)(=|$)/.test(arg)) {
       const flag = arg.split('=')[0], field = flag.slice(2);
       const value = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : argv[++i];
       if (!value || value.startsWith('-')) throw new CliError(t('missingArgument', { flag }), 2, 'missing_argument');
@@ -34,7 +37,7 @@ export function parseArgs(argv) {
   }
   options.command = positions.shift() || 'status';
   if (version) {
-    if (positions.length || options.command !== 'status' || options.to.length || options.token || options.plan || options.path || helpFlag || argv.includes('status')) throw new CliError(t('versionUsage'), 2, 'usage');
+    if (positions.length || options.command !== 'status' || options.to.length || options.token || options.plan || options.path || options.repo || options.notes || options.all || options.check || helpFlag || argv.includes('status')) throw new CliError(t('versionUsage'), 2, 'usage');
     options.command = 'version';
   } else if (helpFlag) { options.command = 'help'; positions.length = 0; }
   if (!COMMANDS.includes(options.command)) throw new CliError(t('unknownCommand'), 2, 'usage');
@@ -43,7 +46,15 @@ export function parseArgs(argv) {
     if (!options.skill && options.command !== 'update') throw new CliError(t('missingSkill', { action: command(options.command) }), 2, 'missing_skill');
     if (options.skill && !isSkillName(options.skill)) throw new CliError(t('invalidSkill'), 2, 'usage');
   }
-  if (positions.length || (options.to.length && options.command !== 'install') || (options.token !== null && options.command !== 'login') || (options.plan !== null && options.command !== 'subscribe') || (options.path !== null && options.command !== 'update')) throw new CliError(t('wrongArgument'), 2, 'usage');
+  // publish：一个位置参数（Skill 目录）或 --repo <路径>（可加 --all/--check），二者互斥。
+  if (options.command === 'publish') {
+    options.directory = positions.shift() || null;
+    if (!options.directory && options.repo === null) throw new CliError(t('publishUsage'), 2, 'usage');
+    if (options.directory && options.repo !== null) throw new CliError(t('wrongArgument'), 2, 'usage');
+    if ((options.all || options.check) && options.repo === null) throw new CliError(t('wrongArgument'), 2, 'usage');
+    if (options.all && options.check) throw new CliError(t('wrongArgument'), 2, 'usage');
+  }
+  if (positions.length || (options.to.length && options.command !== 'install') || (options.token !== null && options.command !== 'login') || (options.plan !== null && options.command !== 'subscribe') || (options.path !== null && options.command !== 'update') || (options.repo !== null && options.command !== 'publish') || (options.notes !== null && options.command !== 'publish') || ((options.all || options.check) && options.command !== 'publish')) throw new CliError(t('wrongArgument'), 2, 'usage');
   return options;
 }
 
@@ -157,6 +168,15 @@ async function runCommand(argv, runtime) {
       ctx.catalog = await ctx.client.catalog();
       ctx.names = catalogNames(ctx.catalog);
       return await list(ctx);
+    }
+    if (options.command === 'publish') {
+      // 发布是鉴权操作：先完成登录，再确认账号有 publisher 角色（无角色 → 退出码 3 登录引导）。
+      await requireLogin(ctx);
+      const account = await ctx.client.me(ctx.token);
+      if (account.publisher !== true) throw new CliError(t('notPublisher'), 3, 'not_a_publisher', { next_command: command('login') });
+      if (options.repo !== null) return await publishRepo(ctx, options.repo, { all: options.all, check: options.check, notes: options.notes });
+      await publishSkill(ctx, options.directory, { notes: options.notes });
+      return 0;
     }
     throw new CliError(t('notImplemented', { name: options.command }), 2, 'not_implemented');
   } catch (error) {

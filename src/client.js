@@ -1,9 +1,9 @@
 import { t, language, command, skillLabel } from './i18n.js';
 import { CliError } from './io.js';
+import { isSkillName, isVersion } from './skills.js';
 
-// 规范名与 semver 校验暂驻 client.js；任务 5 的 skills.js 数据层落地后统一收编。
-export const isSkillName = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(value);
-export const isVersion = (value) => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value);
+// 规范名与 semver 校验随任务 4 的 skills.js 数据层收编；这里保留再导出以免调用方漂移。
+export { isSkillName, isVersion };
 
 const invalid = (message) => new CliError(message, 1, 'invalid_response');
 
@@ -64,7 +64,7 @@ export class Client {
     const page = typeof product?.page === 'string' && /^\/(?!\/)/.test(product.page) ? product.page : `/store/${encodeURIComponent(skill)}/`;
     return this.url(page);
   }
-  async request(route, { token, method = 'GET', body, download = false, skill, product, timeoutMs = 30_000 } = {}) {
+  async request(route, { token, method = 'GET', body, headers = {}, download = false, skill, product, timeoutMs = 30_000 } = {}) {
     if (token && /[\r\n\0]/.test(token)) throw new CliError(t('invalidToken'), 3, 'unauthorized');
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -72,14 +72,18 @@ export class Client {
     this.signal.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(abort, download ? 120_000 : timeoutMs);
     const dispose = () => { clearTimeout(timer); this.signal.removeEventListener('abort', abort); };
+    // 二进制体（Uint8Array/Buffer）按原始字节发送并由调用方提供配套头；其余按 JSON 编码。
+    const binary = body instanceof Uint8Array;
     let handedOff = false;
     try {
       const address = /^https?:\/\//.test(route) ? route : this.url(route);
       // API 不得重定向；免费发布物可以跳到公开附件，且不携带令牌。
       const response = await fetch(address, {
         method,
-        headers: { 'Accept-Language': this.lang, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: controller.signal,
+        headers: { 'Accept-Language': this.lang,
+          ...(body !== undefined ? { 'Content-Type': binary ? 'application/gzip' : 'application/json' } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+        ...(body !== undefined ? { body: binary ? body : JSON.stringify(body) } : {}), signal: controller.signal,
         redirect: download && !token ? 'follow' : 'error',
       });
       if (download && response.ok) { handedOff = true; return { response, dispose }; }
@@ -118,7 +122,20 @@ export class Client {
   }
   async me(token, options = {}) {
     const data = await this.request('/api/auth/me', { token, ...options });
-    if (typeof data?.email !== 'string' || !data.email || !Array.isArray(data.subscriptions)) throw invalid(t('invalidAccount'));
+    // publisher 是设计契约字段（发布端鉴权）：缺字段按 invalid_response 拒绝（任务 3 审查登记）。
+    if (typeof data?.email !== 'string' || !data.email || !Array.isArray(data.subscriptions) || typeof data.publisher !== 'boolean') throw invalid(t('invalidAccount'));
+    return data;
+  }
+  // 发布上传（设计「接口设计·发布端」）：体为 tar.gz 二进制，名字/版本/摘要在 X- 头里；
+  // 错误语义 409 version_exists / 403 not_a_publisher / 400 invalid_package / 413 too_large 由调用方映射。
+  async publish(token, { name, version, sha256, body, notes }) {
+    const data = await this.request('/api/store/publish', {
+      token, method: 'POST', body, timeoutMs: 120_000,
+      // 说明文本经百分号编码放进头：HTTP 头不接受非 ASCII 字节。
+      headers: { 'X-Skill-Name': name, 'X-Skill-Version': version, 'X-Content-SHA256': sha256, ...(notes ? { 'X-Notes': encodeURIComponent(notes) } : {}) },
+    });
+    if (data?.skill !== name || data?.version !== version || data?.sha256 !== sha256
+      || !Number.isSafeInteger(data?.size) || data.size !== body.length || typeof data?.url !== 'string' || !data.url) throw invalid(t('publishResponse'));
     return data;
   }
 }

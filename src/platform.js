@@ -10,3 +10,14 @@ export const userHome = (env = process.env, platform = process.platform) =>
 export async function restrictPermissions(file, platform = process.platform, changeMode = chmod) {
   if (platform !== 'win32') await changeMode(file, 0o600);
 }
+
+export function tarInvocation(archive, destination, platform = process.platform, env = process.env) {
+  const paths = pathsFor(platform);
+  const windows = env.SystemRoot || env.WINDIR;
+  return {
+    command: platform === 'win32' ? windows ? paths.join(windows, 'System32', 'tar.exe') : 'tar.exe' : 'tar',
+    // 归档名不带盘符，兼容 bsdtar 和 GNU tar；不使用 GNU 专有的 --force-local。
+    args: ['-xzf', paths.basename(archive), '-C', destination],
+    cwd: paths.dirname(archive),
+  };
+}

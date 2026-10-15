@@ -4,6 +4,8 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolveLanguage, withLanguage, t, helpLines, formatCommand, command, COMMAND } from '../src/i18n.js';
 import { CliError, Output } from '../src/io.js';
+import { parseSkill, compare } from '../src/skills.js';
+import { canonicalName } from '../src/publish.js';
 
 const TOKEN = 'hy_Abcd0123456789abcdefghijklmnopqrstuvXYZ';
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
@@ -52,6 +54,41 @@ test('command() 拼出可复制命令，特殊字符按平台引用', () => {
   assert.equal(formatCommand(['install', 'demo skill'], 'win32'), `${COMMAND} install 'demo skill'`);
   assert.equal(formatCommand(['install', "it's"], 'win32'), `${COMMAND} install 'it''s'`);
   assert.equal(formatCommand(['install', "it's"], 'linux'), `${COMMAND} install 'it'\\''s'`);
+});
+
+test('frontmatter 最小解析：引号、注释、CRLF、行内 metadata；重复 name 无效、不执行 YAML 标签', () => {
+  assert.deepEqual(parseSkill('\uFEFF---\r\nname: "ppt-design" # 注释\r\nmetadata:\r\n  version: \'0.2.0\' # 注释\r\n---\r\n'), { name: 'ppt-design', version: '0.2.0' });
+  assert.deepEqual(parseSkill('---\nname: ppt-design-pro\nmetadata: {version: "1.0.0"}\n---\n'), { name: 'ppt-design-pro', version: '1.0.0' });
+  assert.equal(parseSkill('---\nname: ppt-design\nmetadata: {author: "a, b", version: "0.2.0", other: [a, b]} # 注释\n---\n').version, '0.2.0');
+  assert.equal(parseSkill('---\nname: ppt-design\nmetadata:\n  other:\n    version: 9.9.9\n  version: 0.2.0\n---\n').version, '0.2.0');
+  assert.equal(parseSkill('---\nname: ppt-design\nname: unrelated\n---\n').name, null);
+  assert.equal(parseSkill('# 文档\nname: ppt-design\n').name, null);
+  assert.equal(parseSkill('---\nname: ppt-design\nmetadata:\n  version: 01.0.0\n---\n').version, null);
+  // YAML 标签不执行：字面量字符串不是语义化版本即无效。
+  assert.equal(parseSkill('---\nname: ppt-design\nmetadata:\n  version: "{{ eval }}"\n---\n').version, null);
+  assert.equal(parseSkill('---\nname: ppt-design\n---\n').version, null);
+});
+
+test('规范名映射：frontmatter 合法 name 优先；目录名小写化并去掉非法字符；数字开头或清理后为空拒绝', () => {
+  withLanguage({ lang: 'zh' }, () => {
+    assert.equal(canonicalName('PPT-design', null), 'ppt-design');
+    assert.equal(canonicalName('My_Skill 2', null), 'myskill2');
+    assert.equal(canonicalName('anything', 'oracle-bone'), 'oracle-bone');
+    // frontmatter name 非法（大写/空格）时回落目录名推导。
+    assert.equal(canonicalName('good-dir', 'Not Legal'), 'good-dir');
+    assert.equal(canonicalName('good-dir', 'UPPER'), 'good-dir');
+    for (const bad of ['1abc', '2024-notes', '中文', '-x', '___', '']) {
+      assert.throws(() => canonicalName(bad, null), (error) => error instanceof CliError && error.error === 'invalid_skill_name', bad);
+    }
+  });
+});
+
+test('语义化版本比较：BigInt 逐段、跳版本可比', () => {
+  assert.ok(compare('0.10.0', '0.9.0') > 0);
+  assert.ok(compare('0.9.9', '0.10.0') < 0);
+  assert.ok(compare('1.0.0', '1.0.0') === 0);
+  assert.ok(compare('2.0.0', '1.99.99') > 0);
+  assert.ok(compare('0.2.10', '0.2.9') > 0);
 });
 
 test('CliError 携带退出码、错误码与详情，默认 1/failed', () => {

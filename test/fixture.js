@@ -27,7 +27,7 @@ export async function fixture(t) {
   const home = path.join(temporary, 'home'), cwd = path.join(temporary, 'project'), config = path.join(temporary, 'config'), mockBin = path.join(temporary, 'bin');
   // bin 为任务 3 的假浏览器 helper 预留；任务 2 尚不注入。
   for (const directory of [home, cwd, config, mockBin]) await mkdir(directory);
-  const state = { catalog: structuredClone(CATALOG), catalogShape: 'products', latest: '0.1.0', badVersions: false, requests: [] };
+  const state = { catalog: structuredClone(CATALOG), catalogShape: 'products', latest: '0.1.0', badVersions: false, failWith: null, requests: [] };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
@@ -41,6 +41,8 @@ export async function fixture(t) {
       const english = req.headers['accept-language'] === 'en';
       state.requests.push({ method: req.method, path: url.pathname, query: url.searchParams, token, body, headers: req.headers });
       if (req.method === 'GET' && url.pathname === '/api/store/catalog') {
+        // 通用错误注入：failWith 命中 catalog/versions 时按它返回错误 JSON（error/message 可省略）。
+        if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);
         // 外层形状可切换：{products}（默认）/ 裸数组 / {catalog} / 无法识别，客户端前三种都要接受。
         const products = state.catalog.map(({ summaryEn, ...product }) => ({ ...product, summary: english ? summaryEn : product.summary }));
         if (state.catalogShape === 'array') return json(res, 200, products);
@@ -49,6 +51,7 @@ export async function fixture(t) {
         return json(res, 200, { products });
       }
       if (req.method === 'GET' && url.pathname === '/api/store/versions') {
+        if (state.failWith) return error(res, state.failWith.status, state.failWith.error, state.failWith.message);
         const history = ['0.1.0', '0.0.9'].map((version) => ({ version, published_at: '2026-10-15T08:00:00Z', notes: english ? `${version}: First pilot release.` : `${version}：首个试点版本。` }));
         const skills = {};
         for (const product of state.catalog) for (const type of ['free', 'paid']) {

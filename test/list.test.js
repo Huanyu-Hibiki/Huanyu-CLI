@@ -161,7 +161,7 @@ test('服务端 401 → unauthorized 退出码 3（登录引导），双语提�
   assert.match(zh.stderr, /登录已失效，请重新运行 npx github:Huanyu-Hibiki\/Huanyu-CLI login。/);
   const en = await f.run(['list', '--lang', 'en']);
   assert.equal(en.code, 3);
-  assert.match(en.stderr, /Sign-in has expired\. Run npx github:Huanyu-Hibiki\/Huanyu-CLI login\./);
+  assert.match(en.stderr, /Sign-in has expired\. Run npx github:Huanyu-Hibiki\/Huanyu-CLI login again\./);
   const value = data(await f.run(['list', '--json']));
   assert.equal(value.ok, false);
   assert.equal(value.error, 'unauthorized');

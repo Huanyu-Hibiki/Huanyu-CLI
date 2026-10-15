@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN } from './fixture.js';
+import { command } from '../src/i18n.js';
 
 const data = (result) => {
   assert.equal(result.signal, null, result.stderr);
@@ -283,19 +284,46 @@ test('过滤种：update <skill> 只更新指定 Skill；未知 Skill 名拒绝'
   assert.equal(data(unknown).error, 'unknown_skill');
 });
 
-test('付费 Skill 的 update 沿用一期购买引导拦截：exit 3 purchase_unavailable，不发下载', async (t) => {
+// —— 付费更新路径（二期任务 3）：逐 skill 权益判定，整批原子（未购付费拦截时免费也不装一半） ——
+
+// 发布一个付费版本供下载端点消费（种子发布物只覆盖免费 skill），再装回旧版本制造过期。
+const publishPaid = async (f, installed = '0.0.9') => {
+  await writeSkill(f.cwd, 'ppt-design-pro', '0.2.0');
+  const result = await f.run(['publish', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  return writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design-pro', installed);
+};
+
+test('已购付费 skill 过期：update 令牌直连下载更新成功，全程无 302', async (t) => {
   const f = await fixture(t);
-  await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design-pro', '0.0.9');
-  const result = await f.run(['update', '--json']);
+  const target = await publishPaid(f);
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const value = data(result);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design-pro', path: target, previous: '0.0.9', version: '0.2.0' }]);
+  assert.equal(await versionOf(target), '0.2.0');
+  const downloads = f.state.requests.filter((r) => r.path === '/api/store/download/ppt-design-pro');
+  assert.deepEqual(downloads.map((r) => r.token), [TOKEN]);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/releases/')), '付费下载不得 302 到公开附件');
+});
+
+test('混合批量：免费过期 + 未购付费过期 → exit 3 指向未购付费 skill，免费未被安装（整批原子）', async (t) => {
+  const f = await fixture(t);
+  const paid = await publishPaid(f);
+  const free = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
+  f.state.grants.set(TOKEN, []);
+  const result = await f.run(['update', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(result.code, 3);
   const value = data(result);
-  assert.equal(value.error, 'purchase_unavailable');
-  assert.equal(value.phase2, true);
-  assert.equal(value.url, `${f.base}/store/ppt-design-pro/`);
-  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download') || r.path.startsWith('/releases/')), '付费引导拦截不应进入下载');
-  const human = await f.run(['update']);
-  assert.equal(human.code, 3);
-  assert.match(human.stderr, /暂未开放购买/);
+  assert.equal(value.ok, false);
+  assert.equal(value.error, 'inactive');
+  assert.equal(value.subscribe_command, command('subscribe', 'ppt-design-pro'));
+  assert.equal(value.subscription_url, `${f.base}/store/ppt-design-pro/`);
+  assert.match(value.message, /尚未购买 ppt-design-pro/);
+  // 整批未开始：付费与免费目标都保持原版本，且没有发生任何下载。
+  assert.equal(await versionOf(paid), '0.0.9', '付费目标不应被更新');
+  assert.equal(await versionOf(free), '0.0.9', '免费目标不应装一半');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '权益拦截不应进入下载');
 });
 
 test('交互确认更新数量；拒绝 → updateCanceled（exit 0）且未动目标', async (t) => {

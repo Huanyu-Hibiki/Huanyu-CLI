@@ -118,6 +118,9 @@ export async function fixture(t) {
     deviceStatuses: ['authorization_pending', 'success'], deviceStatusesByRequest: null, devicePolls: 0, deviceRequests: 0,
     interval: 5, expiresIn: 600, deviceApproved: false, requireApproval: false, deviceToken: null, deviceErrorMessage: null,
     deviceCode: null, userCode: null, logoutFailure: false, revoked: new Set(), grants: new Map(),
+    // 管理门户（二期任务 3）：portalUrl 注入门户响应 URL（null 走默认 /account/；空串模拟缺字段）；
+    // subscriptionStatus 覆盖订阅状态（权益判定的有效/无效状态正反例）。
+    portalUrl: null, subscriptionStatus: null,
     // 发布端（任务 4）：publishers 为有发布角色的令牌集合（TOKEN 默认在内，TOKEN2 需 grants 注册后仍不在）；
     // published 按 `name:version` 存 {body, sha256, size, notes, published_at}；publishStatus 强制注入错误；dropPublisher 让 me 缺字段。
     publishers: new Set([TOKEN]), published: new Map(), publishStatus: null, dropPublisher: false,
@@ -128,17 +131,20 @@ export async function fixture(t) {
     // dropChecksum 让 versions 省略摘要（fail-closed 测试）、badChecksum 让 versions 下发错误摘要、
     // corruptBody 让 /releases 截断正文（客户端读到不完整流）、releaseDelay 压住发布物响应模拟慢下载、
     // versionsDelay 压住版本表响应（构造 scan 之后、下载之前的目标变动窗口，update 预检测试用）。
-    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0, versionsDelay: 0 };
+    releases: new Map(await defaultReleases()), dropChecksum: false, badChecksum: false, corruptBody: false, releaseDelay: 0, versionsDelay: 0,
+    // 付费下载（二期任务 3）：badDownloadVersion 让下载端点回错误的 X-Skill-Version（头校验正例）。
+    badDownloadVersion: false };
   let base;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const error = (res, status, code, message) => json(res, status, { error: code, message });
   // 登录账号的订阅列表按 grants 生成；默认把目录里的全部付费 Skill 授予 TOKEN。
+  // subscriptionStatus 覆盖生成的状态（默认按方案给 lifetime/active），供权益判定的正反例注入。
   const subscriptions = (token) => {
     const names = state.grants.get(token) || (token === TOKEN ? state.catalog.flatMap((p) => p.paid ? [p.paid.skill] : []) : []);
     return names.map((skill) => {
       const product = state.catalog.find((p) => p.paid?.skill === skill);
       const plan = product?.offer?.[0] || 'lifetime';
-      return { skill, name: product?.name || skill, plan, status: plan === 'lifetime' ? 'lifetime' : 'active', renews: plan === 'lifetime' ? null : 1793664000, ends: null };
+      return { skill, name: product?.name || skill, plan, status: state.subscriptionStatus || (plan === 'lifetime' ? 'lifetime' : 'active'), renews: plan === 'lifetime' ? null : 1793664000, ends: null };
     });
   };
   const server = createServer(async (req, res) => {
@@ -318,7 +324,8 @@ export async function fixture(t) {
         if (product.paid?.skill === name) {
           if (!authenticate()) return;
           if (!subscriptions(token).some((subscription) => subscription.skill === name)) return error(res, 402, 'inactive', '尚未购买。');
-          res.writeHead(200, { 'Content-Type': 'application/gzip', 'X-Content-SHA256': entry.sha256, 'X-Skill-Version': version });
+          // X-Skill-Version 声明所发内容的版本：badDownloadVersion 注入不匹配值（客户端头校验正例）。
+          res.writeHead(200, { 'Content-Type': 'application/gzip', 'X-Content-SHA256': entry.sha256, 'X-Skill-Version': state.badDownloadVersion ? '9.9.9' : version });
           return res.end(entry.body);
         }
         res.writeHead(302, { Location: `${base}/releases/${name}-${version}.tar.gz` });
@@ -375,6 +382,11 @@ export async function fixture(t) {
         if (!authenticate()) return;
         // publisher 是契约字段（设计「接口设计」）；dropPublisher 用于缺字段的 invalid_response 测试。
         return json(res, 200, { email: EMAIL, subscriptions: subscriptions(token), ...(state.dropPublisher ? {} : { publisher: state.publishers.has(token) }) });
+      }
+      // 账号管理门户（二期任务 3，契约：POST 🔒 → { url }）：portalUrl 注入响应 URL（空串模拟缺字段）。
+      if (req.method === 'POST' && url.pathname === '/api/account/portal') {
+        if (!authenticate()) return;
+        return json(res, 200, { url: state.portalUrl ?? `${base}/account/` });
       }
       if (req.method === 'POST' && url.pathname === '/api/cli/logout') {
         if (state.logoutFailure) return error(res, 503, 'unavailable', '模拟网络失败。');

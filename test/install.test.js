@@ -4,7 +4,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { fixture, writeSkill, linkDirectory, readDirectoryLink } from './fixture.js';
+import { fixture, writeSkill, linkDirectory, readDirectoryLink, TOKEN } from './fixture.js';
 import { interruptBackups } from '../src/cli.js';
 import { isSkillName } from '../src/skills.js';
 import { prepare, replaceAll } from '../src/install.js';
@@ -185,19 +185,104 @@ test('下载期间目标变成开发目录 → rename 前双重保护拦截并�
   assert.deepEqual(await stageLeftovers(root), []);
 });
 
-test('付费 skill 一期前置拦截：exit 3 purchase_unavailable + 商品页 URL，未发下载请求', async (t) => {
+// —— 付费下载路径（二期任务 3）：requireEntitlement 已购放行、未购 exit 3 inactive 引导 ——
+
+// 种子发布物只覆盖免费 skill：付费版本先经 publish 落进商店，下载端点才有内容可发。
+const publishPaid = async (f, version = '0.2.0') => {
+  await writeSkill(f.cwd, 'ppt-design-pro', version);
+  const result = await f.run(['publish', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+};
+const downloadsOf = (f, name) => f.state.requests.filter((r) => r.path === `/api/store/download/${name}`);
+
+test('已购付费 skill 一条命令安装（多宿主）：Bearer 直连 200、全程无 302 跳转', async (t) => {
   const f = await fixture(t);
-  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json']);
+  await publishPaid(f);
+  await threeHosts(f);
+  const result = await f.run(['install', 'ppt-design-pro', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const primary = path.join(f.home, '.zcode', 'skills', 'ppt-design-pro');
+  const value = data(result);
+  assert.deepEqual(value.installations, [{ name: 'ppt-design-pro', path: primary, previous: null, version: '0.2.0' }]);
+  assert.equal(value.links.length, 2);
+  assert.ok(value.links.every((item) => item.target === primary));
+  assert.match(await readFile(path.join(primary, 'SKILL.md'), 'utf8'), /version: "0\.2\.0"/);
+  // 付费下载：下载端点带 Bearer 直连拿 200；redirect:error 语义下没有 302→/releases 的跟随请求。
+  assert.deepEqual(downloadsOf(f, 'ppt-design-pro').map((r) => r.token), [TOKEN]);
+  assert.equal(downloadsOf(f, 'ppt-design-pro')[0].query.get('version'), '0.2.0');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/releases/')), '付费下载不得 302 到公开附件');
+  // 权益判定经 /api/auth/me： subscriptions 含 ppt-design-pro（默认 grants）才放行。
+  assert.ok(f.state.requests.some((r) => r.path === '/api/auth/me' && r.token === TOKEN));
+});
+
+test('X-Skill-Version 头不匹配注入 → version_mismatch 拒绝，目标不可达', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.badDownloadVersion = true;
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 1);
+  const value = data(result);
+  assert.equal(value.ok, false);
+  assert.equal(value.error, 'version_mismatch');
+  assert.equal(await exists(path.join(f.home, '.zcode')), null, '头校验失败时目标不可达');
+});
+
+test('未购付费 skill：exit 3 inactive + subscribe_command/subscription_url，不发下载', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.grants.set(TOKEN, []);
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
   assert.equal(result.code, 3);
   const value = data(result);
-  assert.equal(value.error, 'purchase_unavailable');
-  assert.equal(value.phase2, true);
-  assert.equal(value.url, `${f.base}/store/ppt-design-pro/`);
-  const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode']);
+  assert.equal(value.ok, false);
+  assert.equal(value.error, 'inactive');
+  assert.equal(value.subscribe_command, command('subscribe', 'ppt-design-pro'));
+  assert.equal(value.subscription_url, `${f.base}/store/ppt-design-pro/`);
+  assert.match(value.message, new RegExp(`尚未购买 ppt-design-pro。请运行 ${command('subscribe', 'ppt-design-pro').replaceAll('.', '\\.')}，或打开 ${f.base}/store/ppt-design-pro/`));
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '未购不应进入付费下载');
+  const human = await f.run(['install', 'ppt-design-pro', '--to', 'zcode'], { HY_TOKEN: TOKEN });
   assert.equal(human.code, 3);
-  assert.match(human.stderr, /暂未开放购买/);
+  assert.match(human.stderr, /尚未购买 ppt-design-pro/);
   assert.ok(human.stderr.includes(`${f.base}/store/ppt-design-pro/`));
-  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download') || r.path.startsWith('/releases/')), '一期不应进入付费下载');
+});
+
+test('订阅状态无效（canceled）同视为未购；有效状态（trialing）放行', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.grants.set(TOKEN, ['ppt-design-pro']);
+  f.state.subscriptionStatus = 'canceled';
+  const rejected = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(rejected.code, 3);
+  assert.equal(data(rejected).error, 'inactive');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '失效订阅不应进入付费下载');
+  f.state.subscriptionStatus = 'trialing';
+  const accepted = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(accepted.code, 0, accepted.stdout + accepted.stderr);
+  assert.equal(data(accepted).installations[0].version, '0.2.0');
+});
+
+test('无令牌安装付费 skill：设备码登录引导 exit 3，不进入下载', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.requireApproval = true;
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], {}, { browserDelay: 100 });
+  assert.equal(result.code, 3);
+  const pending = result.stdout.trim().split('\n').map(JSON.parse).at(-1);
+  assert.equal(pending.error, 'authorization_pending');
+  assert.equal(pending.next_command, 'npx github:Huanyu-Hibiki/Huanyu-CLI install ppt-design-pro --to zcode --json');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '登录完成前不应下载');
+});
+
+test('令牌失效（401）：exit 3 unauthorized 重新登录引导', async (t) => {
+  const f = await fixture(t);
+  await publishPaid(f);
+  f.state.revoked.add(TOKEN);
+  const result = await f.run(['install', 'ppt-design-pro', '--to', 'zcode', '--json'], { HY_TOKEN: TOKEN });
+  assert.equal(result.code, 3);
+  const value = data(result);
+  assert.equal(value.ok, false);
+  assert.equal(value.error, 'unauthorized');
+  assert.match(value.message, /登录已失效，请重新运行 npx github:Huanyu-Hibiki\/Huanyu-CLI login。/);
 });
 
 test('occupied：目标目录被无关内容占用 → 占用预检前移（不下整包）且保留原样', async (t) => {

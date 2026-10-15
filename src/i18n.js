@@ -67,6 +67,10 @@ export const dictionary = {
   trialing: ['试用中', 'Trial'],
   unknownDate: ['日期未知', 'unknown date'],
   noInstallations: ['未发现已安装的商店 Skill。', 'No installed store skills found.'],
+  // 管理门户族（二期任务 3）
+  invalidPortal: ['门户信息不完整，请重试。', 'The portal details are incomplete. Please retry.'],
+  portalOpened: ['已打开购买管理：{url}', 'Purchase management opened: {url}'],
+  browserManual: ['无法打开浏览器，请打开：{url}', 'Could not open the browser. Open: {url}'],
   // 安装状态族（任务 5）
   unknownVersion: ['版本未知', 'unknown version'],
   versionCurrent: ['{name}：{version}（最新版）', '{name}: {version} (latest)'],
@@ -149,7 +153,6 @@ export const dictionary = {
   extractFailed: ['解压失败，请确认系统已安装 tar。', 'Extraction failed. Check that tar is installed.'],
   installPackageMismatch: ['安装包的 Skill 名称或版本不匹配，请重试。', 'The package skill name or version does not match. Please retry.'],
   loginRequired: ['请先运行 {command} login。', 'First run {command} login.'],
-  purchaseUnavailable: ['{name} 暂未开放购买：购买功能二期上线，可先到 {url} 查看商品页。', '{name} is not available for purchase yet. Purchasing arrives in phase 2; see the product page at {url}.'],
   autoConfirmedInstall: ['非交互模式：已自动确认安装。', 'Non-interactive mode: installation was auto-confirmed.'],
   // 更新族（二期任务 1）
   unknownInstallation: ['这个目录里没有可识别的 Skill：{path}', 'No recognized skill in this directory: {path}'],

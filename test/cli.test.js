@@ -10,11 +10,11 @@ const BIN = fileURLToPath(new URL('../bin/hy.js', import.meta.url));
 const DRIVER = fileURLToPath(new URL('./driver.js', import.meta.url));
 const { version: VERSION } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const COMMANDS = ['status', 'list', 'install', 'update', 'login', 'logout', 'subscribe', 'manage', 'help', 'version', 'publish', 'product', 'unpublish', 'audit'];
-// 任务 4 起 publish、任务 6 起 install、二期任务 1 起 update、二期任务 2 起 product/unpublish/audit 已实现；
-// 仍待实现的命令保持 not_implemented。
-// update/product/unpublish/audit 与 install 一样先做本地/网络前置，本测试不带假商店服务器，
-// 不能再当 not_implemented 样本（行为测试见 test/update.test.js、test/admin.test.js）。
-const PENDING = ['manage'];
+// 任务 4 起 publish、任务 6 起 install、二期任务 1 起 update、二期任务 2 起 product/unpublish/audit、
+// 二期任务 3 起 manage 已实现；仍待实现的命令保持 not_implemented。
+// update/product/unpublish/audit/manage 与 install 一样先做登录/网络前置，本测试不带假商店服务器，
+// 不能再当 not_implemented 样本（行为测试见 test/update.test.js、test/admin.test.js、test/manage.test.js）。
+const PENDING = [];
 
 // 语言相关环境固定为确定值（默认中文）；extraEnv 在其后展开以便覆盖测试环境变量通道。
 const BASE_ENV = { HY_LANG: '', LC_ALL: 'C', LC_MESSAGES: '', LANG: '', HY_TOKEN: '', CI: '' };
@@ -216,13 +216,13 @@ test('未实现命令执行时退出码 2，error 为 not_implemented 并使用�
     assert.match(data(result).message, /尚未实现/, name);
     assert.ok(data(result).message.includes(name), name);
   }
-  // install（任务 6 起）会先拉 catalog，本测试不带假商店服务器，不能再当 not_implemented 样本。
-  for (const args of [['subscribe', 'demo-skill', '--plan', 'lifetime']]) {
-    const result = await run([...args, '--json']);
-    assert.equal(result.code, 2, args.join(' '));
-    assert.equal(data(result).error, 'not_implemented', args.join(' '));
-  }
-  const english = await run(['manage', '--lang', 'en']);
+  // install（任务 6 起）会先拉 catalog，本测试不带假商店服务器，不能再当 not_implemented 样本；
+  // subscribe（二期任务 4）同理先走登录/catalog 前置，这里只钉住 not_implemented 文案本身。
+  const result = await run(['subscribe', 'demo-skill', '--plan', 'lifetime', '--json']);
+  assert.equal(result.code, 2);
+  assert.equal(data(result).error, 'not_implemented');
+  assert.match(data(result).message, /尚未实现/);
+  const english = await run(['subscribe', 'demo-skill', '--lang', 'en']);
   assert.match(english.stderr, /not implemented yet/);
 });
 

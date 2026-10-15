@@ -116,7 +116,9 @@ function priceLabel(prices) {
   return Object.entries(prices).map(([plan, price]) => t('pricePlan', { price: formatPrice(price), plan: planLabel(plan) })).join('; ') || t('priceUnavailable');
 }
 
-const subscriptionLabel = (status) => ['active', 'canceling', 'past_due', 'lifetime', 'trialing'].includes(status) ? t(status) : status;
+// 订阅有效状态（订阅展示与付费权益判定共用）：处于这些状态视为已购。
+const SUBSCRIPTION_STATUSES = ['active', 'canceling', 'past_due', 'lifetime', 'trialing'];
+const subscriptionLabel = (status) => SUBSCRIPTION_STATUSES.includes(status) ? t(status) : status;
 function localDate(seconds) {
   const date = new Date(seconds * 1000);
   if (!Number.isFinite(date.getTime())) return t('unknownDate');
@@ -236,7 +238,8 @@ async function list(ctx) {
 
 // 批量应用：按 Skill 名去重只准备（下载校验）一次，replaceAll 单事务覆盖全部目标——
 // 多动作共享备份与整批回滚（设计「错误处理」）。remove/link 动作不需要下载源。
-// 二期的付费清理（addFreeReplacements）在此接入 remove 动作；一期付费只有入口拦截。
+// 付费 skill 在入口已过 requireEntitlement，这里的令牌下载（200 直连 + 响应头校验）得以激活；
+// 二期的付费清理（addFreeReplacements，任务 5）在此接入 remove 动作。
 async function apply(ctx, actions, versions) {
   const prepared = new Map();
   try {
@@ -305,13 +308,30 @@ async function planActions(ctx, name, roots) {
   return { actions, skipped, links, primaryRoot, linkRoots };
 }
 
-// 付费前置拦截（install/update 共用，设计「分期计划」：一期付费=引导非购买）：不进 402/checkout
-// 流程，exit 3 附商品页。二期任务 3/5（requireLogin + 令牌下载 + 402 内联购买）解锁时只改这里。
-function purchaseGate(ctx, name) {
+// 付费权益闸门（install/update 共用，二期任务 3）：免费 skill 直接放行；付费先 requireLogin，
+// 再以 me().subscriptions 判定——已购（状态有效）放行令牌下载，未购 exit 3 'inactive' 附
+// subscribe_command/subscription_url（与下载端 402 同语义、同词条，任务 5 在此接内联购买）。
+// 订阅快照缓存在 ctx.account：混合批量逐 skill 判定只查一次账号。
+async function requireEntitlement(ctx, name) {
   const { product, paid } = findSkill(ctx.catalog, name);
-  if (!paid) return;
+  if (!paid) return true;
+  await requireLogin(ctx);
+  if (!ctx.account) ctx.account = await ctx.client.me(ctx.token);
+  if (ctx.account.subscriptions.some((item) => item.skill === name && SUBSCRIPTION_STATUSES.includes(item.status))) return true;
   const url = ctx.client.subscriptionUrl(name, product);
-  throw new CliError(t('purchaseUnavailable', { name: skillLabel(name), url }), 3, 'purchase_unavailable', { url, phase2: true });
+  const next = command('subscribe', name);
+  throw new CliError(t('inactive', { name: skillLabel(name), next, url }), 3, 'inactive', { subscribe_command: next, subscription_url: url });
+}
+
+// hy manage（二期任务 3，template 移植）：登录后向商店要账号门户 URL 并打开浏览器；
+// 打不开时给可复制链接。响应形状校验：缺/空 url 按 invalid_response 拒绝（openBrowser 内另有 URL 语法校验）。
+async function manage(ctx) {
+  await requireLogin(ctx);
+  const portal = await ctx.client.request('/api/account/portal', { method: 'POST', token: ctx.token });
+  if (typeof portal?.url !== 'string' || !portal.url) throw new CliError(t('invalidPortal'), 1, 'invalid_response');
+  const opened = await ctx.openBrowser(portal.url);
+  ctx.output.write({ url: portal.url, opened }, [opened ? t('portalOpened', { url: portal.url }) : t('browserManual', { url: portal.url })]);
+  return 0;
 }
 
 // 下载前占用/变更预检（install/update 共用）：整批任一目标被无关内容占用（含悬空链接——
@@ -329,9 +349,9 @@ async function assertReplaceable(ctx, actions) {
 // 多目标安装（任务 7 完整版，机制对齐 template）：resolveRoots 选根 → planActions 只读规划 →
 // 交互列目标并确认 → 预检（互相包含/占用/变化全部在下载之前）→ apply 批量事务 → 复扫与输出。
 async function install(ctx, name = ctx.options.skill) {
-  // 闸门先于 --to 校验（quality-M2 抽取自此处与 update）：一期语义下付费 skill 无论参数对错
-  // 都应先得到购买引导，而不是用法报错。
-  purchaseGate(ctx, name);
+  // 权益闸门先于 --to 校验（quality-M2 抽取自此处与 update）：付费 skill 无论参数对错都先得到
+  // 登录/购买引导（未登录走设备码、未购 exit 3 inactive），而不是用法报错；免费 skill 直接放行。
+  await requireEntitlement(ctx, name);
   const roots = await resolveRoots(ctx);
   const { actions, skipped, links, primaryRoot, linkRoots } = await planActions(ctx, name, roots);
   // --yes 是用户显式确认（不再提问）；auto_confirmed 只标记「非交互静默确认」——两者都不提问，
@@ -385,8 +405,8 @@ async function install(ctx, name = ctx.options.skill) {
 // 按 real_path 去重（链接安装只更新真实目标一次，链接保持指向、新版本即刻生效）→ apply 整批
 // 事务替换 → 复扫冲突/多副本警告。`update <skill>` 只更新指定；`--path <目录>` 定点（拒绝未知
 // 目录/与 --skill 不匹配）。开发目录跳过并解释；交互确认更新数量，非交互 auto_confirmed 警示沿用。
-// 付费 Skill 沿用 install 的一期购买引导拦截（purchaseUnavailable，exit 3 附商品页）；
-// 已购安装的解锁（requireLogin + 令牌下载）由二期任务 3/5 接入。
+// 付费 Skill 逐个过权益闸门（二期任务 3）：已购令牌下载更新；批量里任一未购付费 skill
+// exit 3 指向该 skill——整批原子，免费目标也不装一半。
 async function update(ctx) {
   if (ctx.options.skill) findSkill(ctx.catalog, ctx.options.skill);
   let all;
@@ -423,9 +443,9 @@ async function update(ctx) {
   skipped.push(...eligible.filter((item) => updateDue(item) && latestYanked(versions[item.name]))
     .map((item) => ({ name: item.name, path: item.path, reason: 'all_yanked' })));
   const actions = await Promise.all(pending.map(async (item) => ({ name: item.name, path: await realInstallation(item), previousName: item.name, previousVersion: item.version })));
-  // 付费闸门（quality-M2 抽取为 purchaseGate，与 install 共用）：过期才有动作，已最新的付费
-  // 安装不触发拦截；任务 3/5 解锁时只改 purchaseGate。
-  for (const action of actions) purchaseGate(ctx, action.name);
+  // 付费权益闸门（quality-M2 抽取，与 install 共用 requireEntitlement）：过期才有动作，已最新的
+  // 付费安装不触发闸门；逐 skill 判定，任一未购即 exit 3——整批未开始，免费目标也不装一半。
+  for (const action of actions) await requireEntitlement(ctx, action.name);
   // --yes 是用户显式确认；auto_confirmed 只标记「非交互静默确认」——与 install 同语义，
   // 但仅在实际有动作被静默确认时标记（up_to_date 无动作就不打提示行）。
   const auto = actions.length > 0 && !ctx.options.yes && !ctx.interactive;
@@ -573,6 +593,8 @@ async function runCommand(argv, runtime) {
       observeStage: (stage) => stages.push(stage) };
     if (options.command === 'logout') return await logout(ctx);
     if (options.command === 'login') return await login(ctx, options.token);
+    // manage 只走登录 + 门户接口，不消费 catalog（template 同位）。
+    if (options.command === 'manage') return await manage(ctx);
     if (options.command === 'status' || options.command === 'list' || options.command === 'install' || options.command === 'update') {
       // catalog 拉取一次并缓存进 ctx；status 扫描与 install/update 等后续命令复用。
       ctx.catalog = await ctx.client.catalog();

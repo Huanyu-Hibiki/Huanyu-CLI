@@ -171,6 +171,17 @@ async function resolvesTarget(directory) {
 // 供 assertManagedTarget 判定（install 规划期、update 动作构建与 replaceAll 执行期复检共用）。
 const managedRootKeys = async (extra) => new Set(await canonicalRootKeys(await managedRoots(extra)));
 
+// 复扫警告段（任务 1 quality-M3 登记的抽取窗口，任务 7 落地）：install/update 共用——复扫给定根
+// 集合（含免费版清理扫描过的同宿主根），报告配对冲突与多副本这类需要全目录视角的警告。
+// reportDuplicates=false 对应 update --path 的单根视野（定点不报多副本）；names 限定多副本的
+// skill 范围（update <skill> 只看该 skill），null 为全部（install 始终全量报告）。
+async function rescanWarnings(ctx, roots, { reportDuplicates = true, names = null } = {}) {
+  const after = await scan(ctx.names, roots);
+  const warnings = [...await conflicts(after, ctx.catalog)];
+  if (reportDuplicates) warnings.push(...duplicateLines(duplicateCopies(names ? after.filter((item) => names.includes(item.name)) : after)));
+  return warnings;
+}
+
 // 扫描九宿主的用户级目录报告已装商店 skill：版本、可更新、警告（配对冲突/多副本/历史截断）；未登录也可用。
 async function status(ctx) {
   await loadAuth(ctx);
@@ -519,11 +530,9 @@ async function install(ctx, name = ctx.options.skill) {
   const versions = downloads ? await ctx.client.versions(ctx.catalog) : {};
   const { warnings, backups } = await apply(ctx, actions, versions, { purchaseOnInactive: true, managedKeys });
   // 复扫全部根（含清理扫描过的同宿主根）：报告配对冲突/多副本等需要全目录视角的警告
-  //（多副本提示带精确的合并命令）。与 update 的复扫段成对语义（quality-M3）：update 按发现根
-  // 复扫、--path 定点不报多副本；两段需同步改动，抽取窗口留任务 7 收尾。
-  const installed = await scan(ctx.names, [...roots, ...cleanup.roots]);
-  warnings.push(...await conflicts(installed, ctx.catalog));
-  warnings.push(...duplicateLines(duplicateCopies(installed)));
+  //（多副本提示带精确的合并命令）。与 update 的复扫段共用 rescanWarnings（quality-M3 抽取）：
+  // install 按 --to/发现根复扫、始终报多副本；update 按发现根复扫、--path 定点不报多副本。
+  warnings.push(...await rescanWarnings(ctx, [...roots, ...cleanup.roots]));
   const installations = actions.filter((action) => !action.remove && !action.link).map((action) => ({ name, path: action.path,
     previous: action.previousName === name ? action.previousVersion : null, version: versions[name].latest }));
   links.push(...actions.filter((action) => action.link).map((action) => ({ name, path: action.path, target: action.link, existing: false, replaced_copy: action.previousName === name })));
@@ -641,11 +650,9 @@ async function update(ctx) {
   skipped.push(...await assertReplaceable(ctx, actions));
   const { warnings, backups } = await apply(ctx, actions, versions, { purchaseOnInactive: true, managedKeys });
   // 复扫原发现范围 + 清理扫描过的同宿主根（--path 定点只看那个根）：冲突警告需要全目录视角；
-  // 多副本只在非定点时报告。与 install 的复扫段成对语义（quality-M3）：install 按 --to/发现根
-  // 复扫、始终报多副本；两段需同步改动，抽取窗口留任务 7 收尾。
-  const after = await scan(ctx.names, [...all.map((item) => item.root), ...cleanup.roots]);
-  warnings.push(...await conflicts(after, ctx.catalog));
-  if (!ctx.options.path) warnings.push(...duplicateLines(duplicateCopies(after.filter((item) => !ctx.options.skill || item.name === ctx.options.skill))));
+  // 多副本只在非定点时报告（rescanWarnings 与 install 共用，quality-M3 抽取）。
+  warnings.push(...await rescanWarnings(ctx, [...all.map((item) => item.root), ...cleanup.roots],
+    { reportDuplicates: !ctx.options.path, ...(ctx.options.skill ? { names: [ctx.options.skill] } : {}) }));
   const installations = replacements.map((item) => ({ name: item.name, path: item.path, previous: item.previousVersion, version: versions[item.name].latest }));
   // 纯清理批次打 cleanup_only（quality-LOW-7）：status 仍 up_to_date，标记让消费端区分
   //「本批只有删除发生」。

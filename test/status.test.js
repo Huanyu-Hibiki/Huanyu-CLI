@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { fixture, writeSkill } from './fixture.js';
 import { HOSTS, targetRoot } from '../src/hosts.js';
 import { scan, conflicts } from '../src/skills.js';
-import { command } from '../src/i18n.js';
+import { command, withLanguage } from '../src/i18n.js';
 
 const exec = promisify(execFile);
 const data = (result) => {
@@ -166,7 +166,10 @@ test('配对冲突按宿主组归并：付费在项目级、免费在同宿主�
   const paid = await writeSkill(path.join(f.cwd, '.claude', 'skills'), 'ppt-design-pro', '0.1.0');
   const found = await scan(['ppt-design', 'ppt-design-pro'], [path.dirname(free), path.dirname(paid)]);
   assert.equal(found.length, 2);
-  const warnings = await conflicts(found, f.state.catalog, f.env, process.platform, f.cwd);
+  // 进程内直调 conflicts：i18n 会跟随宿主进程环境（CI 的 macOS runner 是 en_US），
+  // 用 withLanguage 钉成中文以匹配断言文案；CLI 子进程路径由 fixture 环境隔离，不受影响。
+  const warnings = await withLanguage({ lang: 'zh', explicit: true },
+    () => conflicts(found, f.state.catalog, f.env, process.platform, f.cwd));
   assert.deepEqual(warnings, [`${path.dirname(paid)}: ppt-design 和 ppt-design-pro 两个版本同时装会抢着接同一类请求`]);
   // 反例：付费在项目级 .claude、免费在用户级 .zcode——不同宿主组不警告。
   const other = await fixture(t);
@@ -174,7 +177,8 @@ test('配对冲突按宿主组归并：付费在项目级、免费在同宿主�
   const otherPaid = await writeSkill(path.join(other.cwd, '.claude', 'skills'), 'ppt-design-pro', '0.1.0');
   const otherFound = await scan(['ppt-design', 'ppt-design-pro'], [path.dirname(otherFree), path.dirname(otherPaid)]);
   assert.equal(otherFound.length, 2);
-  assert.deepEqual(await conflicts(otherFound, other.state.catalog, other.env, process.platform, other.cwd), []);
+  assert.deepEqual(await withLanguage({ lang: 'zh', explicit: true },
+    () => conflicts(otherFound, other.state.catalog, other.env, process.platform, other.cwd)), []);
 });
 
 test('无安装时输出 noInstallations，宿主目录存在但为空也一样', async (t) => {

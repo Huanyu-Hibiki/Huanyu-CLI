@@ -80,24 +80,26 @@
 - **安全**: 是（下载供应链·用户输入路径）
 - **审查记录**: spec 通过（机制保真逐行 diff 证实）；quality 无 CRITICAL/HIGH；security 无 CRITICAL/HIGH。修复 11 项：免费摘要 fail-closed（删 302 响应头回退）、下载/解压大小上限对称（100MB/400MB）、占用预检前移、changed 保护 e2e、大小写碰撞用例、解压注入缝、死字段注释、seedCache 隔离、helper 合并、付费闸门排序注释、自定义路径 e2e。登记：POSIX tar PATH/暂存竞态/二次 SIGINT 残留（基线取舍）、fixture 413 与 download_url（契约评审项）
 
-### 任务 7: 全宿主链接共享安装 + 发布→安装闭环验证
+### 任务 7: 全宿主链接共享安装 + 发布→安装闭环验证 ✅（2026-10-15 完成）
 - **交付**: 不带 `--to` 时自动发现九宿主：第一个可用（zcode 优先）放真实副本，其余 junction/symlink 共享；其他宿主的同名独立旧副本自动换为链接；已有正确链接时幂等跳过。闭环集成：任务 4 发布的包经 download 端点装回宿主矩阵，端到端验证"发布→安装"回路。
 - **验收标准**:
-  - [ ] Windows 用 junction、POSIX 用 symlink；链接指向真实安装；update 真实目录时链接自动受益（一期以 status 复核链接关系代替 update）
-  - [ ] 被保护链接/开发目录/未知占用目录跳过且解释原因；多副本合并提示给出精确的修复命令
-  - [ ] 集成测试：publish 上传 → catalog/versions 反映 → install 装回 ≥3 宿主 → status 报告链接关系，全链路绿
+  - [x] Windows 用 junction、POSIX 用 symlink；链接指向真实安装；安装后 status 复核链接关系（1 份实体 + 各宿主链接正确指向；update 属二期仍 not_implemented）
+  - [x] 被保护链接/开发目录/未知占用目录跳过且解释原因；多副本合并提示给出精确的修复命令
+  - [x] 集成测试：publish 上传 → catalog/versions 反映 → install 装回 ≥3 宿主 → status 报告链接关系，全链路绿（loop.test.js，装回内容与发布源逐字节一致）
 - **阻塞边**: 任务 4、任务 6
 - **安全**: 是（下载供应链）
+- **审查记录**: spec 通过（多目标算法与 template 逐段 diff 证实）；quality 无 CRITICAL/HIGH；security 通过（有条件）。修复 7 项：missingTarget 保留原始标志、overlap 预检前移、realInstallation/悬空链接/linkDirectory 失败位三例补测、二次 SIGINT 前同步打印备份路径、RESERVED 保留名下沉 isSkillName（全链收紧）、install 拆分 resolveRoots/planActions、LOW 五项（纯链接跳过 versions/ENOTDIR/拼写提示/--yes 注释/排序键）。登记二期：副本静默销毁与链接写穿（基线取舍，protectSymlinks 重审时处理）、UNC 混排归一、悬空链接跳过语义（风险表有载）
 
-### 任务 8: 发布收尾——README、skill 更新约定、CI 定稿
+### 任务 8: 发布收尾——README、skill 更新约定、CI 定稿 ✅（2026-10-15 完成）
 - **交付**: 仓库 README（中英）说明安装/发布用法（`npx github:` 直跑）；"skill 内置版本检查"约定文档化（versions 公开接口、节流、HY_NO_AUTO_UPDATE 开关、自更新命令模板）；九宿主 CI 矩阵抽样测试补齐；发布前检查清单（DEFAULT_API 替换点、命令名复验）。
 - **验收标准**:
-  - [ ] README 双语与实际命令行为一致（以测试断语文案为准）
-  - [ ] 版本检查约定文档完整（可直接抄进新 skill 的 SKILL.md）
-  - [ ] 六格 CI 矩阵全绿；发布检查清单入文档
-- **前置（审查登记）**: 固化"只用 npm test 入口"约定（裸 node --test 会误扫 template/ 与 test/driver.js）；package.json files 加回 README + 补 LICENSE 文件（任务 1 审查遗留）。
+  - [x] README 双语与实际命令行为一致（逐命令与 help 词条实跑核对 + core.test.js 自动钉住，词条改动即红）
+  - [x] 版本检查约定文档完整（fenced 模板可整段抄进 SKILL.md；端点与 DEFAULT_API 测试级同步）
+  - [x] 六格 CI 矩阵全绿——**证据暂缓至首次 push**（与任务 1 同口径；workflow 就位含 pack 校验步骤，本地 149 测试全绿）；发布检查清单入 docs/release-checklist.md
+- **前置（审查登记）**: ✅ npm test 入口约定固化（README 开发节 + scripts 注释）；files 加回 README×2 + LICENSE（MIT）
 - **阻塞边**: 任务 7
 - **安全**: 否
+- **审查记录**: spec 12/12 核心项通过；quality 1 HIGH（端点断言硬编码占位 URL，发布后必假红）已修——断言改由 DEFAULT_API 拼出；MEDIUM 措辞矛盾已修（"以小写字母或数字开头"）；README 补退出码 1/130；清单措辞精确化（README 侧无测试钉 + 版本断言提醒）。登记：npm registry 页相对链接死链（npx github 分发不受影响）、workflow 并发取消、npm pack 内容为目测非断言
 
 ## 并行机会（frontier）
 

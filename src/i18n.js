@@ -8,7 +8,7 @@ export const command = (...args) => formatCommand(args);
 
 // 每个条目依次是中文、英文；占位符保留命令、路径和服务端数据。
 export const dictionary = {
-  helpIntro: ['安装、更新和管理环宇商店的 Skill。', 'Install, update, and manage Huanyu store skills.'],
+  helpIntro: ['安装、更新、购买和管理环宇商店的 Skill。', 'Install, update, purchase, and manage Huanyu store skills.'],
   helpUsage: ['用法：{command} <命令> [--json] [--yes] [--lang zh|en]', 'Usage: {command} <command> [--json] [--yes] [--lang zh|en]'],
   helpStatus: ['{command} status（默认）  查看已安装的 Skill 和账号', '{command} status (default)  Show installed skills and account'],
   helpList: ['{command} list  查看 Skill 和价格', '{command} list  List skills and prices'],

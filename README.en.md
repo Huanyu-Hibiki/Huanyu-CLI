@@ -2,7 +2,7 @@
 
 # hy
 
-The Huanyu store CLI for installing, updating, purchasing, and managing skills in the Huanyu store.
+The Huanyu store CLI. Install, update, purchase, and manage Huanyu store skills.
 
 Requires Node.js 18 or later. Run it with npx; no separate install needed:
 

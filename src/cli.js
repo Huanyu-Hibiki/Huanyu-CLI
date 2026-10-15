@@ -10,7 +10,7 @@ import { login, loadAuth, requireLogin } from './auth.js';
 import { requirePurchase } from './purchase.js';
 import { openBrowser } from './browser.js';
 import { publishSkill, publishRepo, reconcileRepo } from './publish.js';
-import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked, sameAgentRoots, canonicalRootKeys, freeReplacements, retainedBackups } from './skills.js';
+import { scan, compare, updates, conflicts, duplicateCopies, inspectSkill, isDevelopmentDirectory, uniqueDirectories, canonicalDirectory, logicalDirectory, latestYanked, sameAgentRoots, canonicalRootKeys, freeReplacements, retainedBackups, assertManagedTarget } from './skills.js';
 import { targetRoot, installationRoots, nearestHostId, managedRoots } from './hosts.js';
 import { directoryKey, sameDirectory, resolveDirectory } from './platform.js';
 import { prepare, replaceAll } from './install.js';
@@ -167,6 +167,10 @@ async function resolvesTarget(directory) {
   }
 }
 
+// M2 管辖根键集合（三审 HIGH-1）：发现根/--to 显式根/各宿主用户级与项目级根 → canonical 键集合，
+// 供 assertManagedTarget 判定（install 规划期、update 动作构建与 replaceAll 执行期复检共用）。
+const managedRootKeys = async (extra) => new Set(await canonicalRootKeys(await managedRoots(extra)));
+
 // 扫描九宿主的用户级目录报告已装商店 skill：版本、可更新、警告（配对冲突/多副本/历史截断）；未登录也可用。
 async function status(ctx) {
   await loadAuth(ctx);
@@ -257,7 +261,7 @@ async function list(ctx) {
 // 付费 skill 在入口已过权益闸门（requireEntitlement），这里的令牌下载（200 直连 + 响应头校验）
 // 得以激活；下载期 402（requireEntitlement 快照过时、竞态窗口、或服务端刚扣款未生效）按
 // purchaseOnInactive 内联进购买流程后重试一次（任务 5）——一条命令完成购买+安装/更新。
-async function apply(ctx, actions, versions, { purchaseOnInactive = false } = {}) {
+async function apply(ctx, actions, versions, { purchaseOnInactive = false, managedKeys = null } = {}) {
   const prepared = new Map();
   try {
     for (const name of new Set(actions.filter((action) => !action.remove && !action.link).map((action) => action.name))) {
@@ -275,7 +279,7 @@ async function apply(ctx, actions, versions, { purchaseOnInactive = false } = {}
       prepared.set(name, item);
     }
     return await replaceAll(actions.map((action) => ({ ...action, source: action.remove || action.link ? undefined : prepared.get(action.name).source })),
-      { signal: ctx.signal, names: ctx.names, onStage: ctx.observeStage, renameFile: ctx.renameFile });
+      { signal: ctx.signal, names: ctx.names, onStage: ctx.observeStage, renameFile: ctx.renameFile, managedKeys });
   } finally {
     for (const item of prepared.values()) await item.cleanup().catch(() => {});
   }
@@ -362,16 +366,14 @@ async function planActions(ctx, name, roots) {
   const primaries = found.filter((item) => sameDirectory(item.root, primaryRoot));
   const candidates = primaries.length ? primaries : [{ name, path: path.join(primaryRoot, name), version: null }];
   const target = path.resolve((candidates.find((item) => path.basename(item.path) === name) || candidates[0]).path);
-  const managedKeys = new Set(await canonicalRootKeys(await managedRoots(roots)));
+  const managedKeys = await managedRootKeys(roots);
   for (const item of candidates) {
     // 暂存前的第一重开发目录保护：跳过并解释，不动内容、不发起下载。
     if (await isDevelopmentDirectory(item.path)) { skipped.push(skippedInstallation(item)); continue; }
     const real = primaries.length ? await realInstallation(item) : item.path;
     // M2 写穿白名单：非链接主安装的父目录就是 roots 之一（恒在集合内）；链接主安装的真实目标
     // 父目录不在集合内 = 用户自建链接指向 CLI 管理范围之外 → 拒绝写穿，交还用户处置。
-    if (!managedKeys.has(directoryKey(await canonicalDirectory(path.dirname(real))))) {
-      throw new CliError(t('occupiedOutside', { path: real }), 1, 'occupied', { path: real, link: item.path });
-    }
+    await assertManagedTarget(real, managedKeys, item.path);
     actions.push({ name, path: real, previousName: primaries.length ? name : null, previousVersion: item.version });
   }
   const targetKey = directoryKey(await canonicalDirectory(target));
@@ -381,6 +383,7 @@ async function planActions(ctx, name, roots) {
     for (const directory of directories) {
       const info = await lstatOrNull(directory);
       // M4：悬空链接只让出自己这个位——跳过并解释，不再拖垮整批（fail-closed 语义见 assertReplaceable）。
+      // 已知取舍（三审登记不修）：被跳过的悬空链接每次运行都会出现在 skipped——持续可见比静默吞掉好。
       if (info?.isSymbolicLink() && !await resolvesTarget(directory)) { skipped.push({ name, path: directory, reason: 'dangling_link' }); continue; }
       if (info && directoryKey(await canonicalDirectory(directory)) === targetKey) { links.push({ name, path: directory, target, existing: true }); continue; }
       if (info && await isDevelopmentDirectory(directory)) { skipped.push(skippedInstallation({ name, path: directory })); continue; }
@@ -388,7 +391,7 @@ async function planActions(ctx, name, roots) {
       actions.push({ name, path: directory, link: target, previousName: current?.name === name ? name : null, previousVersion: current?.version || null });
     }
   }
-  return { actions, skipped, links, primaryRoot, linkRoots };
+  return { actions, skipped, links, primaryRoot, linkRoots, managedKeys };
 }
 
 // 只读权益判定（security-MEDIUM-3 拆闸门；HIGH-1 清理前提共用）：免费 skill、本进程已确认购买
@@ -471,7 +474,7 @@ async function install(ctx, name = ctx.options.skill) {
   // 确认之后（下载之前）。免费 skill 直接放行。
   const entitled = await checkEntitlement(ctx, name);
   const roots = await resolveRoots(ctx);
-  const { actions, skipped, links, primaryRoot, linkRoots } = await planActions(ctx, name, roots);
+  const { actions, skipped, links, primaryRoot, linkRoots, managedKeys } = await planActions(ctx, name, roots);
   // --yes 是用户显式确认（不再提问）；auto_confirmed 只标记「非交互静默确认」——两者都不提问，
   // 但静默确认需要提示行维持可见性，显式 --yes 是用户自己的决定，不需要提示。
   const auto = !ctx.options.yes && !ctx.interactive;
@@ -514,7 +517,7 @@ async function install(ctx, name = ctx.options.skill) {
     invalidateAccount(ctx);
   }
   const versions = downloads ? await ctx.client.versions(ctx.catalog) : {};
-  const warnings = await apply(ctx, actions, versions, { purchaseOnInactive: true });
+  const { warnings, backups } = await apply(ctx, actions, versions, { purchaseOnInactive: true, managedKeys });
   // 复扫全部根（含清理扫描过的同宿主根）：报告配对冲突/多副本等需要全目录视角的警告
   //（多副本提示带精确的合并命令）。与 update 的复扫段成对语义（quality-M3）：update 按发现根
   // 复扫、--path 定点不报多副本；两段需同步改动，抽取窗口留任务 7 收尾。
@@ -527,11 +530,12 @@ async function install(ctx, name = ctx.options.skill) {
   // replacesFree 原位替换的条目附 replaced_by（quality-LOW-6）：该路径同时出现在 installations 里，
   // 字符串条目无法区分「被谁替换」，对象条目指明接替的付费 skill。
   const removed = removedActions(actions).map((action) => action.replacesFree ? { path: action.path, replaced_by: action.name } : action.path);
-  ctx.output.write({ installations, links, removed, skipped, warnings, ...(auto ? { auto_confirmed: true } : {}) },
+  ctx.output.write({ installations, links, removed, skipped, warnings, ...(backups.length ? { retained_backups: backups } : {}), ...(auto ? { auto_confirmed: true } : {}) },
     [...installations.map((item) => item.previous && item.previous !== item.version
       ? t('updated', { name: skillLabel(item.name), previous: item.previous, version: item.version, path: item.path })
       : t('installed', { name: skillLabel(item.name), version: item.version, path: item.path })),
-      ...linkedLines(links), ...removedLines(actions), ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
+      ...linkedLines(links), ...removedLines(actions), ...backups.map((backup) => t('backupCreated', { path: backup })),
+      ...skippedLines(skipped), ...warnings, ...(auto ? [t('autoConfirmedInstall')] : [])]);
   return 0;
 }
 
@@ -577,7 +581,16 @@ async function update(ctx) {
   const pending = eligible.filter((item) => updateDue(item) && !latestYanked(versions[item.name]));
   skipped.push(...eligible.filter((item) => updateDue(item) && latestYanked(versions[item.name]))
     .map((item) => ({ name: item.name, path: item.path, reason: 'all_yanked' })));
-  const actions = await Promise.all(pending.map(async (item) => ({ name: item.name, path: await realInstallation(item), previousName: item.name, previousVersion: item.version })));
+  // M2 写穿白名单（三审 HIGH-1）：update 的动作对每个 realInstallation 结果执行与 install 规划期
+  // 同一判定（--path 定点分支在 all 汇入处同样过检；管辖根 = 发现/--path 根 + 宿主用户级与项目级根）
+  //——链接真实目标越界按 occupied 拒绝，此时整包尚未下载。linked_from 记录链接位，
+  // 交互确认前透出解析后的真实目标（写穿必须可见）。
+  const managedKeys = await managedRootKeys([...new Set(all.map((item) => item.root))]);
+  const actions = await Promise.all(pending.map(async (item) => {
+    const real = await realInstallation(item);
+    await assertManagedTarget(real, managedKeys, item.path);
+    return { name: item.name, path: real, previousName: item.name, previousVersion: item.version, ...(real !== item.path ? { linked_from: item.path } : {}) };
+  }));
   // 入口只读闸门（security-MEDIUM-3 拆闸门）：pending 里的付费 skill 先登录并判定已购；未购不在
   // 此付款（购买推迟到用户确认之后）。unpaid 集合供确认后的购买环节消费。
   const unpaid = new Set();
@@ -596,6 +609,12 @@ async function update(ctx) {
   const replacements = actions.filter((action) => !action.remove);
   // removed 条目形状与 install 一致（replacesFree 原位替换附 replaced_by，quality-LOW-6）。
   const removed = removedActions(actions).map((action) => action.replacesFree ? { path: action.path, replaced_by: action.name } : action.path);
+  // 交互确认前透出写穿目标（三审 HIGH-1）：链接位的更新实际落在真实目录，确认前单独一行显示解析结果。
+  const through = replacements.filter((action) => action.linked_from);
+  if (ctx.interactive && through.length) {
+    ctx.output.write({ event: 'write_through', write_throughs: through.map((action) => ({ link: action.linked_from, target: action.path })) },
+      through.map((action) => t('writeThroughTarget', { path: action.linked_from, target: action.path })));
+  }
   // 确认与静默确认（security-MEDIUM-2b/c）：纯清理批次（0 替换 >0 移除）同样要确认——交互提问
   // 移除数，非交互打 auto_confirmed 警示行；混合批次的确认文案计入移除数。
   const auto = (replacements.length > 0 || removed.length > 0) && !ctx.options.yes && !ctx.interactive;
@@ -620,7 +639,7 @@ async function update(ctx) {
   // 目标被第三方改动时，在下载整包之前失败（含清理并入的 remove 动作）；悬空链接的链接位
   // 撤下并解释（M4；update 的动作全部声明过 previousName，实际不会走到该分支，语义与 install 对齐）。
   skipped.push(...await assertReplaceable(ctx, actions));
-  const warnings = await apply(ctx, actions, versions, { purchaseOnInactive: true });
+  const { warnings, backups } = await apply(ctx, actions, versions, { purchaseOnInactive: true, managedKeys });
   // 复扫原发现范围 + 清理扫描过的同宿主根（--path 定点只看那个根）：冲突警告需要全目录视角；
   // 多副本只在非定点时报告。与 install 的复扫段成对语义（quality-M3）：install 按 --to/发现根
   // 复扫、始终报多副本；两段需同步改动，抽取窗口留任务 7 收尾。
@@ -633,9 +652,11 @@ async function update(ctx) {
   ctx.output.write({ installations, removed, skipped, warnings, ...counts, updated_count: installations.length,
     status: installations.length ? 'updated' : 'up_to_date',
     ...(!installations.length && removed.length ? { cleanup_only: true } : {}),
+    ...(backups.length ? { retained_backups: backups } : {}),
     ...(auto ? { auto_confirmed: true } : {}) },
     [...(installations.length ? installations.map((item) => t('updated', { name: skillLabel(item.name), previous: item.previous || t('unknownVersion'), version: item.version, path: item.path })) : [t('upToDate')]),
-      ...removedLines(actions), ...skippedLines(skipped), ...warnings,
+      ...removedLines(actions), ...backups.map((backup) => t('backupCreated', { path: backup })),
+      ...skippedLines(skipped), ...warnings,
       ...(auto ? [replacements.length ? t('autoConfirmedUpdate') : t('autoConfirmedCleanup')] : [])]);
   return 0;
 }

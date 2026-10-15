@@ -18,9 +18,10 @@ const versionOf = async (directory) => ((await readFile(path.join(directory, 'SK
 
 // 二期任务 1：hy update 全量更新——链接只更新实体、整批事务、定点/过滤/开发目录/回滚/up_to_date。
 
-test('链接种：链接宿主里的旧版本只更新真实目录，链接保持指向且新版本即刻生效（status 复核）', async (t) => {
+// 三审 HIGH-1：update 写穿白名单生效后，链接种的真实目标迁入宿主根内（合法多宿主共享形态）。
+test('链接种：链接宿主里的旧版本只更新真实目录（真实目标在另一宿主根内→放行），链接保持指向且新版本即刻生效（status 复核）', async (t) => {
   const f = await fixture(t);
-  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  const real = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
   const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
   await mkdir(path.dirname(linked), { recursive: true });
   await linkDirectory(real, linked);
@@ -35,23 +36,85 @@ test('链接种：链接宿主里的旧版本只更新真实目录，链接保�
   assert.equal(value.updated_count, 1);
   assert.equal(value.auto_confirmed, true);
   assert.equal(await versionOf(real), '0.1.0');
+  // update 成功输出附本次产生的备份路径（三审 spec-MINOR：JSON 字段双向）。
+  assert.ok(Array.isArray(value.retained_backups) && value.retained_backups.length === 1, JSON.stringify(value.retained_backups));
+  assert.ok(value.retained_backups[0].startsWith(path.dirname(real)), value.retained_backups[0]);
   // 链接原样保留且指向不变；透过链接读到的已是新版本（更新一次全部生效）。
   assert.ok((await lstat(linked)).isSymbolicLink(), '链接不应被换成独立副本');
   assert.equal(await readDirectoryLink(linked), real);
   assert.equal(await versionOf(linked), '0.1.0');
-  // status 复核：一份实体、real_path 与版本正确、无多副本警告。
+  // status 复核：一份实体、real_path 与版本正确、无多副本警告；被更新的旧副本留有备份提示（M1）。
   const status = data(await f.run(['status', '--json']));
   assert.equal(status.installations.length, 1);
   assert.equal(status.installations[0].path, linked);
   assert.equal(status.installations[0].real_path, await realpath(real));
   assert.equal(status.installations[0].current, '0.1.0');
-  assert.deepEqual(status.warnings, []);
+  assert.equal(status.warnings.length, 1);
+  assert.ok(status.warnings[0].startsWith(`旧版本备份保留在：${path.dirname(real)}`), status.warnings[0]);
   // 文本通道：updated 行（previous → version）与非交互自动确认提示（先把实体降回旧版本再跑一次）。
-  await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
   const human = await f.run(['update']);
   assert.equal(human.code, 0, human.stdout + human.stderr);
   assert.match(human.stdout, new RegExp(`已更新 ppt-design：0\\.0\\.9 → 0\\.1\\.0（${real.replaceAll('\\', '\\\\')}）`));
   assert.match(human.stdout, /非交互模式：已自动确认更新。/);
+});
+
+// —— 三审 HIGH-1：update 路径写穿白名单（与 install 规划期同一判定 + replaceAll 执行期复检） ——
+
+test('M2：update 主位链接指向管辖范围之外 → occupied 拒绝并解释，不下载、链接与真实目标不动', async (t) => {
+  const f = await fixture(t);
+  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 1);
+  const value = data(result);
+  assert.equal(value.error, 'occupied');
+  assert.match(value.message, /CLI 管理范围之外的目录/);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '拒绝发生在下载之前');
+  // 链接与真实目标都原样保留，不写穿。
+  assert.equal(await readDirectoryLink(linked), real);
+  assert.equal(await versionOf(real), '0.0.9');
+  const english = await f.run(['update', '--lang', 'en']);
+  assert.equal(english.code, 1);
+  assert.match(english.stderr, /outside the directories this CLI manages/);
+});
+
+test('M2：update --path 指向链接位同判定——真实目标在宿主根内放行；范围外 → occupied 拒绝不下载', async (t) => {
+  const f = await fixture(t);
+  // 放行侧：真实目标在 claude 宿主根内（合法多宿主共享），--path 定点更新真实目录。
+  const real = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const allowed = await f.run(['update', '--path', linked, '--json']);
+  assert.equal(allowed.code, 0, allowed.stdout + allowed.stderr);
+  assert.deepEqual(data(allowed).installations, [{ name: 'ppt-design', path: real, previous: '0.0.9', version: '0.1.0' }]);
+  assert.equal(await versionOf(real), '0.1.0');
+  // 拒绝侧：真实目标在管辖范围之外，--path 指向链接位同样按 occupied 拒绝。
+  const outside = await writeSkill(path.join(f.temporary, 'store'), 'oracle-bone', '0.0.9');
+  const linkedOutside = path.join(f.home, '.zcode', 'skills', 'oracle-bone');
+  await linkDirectory(outside, linkedOutside);
+  const rejected = await f.run(['update', '--path', linkedOutside, '--json']);
+  assert.equal(rejected.code, 1);
+  assert.equal(data(rejected).error, 'occupied');
+  assert.match(data(rejected).message, /CLI 管理范围之外的目录/);
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download/oracle-bone')), '拒绝侧的 skill 不下载（放行侧的 ppt-design 下载不计入）');
+  assert.equal(await versionOf(outside), '0.0.9', '范围外真实目标不写穿');
+});
+
+test('M2：交互确认前透出写穿目标——链接位显示「→ 真实目录」，确认后更新落在真实目录', async (t) => {
+  const f = await fixture(t);
+  const real = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
+  const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
+  await mkdir(path.dirname(linked), { recursive: true });
+  await linkDirectory(real, linked);
+  const result = await f.run(['update'], {}, { interactive: true, answers: [true] });
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.ok(result.stdout.includes(`链接位 ${linked} → 真实目录：${real}`), result.stdout);
+  assert.equal(result.trace.questions.length, 1, '确认提问照常一次');
+  assert.equal(await versionOf(real), '0.1.0');
 });
 
 test('多副本种：多宿主多副本各自更新、同名只下载一次、多副本警告保留、counts 形状完整', async (t) => {
@@ -175,6 +238,47 @@ test('下载前占用预检：scan 与执行之间目标被换成无关内容 �
   assert.deepEqual(await stageLeftovers(path.dirname(target)), []);
 });
 
+// 三审 LOW-9②：声明过 previousName 的位在预检期变成悬空链接 → occupied fail-closed
+//（M4 的跳过语义只覆盖「无既有内容声明的链接位」，不因放宽误吞有内容声明的位）。
+test('M4：声明过 previousName 的位变悬空链接（下载前竞态）→ occupied 拒绝且不下载', async (t) => {
+  const f = await fixture(t);
+  const target = await writeSkill(path.join(f.home, '.zcode', 'skills'), 'ppt-design', '0.0.9');
+  f.state.versionsDelay = 500;
+  const pending = f.run(['update', '--json']);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !f.state.requests.some((r) => r.path === '/api/store/versions')) await delay(20);
+  // 窗口内：原目录被换成悬空链接（有 previousName 声明的位）——不得按 dangling_link 跳过装过去。
+  await rm(target, { recursive: true, force: true });
+  await linkDirectory(path.join(f.temporary, 'missing'), target);
+  const result = await pending;
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'occupied');
+  assert.ok(!f.state.requests.some((r) => r.path.startsWith('/api/store/download')), '不下载');
+  assert.ok((await lstat(target)).isSymbolicLink(), '悬空链接原样保留');
+});
+
+// 三审 MEDIUM：过期备份只清「本批涉及 skill」的——无关 skill 的备份不受连带清理。
+test('M1：同根 skill A 的备份在场 → 更新 skill B → A 备份保留、B 自己的旧备份清理', async (t) => {
+  const f = await fixture(t);
+  const root = path.join(f.home, '.zcode', 'skills');
+  // A（oracle-bone）已最新但留有旧备份；B（ppt-design）装着旧版且留有自己的旧备份。
+  await writeSkill(root, 'oracle-bone', '0.1.0');
+  const backupA = path.join(root, '.hy-backup-1000');
+  await writeSkill(root, 'oracle-bone', '0.0.1', '.hy-backup-1000');
+  await writeSkill(root, 'ppt-design', '0.0.9');
+  const backupB = path.join(root, '.hy-backup-1001');
+  await writeSkill(root, 'ppt-design', '0.0.1', '.hy-backup-1001');
+  const result = await f.run(['update', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  // B 更新（0.0.9 → 0.1.0）：B 的旧备份被清、新备份产生；A 的备份不是本批 skill，原样保留。
+  assert.equal(await versionOf(path.join(root, 'ppt-design')), '0.1.0');
+  assert.equal(await versionOf(backupA), '0.0.1', 'A 的备份不受 B 的更新连带清理');
+  await absent(backupB);
+  const fresh = (await readdir(root)).filter((name) => name.startsWith('.hy-backup-') && name !== '.hy-backup-1000');
+  assert.equal(fresh.length, 1, 'B 的新备份在场');
+  assert.equal(await versionOf(path.join(root, fresh[0])), '0.0.9');
+});
+
 // 任务 5 后同宿主的免费版会被配对清理（冲突随之消失）；冲突复扫的判别例改用受保护的开发目录
 // 免费版——共存持续存在，update 前后都提示 conflict，且 up_to_date 复扫同样报告。
 test('conflicts 复扫判别例：同宿主受保护的免费版与付费版共存 → update 后仍提示 conflict 行', async (t) => {
@@ -199,9 +303,9 @@ test('conflicts 复扫判别例：同宿主受保护的免费版与付费版共�
   assert.match(human.stdout, /ppt-design 和 ppt-design-pro 两个版本同时装/);
 });
 
-test('--path 指向链接安装：动作落真实目标，链接不动', async (t) => {
+test('--path 指向链接安装：动作落真实目标（目标在宿主根内→放行），链接不动', async (t) => {
   const f = await fixture(t);
-  const real = await writeSkill(path.join(f.temporary, 'store'), 'ppt-design', '0.0.9');
+  const real = await writeSkill(path.join(f.home, '.claude', 'skills'), 'ppt-design', '0.0.9');
   const linked = path.join(f.home, '.zcode', 'skills', 'ppt-design');
   await mkdir(path.dirname(linked), { recursive: true });
   await linkDirectory(real, linked);

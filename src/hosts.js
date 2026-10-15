@@ -72,6 +72,8 @@ export function projectRootsOf(hostId, env = process.env, platform = process.pla
 // CLI 管辖根全集（任务 6 M2 写穿白名单）：已存在的用户级宿主根（installationRoots）+ 各宿主项目级根
 // + 调用方显式提供的根（--to 显式根或自动发现根）。realInstallation 解析出的真实目标必须落在其中
 // 之一才允许写穿跟随——用户自建链接指向管理范围之外的目录时按占用拒绝，不借 CLI 之手改写任意目录。
+// 已知取舍（三审登记不修）：白名单广度含 cwd 项目级根——项目根属用户自声明语义（在项目里跑 CLI
+// 即视为委托该目录），接受其内写穿。
 export async function managedRoots(extra = [], env = process.env, platform = process.platform, cwd = process.cwd()) {
   return [...new Set([...extra, ...(await installationRoots(env, platform, cwd)), ...HOSTS.flatMap((host) => projectRootsOf(host.id, env, platform, cwd))])];
 }

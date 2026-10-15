@@ -18,6 +18,7 @@ const data = (result) => {
   return JSON.parse(result.stdout);
 };
 const exists = async (file) => { try { return await lstat(file); } catch { return null; } };
+const versionOf = async (directory) => ((await readFile(path.join(directory, 'SKILL.md'), 'utf8')).match(/version: "([^"]+)"/) || [])[1];
 const stageLeftovers = async (root) => (await readdir(root, { recursive: false }).catch((error) => error.code === 'ENOENT' ? [] : (() => { throw error; })())).filter((name) => name.startsWith('.hy-stage-'));
 // prepare 的单元注入位（sizeLimitBytes/runner）：测试进程直连假商店，HY_API 临时指向 fixture。
 const withClient = async (f, fn) => {
@@ -550,8 +551,8 @@ test('其他宿主里的独立旧副本自动换成链接（replaced_copy），s
   assert.equal(status.installations.length, 1);
   assert.equal(status.installations[0].path, primary);
   assert.deepEqual(status.warnings, [
-    `旧版本备份保留在：${backupOld}（下次安装或更新时自动清理，也可手动删除）`,
-    `旧版本备份保留在：${backupRenamed}（下次安装或更新时自动清理，也可手动删除）`,
+    `旧版本备份保留在：${backupOld}（该目录的下一次安装或更新时自动清理，也可手动删除）`,
+    `旧版本备份保留在：${backupRenamed}（该目录的下一次安装或更新时自动清理，也可手动删除）`,
   ]);
 });
 
@@ -829,9 +830,12 @@ test('M1 备份保留：替换提交后旧内容保留在 .hy-backup-*（含本�
   await writeFile(path.join(target, 'assets', 'local-edit.txt'), 'user change');
   const first = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(first.code, 0, first.stdout + first.stderr);
+  // install 成功输出附本次产生的备份路径（三审 spec-MINOR：JSON 字段 + 人类行，双向可发现）。
+  const firstValue = data(first);
   const backups = async () => (await readdir(root)).filter((name) => name.startsWith('.hy-backup-')).sort();
   let names = await backups();
   assert.equal(names.length, 1, '替换提交后保留一份备份');
+  assert.deepEqual(firstValue.retained_backups, [path.join(root, names[0])]);
   const backup = path.join(root, names[0]);
   // 备份含旧内容（含用户的本地修改痕迹——被替换销毁的内容可恢复）。
   assert.match(await readFile(path.join(backup, 'SKILL.md'), 'utf8'), /0\.0\.1/);
@@ -840,11 +844,19 @@ test('M1 备份保留：替换提交后旧内容保留在 .hy-backup-*（含本�
   const status = data(await f.run(['status', '--json']));
   assert.equal(status.installations.length, 1);
   assert.equal(status.installations[0].current, '0.1.0');
-  assert.deepEqual(status.warnings, [`旧版本备份保留在：${backup}（下次安装或更新时自动清理，也可手动删除）`]);
+  assert.deepEqual(status.warnings, [`旧版本备份保留在：${backup}（该目录的下一次安装或更新时自动清理，也可手动删除）`]);
   const human = await f.run(['status']);
   assert.ok(human.stdout.includes(`旧版本备份保留在：${backup}`), human.stdout);
   const english = await f.run(['status', '--lang', 'en']);
   assert.match(english.stdout, /A previous version is backed up at:/);
+  // 人类通道同样列明本次备份（先看 install 的文本输出）。
+  await writeSkill(root, 'ppt-design', '0.0.2');
+  await writeFile(path.join(root, 'ppt-design', 'assets', 'local-edit.txt'), 'again');
+  const humanInstall = await f.run(['install', 'ppt-design', '--to', 'zcode']);
+  assert.equal(humanInstall.code, 0, humanInstall.stdout + humanInstall.stderr);
+  const namesAfterHuman = await backups();
+  assert.equal(namesAfterHuman.length, 1, '人类通道安装后同样只留最近一份');
+  assert.ok(humanInstall.stdout.includes(`旧内容已备份：${path.join(root, namesAfterHuman[0])}`), humanInstall.stdout);
   // 下次安装：新备份生成、旧备份清理，安装根下仍只有一份（保留最近一份）。
   const second = await f.run(['install', 'ppt-design', '--to', 'zcode', '--json']);
   assert.equal(second.code, 0, second.stdout + second.stderr);
@@ -856,6 +868,54 @@ test('M1 备份保留：替换提交后旧内容保留在 .hy-backup-*（含本�
   await assert.rejects(access(path.join(backup, 'SKILL.md')), { code: 'ENOENT' }, '旧备份被清理');
 });
 
+// 三审 LOW-9①：失败批次不动旧备份——回滚后一切如旧，根内既有备份不在清理面。
+test('M1：失败批次不动旧备份（根内预置 .hy-backup-x + rename 注入失败）→ 回滚后旧备份仍在', async (t) => {
+  const f = await fixture(t);
+  const root = path.join(f.home, '.zcode', 'skills');
+  await writeSkill(root, 'oracle-bone', '0.1.0', '.hy-backup-old');
+  const target = await writeSkill(root, 'ppt-design', '0.0.9');
+  const result = await f.run(['update', '--json'], {}, { failRenameAt: 1 });
+  assert.equal(result.code, 1);
+  assert.equal(data(result).error, 'replace');
+  assert.equal(await versionOf(path.join(root, '.hy-backup-old')), '0.1.0', '旧备份不被失败批次清理');
+  assert.equal(await versionOf(target), '0.0.9', '整批回滚');
+  assert.deepEqual(await stageLeftovers(root), []);
+});
+
+// 三审 LOW-8：改名失败/撞名留下的备份仍在暂存目录里——status 连同 .hy-stage-*/old 一起上报，可发现；
+// 根集合含 cwd 项目级根（三审 spec-MINOR）——项目根里的备份同样可发现。
+test('M1：status 可发现暂存目录里的备份残留（.hy-stage-*/old）与项目级根里的备份', async (t) => {
+  const f = await fixture(t);
+  const root = path.join(f.home, '.zcode', 'skills');
+  const residue = path.join(root, '.hy-stage-residue', 'old');
+  await writeSkill(path.join(root, '.hy-stage-residue'), 'ppt-design', '0.0.1', 'old');
+  const projectBackup = path.join(f.cwd, '.zcode', 'skills', '.hy-backup-2000');
+  await writeSkill(path.join(f.cwd, '.zcode', 'skills'), 'ppt-design', '0.0.2', '.hy-backup-2000');
+  const result = await f.run(['status', '--json']);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const warnings = data(result).warnings;
+  assert.ok(warnings.some((warning) => warning.includes(residue)), result.stdout);
+  assert.ok(warnings.some((warning) => warning.includes(projectBackup)), result.stdout);
+  const human = await f.run(['status']);
+  assert.ok(human.stdout.includes(residue) && human.stdout.includes(projectBackup), human.stdout);
+});
+
+// 三审 HIGH-1.3（TOCTOU 闭合）：replaceAll 执行期复检管辖——集合不含动作根时拒绝并回滚。
+test('M2：replaceAll 执行期复检 managedKeys——动作根不在集合内 → occupiedOutside 拒绝且原样回滚', async (t) => {
+  const base = await mkdtemp(path.join(tmpdir(), 'hy-toctou-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const target = await writeSkill(base, 'a-skill', '1.0.0');
+  const incoming = await mkdtemp(path.join(tmpdir(), 'hy-incoming-'));
+  t.after(() => rm(incoming, { recursive: true, force: true }));
+  const source = await writeSkill(incoming, 'a-skill', '2.0.0');
+  const error = await replaceAll([{ name: 'a-skill', path: target, source, previousName: 'a-skill', previousVersion: '1.0.0' }],
+    { names: ['a-skill'], managedKeys: new Set(['some-other-root']) }).catch((error) => error);
+  assert.equal(error.error, 'occupied');
+  assert.match(error.message, /CLI 管理范围之外的目录/);
+  assert.match(await readFile(path.join(target, 'SKILL.md'), 'utf8'), /1\.0\.0/, '回滚后原目录保留');
+  assert.deepEqual(await stageLeftovers(base), []);
+});
+
 test('M1：同根多处备份改名撞名（注入固定 stamp）→ 撞名的那份留在暂存目录并警告，绝不销毁旧内容', async (t) => {
   const base = await mkdtemp(path.join(tmpdir(), 'hy-backup-'));
   t.after(() => rm(base, { recursive: true, force: true }));
@@ -864,12 +924,14 @@ test('M1：同根多处备份改名撞名（注入固定 stamp）→ 撞名的�
   t.after(() => rm(incoming, { recursive: true, force: true }));
   const sourceA = await writeSkill(incoming, 'a-skill', '2.0.0'), sourceB = await writeSkill(incoming, 'b-skill', '2.0.0');
   // 两个动作用同一个备份 stamp：第一份改名成功后，第二份撞名失败——必须走「保留暂存目录」路径。
-  const warnings = await replaceAll([
+  const { warnings, backups } = await replaceAll([
     { name: 'a-skill', path: first, source: sourceA, previousName: 'a-skill', previousVersion: '1.0.0' },
     { name: 'b-skill', path: second, source: sourceB, previousName: 'b-skill', previousVersion: '1.0.0' },
   ], { names: ['a-skill', 'b-skill'], backupStamp: () => 'same' });
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /临时目录清理失败/);
+  // 返回的 backups 只含改名成功的那份（撞名的留在暂存目录，不算已保留）。
+  assert.deepEqual(backups, [path.join(base, '.hy-backup-same')]);
   // 两处新内容照常提交；第一份备份改名成功，第二份完整留在暂存目录（可手动恢复）。
   assert.match(await readFile(path.join(first, 'SKILL.md'), 'utf8'), /2\.0\.0/);
   assert.match(await readFile(path.join(second, 'SKILL.md'), 'utf8'), /2\.0\.0/);
@@ -929,8 +991,11 @@ test('replaceAll 观察位 onStage：事务期间上报暂存目录，供二次�
     { name: 'ppt-skill', path: copy, link: primary, previousName: 'ppt-skill', previousVersion: '0.0.2' },
   ];
   const stages = [];
-  const warnings = await replaceAll(actions, { onStage: (stage) => stages.push(stage), names: ['ppt-skill'] });
+  const { warnings, backups } = await replaceAll(actions, { onStage: (stage) => stages.push(stage), names: ['ppt-skill'] });
   assert.deepEqual(warnings, []);
+  // 两个动作都有旧目录 → 保留两份备份，路径随返回值上报（三审 spec-MINOR）。
+  assert.equal(backups.length, 2);
+  assert.deepEqual(backups.map((backup) => path.dirname(backup)).sort(), [rootA, rootB].sort());
   assert.equal(stages.length, 2, '每个动作上报一个暂存目录');
   for (const stage of stages) assert.ok(path.basename(stage).startsWith('.hy-stage-'), stage);
   // 事务结束后暂存目录全部清理。

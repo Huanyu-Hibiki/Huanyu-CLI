@@ -9,7 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CliError } from './io.js';
-import { inspectSkill, isDevelopmentDirectory, isLinkedInstallation, logicalDirectory } from './skills.js';
+import { inspectSkill, isDevelopmentDirectory, isLinkedInstallation, logicalDirectory, assertManagedTarget, BACKUP_PREFIX } from './skills.js';
 import { validateArchive, checkTree } from './archive.js';
 import { tarInvocation, directoryKey } from './platform.js';
 import { SIZE_LIMIT } from './publish.js';
@@ -89,19 +89,23 @@ const systemLink = (target, directory) => symlink(target, directory, process.pla
 // 旧副本备份保留（任务 6 M1 缓解·方案 C）：商店只存最新版发布物，拿不到旧版归档就无法与本地旧
 // 副本做内容差异比对来识别「本地修改」——改为把「提交即销毁」降级为「提交后可恢复」：事务成功的
 // 动作若挪走过旧目录（替换与清理 remove 都算），备份不随暂存目录一起销毁，改名为安装根下的
-// .hy-backup-<stamp> 保留；下一次事务开工前快照、提交后清除更早的备份（「下次安装自动清过期
-// 备份」，每根只留最近一次事务留下的备份）。回滚失败的备份绝不清理（既有守卫不变）；备份改名
-// 失败同样保留暂存目录并警告——宁可残留不可销毁。stamp 含毫秒时间戳与进程内序号（同一事务在
-// 同一根多次备份不撞名；跨进程同毫秒撞名时 rename 失败走保留路径，同样安全）。
-const BACKUP_PREFIX = '.hy-backup-';
+// .hy-backup-<stamp> 保留（路径随返回值上报，供 install/update 输出）；下一次事务开工前快照、提交
+// 后清除「本批涉及 skill」的过期备份（三审 MEDIUM：清理前 inspectSkill 判备份身份，无关 skill 的
+// 备份与无法识别的备份不动——不跨 skill 连带清理）。回滚失败的备份绝不清理（既有守卫不变）；
+// 备份改名失败同样保留暂存目录并警告——宁可残留不可销毁。stamp 含毫秒时间戳与进程内序号（同一
+// 事务在同根多次备份不撞名；跨进程同毫秒撞名时 rename 失败走保留路径，同样安全）。
+// 已知取舍（三审登记不修）：备份目录的权限/ACL 等同在装目录——rename 继承原目录属性，不做收紧。
+// managedKeys（三审 HIGH-1 TOCTOU 闭合）：protect 链在每次 rename 前复检管辖根，默认 null 不限制
+//——replaceAll 保持可独立测试；CLI 的 install/update 传入与规划期同一集合。
 let backupSequence = 0;
 const defaultBackupStamp = () => `${Date.now()}-${++backupSequence}`;
-export async function replaceAll(actions, { renameFile = rename, linkDirectory = systemLink, signal, names = [], onStage, backupStamp = defaultBackupStamp } = {}) {
+export async function replaceAll(actions, { renameFile = rename, linkDirectory = systemLink, signal, names = [], onStage, backupStamp = defaultBackupStamp, managedKeys = null } = {}) {
   // 在暂存前检查整批目标；在每次 rename 前再检查，防止下载期间变成开发目录。
   const protect = async (action) => {
     const directory = action.path;
     if (action.protectSymlinks && await isLinkedInstallation(directory)) throw new CliError(t('skippedSymbolicLink', { name: action.previousName, path: directory }), 1, 'symbolic_link', { path: directory });
     if (await isDevelopmentDirectory(directory)) throw new CliError(t('developmentProtected', { path: directory }), 1, 'development_directory', { path: directory });
+    if (managedKeys) await assertManagedTarget(directory, managedKeys);
   };
   for (const action of actions) await protect(action);
   const paths = await Promise.all(actions.map(async (action) => directoryKey(await logicalDirectory(action.path))));
@@ -115,8 +119,9 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
   const transactions = [];
   let committed = false;
   const warnings = [];
-  // 过期备份快照（M1）：本批触及的每个安装根里既有的 .hy-backup-*，提交成功后清除（本次事务
-  // 新建的备份不在快照里，不受影响）；失败批次不动旧备份。父目录此刻可能尚未创建（ENOENT 跳过）。
+  const backups = [];
+  // 过期备份快照（M1）：本批触及的每个安装根里既有的 .hy-backup-*，提交成功后按身份清除（本次
+  // 事务新建的备份不在快照里，不受影响）；失败批次不动旧备份。父目录此刻可能尚未创建（ENOENT 跳过）。
   const staleBackups = [];
   for (const parent of [...new Set(actions.map((action) => path.dirname(action.path)))]) {
     let entries;
@@ -160,8 +165,12 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
       }
     }
     committed = true;
-    // 提交成功才清过期备份（M1）：失败批次回滚后一切如旧，旧备份也照旧保留。
+    // 提交成功才清过期备份（M1；三审 MEDIUM 收窄）：只清「本批涉及 skill」的备份——动作名与被
+    // 替换名都在涉及集合里；inspectSkill 判不出身份的备份（无关 skill/无法识别）一律不动，
+    // 防止跨 skill 连带清理。失败批次回滚后一切如旧，旧备份也照旧保留。
+    const involved = [...new Set(actions.flatMap((action) => [action.name, action.previousName].filter(Boolean)))];
     for (const backup of staleBackups) {
+      if (!await inspectSkill(backup, involved)) continue;
       try { await rm(backup, { recursive: true, force: true }); }
       catch { warnings.push(t('cleanupWarning', { path: backup })); }
     }
@@ -188,7 +197,8 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
       // 提交成功的动作把备份改名保留（M1）：销毁变可恢复。改名失败则暂存目录连同备份一起保留
       //（continue 跳过清理）并警告位置——绝不因清理失误丢掉旧内容。
       if (committed && transaction.movedOld) {
-        try { await rename(path.join(transaction.stage, 'old'), path.join(path.dirname(transaction.path), `${BACKUP_PREFIX}${backupStamp()}`)); }
+        const backup = path.join(path.dirname(transaction.path), `${BACKUP_PREFIX}${backupStamp()}`);
+        try { await rename(path.join(transaction.stage, 'old'), backup); backups.push(backup); }
         catch { warnings.push(t('cleanupWarning', { path: path.join(transaction.stage, 'old') })); continue; }
       }
       // 回滚失败的备份绝不能在清理时删除。
@@ -197,5 +207,5 @@ export async function replaceAll(actions, { renameFile = rename, linkDirectory =
       catch { warnings.push(t('cleanupWarning', { path: transaction.stage })); }
     }
   }
-  return warnings;
+  return { warnings, backups };
 }

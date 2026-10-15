@@ -12,8 +12,8 @@ const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 
 // 旧版本备份目录前缀（任务 6 M1 缓解）：replaceAll 提交后把被替换/移除目录的备份改名保留在安装根
 // （.hy-backup-<stamp>）。它们不是安装——扫描与配对清理都必须跳过，否则备份会被当成第二份副本
-// 报多副本、甚至被免费版清理再次移除（销毁刚保留的可恢复内容）。
-const BACKUP_PREFIX = '.hy-backup-';
+// 报多副本、甚至被免费版清理再次移除（销毁刚保留的可恢复内容）。install.js 复用同一常量（三审 LOW-6）。
+export const BACKUP_PREFIX = '.hy-backup-';
 export const isReservedSkillName = (value) => typeof value === 'string' && RESERVED.test(value);
 export const isSkillName = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(value) && !RESERVED.test(value);
 export const isVersion = (value) => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value);
@@ -224,6 +224,17 @@ export async function canonicalRootKeys(roots) {
   return [...new Set(await Promise.all(roots.map(async (root) => directoryKey(await canonicalDirectory(root)))))].sort();
 }
 
+// M2 写穿白名单判定（三审 HIGH-1 抽共享件）：directory（真实目标/动作目录）的父目录必须落在
+// 管辖根键集合内，越界按 occupied + occupiedOutside 拒绝并解释。install 规划期（planActions）、
+// update 动作构建（含 --path 定点汇入处）与 replaceAll 执行期复检（TOCTOU 闭合）共用同一判定。
+// 已知取舍（三审登记不修）：根级符号链接（如 ~/.claude/skills → 共享目录）放行——canonical 解析后
+// 动作父目录就是该根，属 M2 的合法形态（链接根整体委托），不在本判定拦截面内。
+export async function assertManagedTarget(directory, keys, link) {
+  if (!keys.has(directoryKey(await canonicalDirectory(path.dirname(directory))))) {
+    throw new CliError(t('occupiedOutside', { path: directory }), 1, 'occupied', { path: directory, ...(link ? { link } : {}) });
+  }
+}
+
 export async function scan(names, roots = discoveryRoots()) {
   // 同一目录可能经由不同路径（符号链接、大小写变体、8.3 短路径）被扫到两次，按真实路径只保留一份。
   const found = [], seen = new Set();
@@ -246,8 +257,10 @@ export async function scan(names, roots = discoveryRoots()) {
 }
 
 // 安装根里保留的旧版本备份（任务 6 M1 缓解）：replaceAll 提交后把被替换/移除目录的备份改名为
-// .hy-backup-<stamp> 留在安装根；status 据此提示位置与清理方法（下一次安装/更新自动清过期备份）。
-export async function retainedBackups(roots = discoveryRoots()) {
+// .hy-backup-<stamp> 留在安装根；status 据此提示位置与清理方法（该目录的下一次安装或更新自动清
+// 过期备份）。根集合 = 发现根 + cwd 项目级根（三审 spec-MINOR：项目级根里的备份同样可发现）；
+// 改名失败/撞名留下的备份仍在暂存目录里，连同 .hy-stage-*/old 一起上报（三审 LOW-8）。
+export async function retainedBackups(roots = [...discoveryRoots(), ...HOSTS.flatMap((host) => projectRootsOf(host.id))]) {
   const found = [];
   for (const root of [...new Set(roots)]) {
     let entries;
@@ -256,7 +269,14 @@ export async function retainedBackups(roots = discoveryRoots()) {
       if (['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
       throw new CliError(t('scanRead', { path: root }), 1, 'skill_read');
     }
-    for (const entry of entries) if (entry.isDirectory() && entry.name.startsWith(BACKUP_PREFIX)) found.push(path.join(root, entry.name));
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith(BACKUP_PREFIX)) found.push(path.join(root, entry.name));
+      else if (entry.name.startsWith('.hy-stage-')) {
+        try { if ((await lstat(path.join(root, entry.name, 'old'))).isDirectory()) found.push(path.join(root, entry.name, 'old')); }
+        catch (error) { if (!['ENOENT', 'ENOTDIR'].includes(error.code)) throw error; }
+      }
+    }
   }
   return found.sort();
 }

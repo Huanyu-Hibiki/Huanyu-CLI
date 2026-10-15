@@ -1,0 +1,10 @@
+# 发布前检查清单
+
+每次对外发布（首次上架、商店域名定稿、版本发布）前过一遍。
+
+- [ ] **DEFAULT_API 占位替换**：`src/client.js` 一处的 `https://store.huanyu.example` 换成正式商店地址（联调前完成）；同步更新 `docs/skill-convention.md` 的端点模板与 README 的 `HY_API` 说明——测试钉住二者一致，漏改会红。
+- [ ] **`hy` 命令名复验**：在目标平台确认 `hy` 未被 PATH 里的其他程序占用（任务 1 已在本机 Windows 验过；macOS/Linux 发布前再查）。冲突时用户仍可用 `npx github:Huanyu-Hibiki/Huanyu-CLI` 运行。
+- [ ] **六格 CI 矩阵全绿**：windows/macos/ubuntu × Node 18/22；首次 push 后复核 workflow 实跑结果（本地全绿不能替代）。
+- [ ] **打包核对**：`npm pack --dry-run` 确认 tarball 只含 bin/、src/、README.md、README.en.md、LICENSE、package.json；核对 package.json 版本号；打 git tag。
+- [ ] **试点商品集上架**：2-3 个（至少 1 免费 + 1 付费配对预留）；用 `hy publish --repo <Huanyu-Skills 路径> --check` 先对账，再 `--all` 批量发布。
+- [ ] **二期待办过一遍**：`docs/plans/2026-10-15-huanyu-cli-mvp-plan.md` 风险表（副本销毁 / 链接写穿 / UNC 混排 / 悬空链接 / 付费清理——二期重审 protectSymlinks 时一并处理）。

@@ -231,6 +231,9 @@ export const dictionary = {
   auditSummary: ['共 {total} 个 Skill：待发布 {publishable}，一致 {current}。', '{total} skills: {publishable} to publish, {current} up to date.'],
   publishBatchSummary: ['批量发布完成：成功 {published} 个，跳过 {skipped} 个。', 'Batch publish finished: {published} published, {skipped} skipped.'],
   skippedVersionExists: ['跳过 {name} {version}：该版本已发布。', 'Skipped {name} {version}: already published.'],
+  // 仓库对账的无效目录行（试点上架实测）：单个目录的元数据问题（缺版本/不可推导名/frontmatter 名
+  // 不一致）收集进报告标 invalid、不中断全量视图；行内给目录与具体原因。
+  publishInvalid: ['{directory}：无法发布——{reason}', '{directory}: cannot be published — {reason}'],
   // 管理命令族（二期任务 2）
   productUsage: ['product 需要一个 Skill 名和至少一个 --set <字段>=<值>，例如 --set summary=... 或 --set prices.lifetime=6900,cny。', 'product requires a skill name and at least one --set <field>=<value>, for example --set summary=... or --set prices.lifetime=6900,cny.'],
   productFields: ['--set 字段值无效：summary/name 需为非空文本；prices.<方案>=<分>,<币种>（如 prices.lifetime=6900,cny）；free/paid 需为规范名且互异。', '--set has an invalid value: summary/name must be non-empty text; prices.<plan>=<cents>,<currency> (for example prices.lifetime=6900,cny); free/paid must be canonical skill names and differ from each other.'],

@@ -324,7 +324,7 @@ test('audit 对账四分类 + yanked 提示：无需登录，--json 结构化，
   // 商店 latest 已回落到 0.1.0（0.2.0 下架），本地 0.3.0 → 待发布；yanked 提示挂在对应条目上。
   assert.equal(value.skills.find((skill) => skill.skill === 'ppt-design').store_latest, '0.1.0');
   assert.deepEqual(value.skills.find((skill) => skill.skill === 'ppt-design').yanked, ['0.2.0']);
-  assert.deepEqual(value.counts, { total: 4, publishable: 2, current: 1, local_behind: 0, store_only: 1 });
+  assert.deepEqual(value.counts, { total: 4, publishable: 2, current: 1, local_behind: 0, store_only: 1, invalid: 0 });
   // 只读公开接口：audit 全程没有新增 /api/auth/me 请求，未登录可用。
   assert.equal(authRequests(), authBefore);
   // 零令牌保证（L5）：audit 触发的 catalog/versions 请求都不带 Authorization。

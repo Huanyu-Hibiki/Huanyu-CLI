@@ -288,7 +288,7 @@ test('publish --repo --check 对账：商店缺/待发布/本地落后/一致/�
   assert.deepEqual(value.skills.map((s) => [s.skill, s.status]), [
     ['new-skill', 'missing'], ['oracle-bone', 'current'], ['ppt-design', 'behind'], ['ppt-design-pro', 'store_only'],
   ]);
-  assert.deepEqual(value.counts, { total: 4, publishable: 2, current: 1, local_behind: 0, store_only: 1 });
+  assert.deepEqual(value.counts, { total: 4, publishable: 2, current: 1, local_behind: 0, store_only: 1, invalid: 0 });
   assert.equal(publishRequests(f).length, 0);
   const human = await f.run(['publish', '--repo', repo, '--check'], { HY_TOKEN: TOKEN });
   assert.equal(human.code, 0, human.stderr);
@@ -359,6 +359,64 @@ test('publish --repo --all 遇 409 跳过该版本并继续整批；裸 --repo �
   assert.equal(output.error, 'cancelled');
   assert.match(output.message, /操作已取消。/);
   assert.equal(publishRequests(f).length, 2);
+});
+
+// 试点上架彩排实测（--check 一病即断）：元数据无效的目录收集进报告而非中断——对账的价值是
+// 全量就绪视图；--all 与 409 同语义跳过并解释；单目录 publish 保持严格拒绝。
+test('publish --repo 元数据无效目录不中断：--check 全量报告（invalid 含原因），--all 跳过并解释', async (t) => {
+  const f = await fixture(t);
+  const repo = path.join(f.temporary, 'skills-repo');
+  await mkdir(repo);
+  await makeSkill(repo, 'new-skill', { name: 'new-skill', version: '0.2.0' });     // 有效：商店缺
+  await makeSkill(repo, 'oracle-bone', { name: 'oracle-bone', version: '0.1.0' }); // 有效：一致
+  await makeSkill(repo, 'no-version', { name: 'no-version' });                     // 缺 version
+  await makeSkill(repo, '1abc', { version: '0.1.0' });                             // 目录名不可推导规范名
+  await makeSkill(repo, 'Weird_Dir', { name: 'Not Legal', version: '0.1.0' });     // frontmatter 名非法 → name_mismatch
+  const check = data(await f.run(['publish', '--repo', repo, '--check', '--json'], { HY_TOKEN: TOKEN }));
+  assert.equal(check.ok, true);
+  // 五个本地目录 + 两个商店多：有效照常分类，无效标 invalid（skill 为空、directory 指明位置）。
+  assert.deepEqual(check.skills.map((s) => `${s.directory ?? s.skill}:${s.status}`).sort(), [
+    '1abc:invalid', 'Weird_Dir:invalid', 'new-skill:missing', 'no-version:invalid', 'oracle-bone:current', 'ppt-design:store_only', 'ppt-design-pro:store_only',
+  ].sort());
+  const invalid = check.skills.filter((s) => s.status === 'invalid');
+  assert.deepEqual(invalid.map((row) => [row.directory, row.reason]).sort(), [
+    ['1abc', 'invalid_skill_name'], ['Weird_Dir', 'name_mismatch'], ['no-version', 'missing_skill_field'],
+  ].sort());
+  assert.match(invalid.find((row) => row.directory === 'no-version').message, /缺少可用的 name 或 metadata\.version/);
+  assert.match(invalid.find((row) => row.directory === '1abc').message, /无法从目录名 1abc 推导规范名/);
+  assert.match(invalid.find((row) => row.directory === 'Weird_Dir').message, /与规范名 weirddir 不一致/);
+  assert.deepEqual(check.counts, { total: 7, publishable: 1, current: 1, local_behind: 0, store_only: 2, invalid: 3 });
+  assert.equal(publishRequests(f).length, 0);
+  // 人类输出（中英）：无效条目给解释行。
+  const human = await f.run(['publish', '--repo', repo, '--check'], { HY_TOKEN: TOKEN });
+  assert.match(human.stdout, /no-version：无法发布——.*缺少可用的 name 或 metadata\.version/);
+  assert.match(human.stdout, /1abc：无法发布——.*无法从目录名 1abc 推导规范名/);
+  const english = await f.run(['publish', '--repo', repo, '--check', '--lang', 'en'], { HY_TOKEN: TOKEN });
+  assert.match(english.stdout, /no-version: cannot be published — .*missing a usable name or metadata\.version/);
+  assert.match(english.stdout, /1abc: cannot be published — .*Cannot derive a canonical name/);
+
+  // --all：有效目录照常发布，无效目录与 409 同语义跳过并解释，不中断整批。
+  const batch = await f.run(['publish', '--repo', repo, '--all'], { HY_TOKEN: TOKEN });
+  assert.equal(batch.code, 0, batch.stderr);
+  assert.match(batch.stdout, /成功 1 个，跳过 3 个。/, batch.stdout);
+  assert.match(batch.stdout, /no-version：无法发布——/);
+  assert.ok(f.state.published.has('new-skill:0.2.0'));
+  assert.ok(!f.state.published.has('weirddir:0.1.0'));
+  assert.equal(publishRequests(f).length, 1, '只对有效目录发起上传');
+  // 发布后重跑 --all：无可发布，但无效目录仍在 skipped 与解释行里可见（多行 JSON 取末行）。
+  const again = events(await f.run(['publish', '--repo', repo, '--all', '--json'], { HY_TOKEN: TOKEN })).at(-1);
+  assert.deepEqual(again.published, []);
+  assert.deepEqual(again.skipped.map((item) => [item.directory, item.reason]).sort(), [
+    ['1abc', 'invalid_skill_name'], ['Weird_Dir', 'name_mismatch'], ['no-version', 'missing_skill_field'],
+  ].sort());
+
+  // 单目录 publish 保持严格拒绝（exit 1）：缺版本与不可推导名都在上传前失败。
+  for (const [folder, error] of [['no-version', 'missing_skill_field'], ['1abc', 'invalid_skill_name']]) {
+    const single = await f.run(['publish', path.join(repo, folder), '--json'], { HY_TOKEN: TOKEN });
+    assert.equal(single.code, 1);
+    assert.equal(data(single).error, error);
+  }
+  assert.equal(publishRequests(f).length, 1);
 });
 
 test('目录推导规范名冲突：一次性列出全部冲突组', async (t) => {

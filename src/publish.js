@@ -218,10 +218,11 @@ export async function publishSkill(ctx, directory, { notes } = {}) {
   }
 }
 
-// 对账行与汇总：状态顺序 商店缺 → 待发布 → 本地落后 → 一致 → 商店多 → 已下架提示。
+// 对账行与汇总：状态顺序 无效 → 商店缺 → 待发布 → 本地落后 → 一致 → 商店多 → 已下架提示。
 function reportLines(report, counts) {
   const by = (status) => report.filter((item) => item.status === status);
   return [
+    ...by('invalid').map((item) => t('publishInvalid', { directory: item.directory, reason: item.message })),
     ...by('missing').map((item) => t('auditMissing', { name: item.skill, version: item.local_version })),
     ...by('behind').map((item) => t('auditBehind', { name: item.skill, local: item.local_version, latest: item.store_latest })),
     ...by('local_behind').map((item) => t('auditLocalBehind', { name: item.skill, local: item.local_version, latest: item.store_latest })),
@@ -231,6 +232,11 @@ function reportLines(report, counts) {
     t('auditSummary', counts),
   ];
 }
+
+// 仓库模式收集为 invalid 的元数据错误（试点上架实测：--check 一病即断让用户逐个试错）：
+// 单个目录的缺版本/不可推导名/frontmatter 名不一致进报告标 invalid，不再中断全量视图；
+// 跨目录的规范名冲突是仓库结构问题，仍整体拒绝。
+const INVALID_SKILL_ERRORS = new Set(['missing_skill_field', 'invalid_skill_name', 'reserved_name', 'name_mismatch']);
 
 // 仓库扫描 + 规范名冲突检测 + 对账（publish --repo 与 audit 共享，二期任务 2 抽取）：
 // 扫描一级 skill 目录（含指向 Skill 的链接）→ 规范名全集与冲突检测（一次列全，本地错误先于网络请求）
@@ -252,9 +258,19 @@ export async function reconcileRepo(client, repoArgument) {
   if (!found.length) throw new CliError(t('repoEmpty', { path: repo }), 1, 'skill_read');
   const byName = new Map();
   for (const item of found) {
-    if (!item.metadata.version) throw new CliError(t('missingNameOrVersion', { path: path.join(item.directory, 'SKILL.md') }), 1, 'missing_skill_field');
-    item.name = canonicalName(item.base, item.metadata.name);
-    byName.set(item.name, [...(byName.get(item.name) || []), item.base]);
+    try {
+      if (!item.metadata.version) throw new CliError(t('missingNameOrVersion', { path: path.join(item.directory, 'SKILL.md') }), 1, 'missing_skill_field');
+      item.name = canonicalName(item.base, item.metadata.name);
+      // frontmatter 名非法回落目录推导时与包内容必然对不上（单目录路径在 publishSkill 就地拒绝）；
+      // 仓库路径收集为 invalid，--all 才不会在批中途被它打断。
+      if (item.metadata.name !== null && item.metadata.name !== item.name) throw new CliError(t('nameMismatch', { path: path.join(item.directory, 'SKILL.md'), name: item.metadata.name, canonical: item.name }), 1, 'name_mismatch');
+      byName.set(item.name, [...(byName.get(item.name) || []), item.base]);
+    } catch (error) {
+      if (!(error instanceof CliError) || !INVALID_SKILL_ERRORS.has(error.error)) throw error;
+      // canonicalName 可能已写入 item.name（name_mismatch 在其后抛出）：清掉，条目只走 invalid 报告。
+      item.name = undefined;
+      item.invalid = { reason: error.error, message: error.message };
+    }
   }
   const conflicts = [...byName].filter(([, directories]) => directories.length > 1).map(([name, directories]) => ({ name, paths: directories }));
   if (conflicts.length) {
@@ -269,7 +285,11 @@ export async function reconcileRepo(client, repoArgument) {
     return comparison > 0 ? 'behind' : comparison === 0 ? 'current' : 'local_behind';
   };
   const yankedVersions = (name) => (versions[name]?.history ?? []).filter((entry) => entry.yanked).map((entry) => entry.version);
-  const report = found.map((item) => ({ skill: item.name, directory: item.base, local_version: item.metadata.version, store_latest: versions[item.name]?.latest ?? null, status: status(item) }));
+  const report = found.filter((item) => item.name).map((item) => ({ skill: item.name, directory: item.base, local_version: item.metadata.version, store_latest: versions[item.name]?.latest ?? null, status: status(item) }));
+  // 无效目录（元数据收集失败）：带原因进报告——对账给全量就绪视图，不参与五态分类与发布目标。
+  for (const item of found.filter((item) => item.invalid)) {
+    report.push({ skill: null, directory: item.base, local_version: item.metadata.version || null, store_latest: null, status: 'invalid', reason: item.invalid.reason, message: item.invalid.message });
+  }
   for (const name of [...new Set([...catalogNames(catalog), ...Object.keys(versions)])]) {
     if (!report.some((item) => item.skill === name)) report.push({ skill: name, directory: null, local_version: null, store_latest: versions[name]?.latest ?? null, status: 'store_only' });
   }
@@ -281,28 +301,34 @@ export async function reconcileRepo(client, repoArgument) {
   const counts = { total: report.length, publishable: report.filter((item) => ['missing', 'behind'].includes(item.status)).length,
     current: report.filter((item) => item.status === 'current').length,
     local_behind: report.filter((item) => item.status === 'local_behind').length,
-    store_only: report.filter((item) => item.status === 'store_only').length };
+    store_only: report.filter((item) => item.status === 'store_only').length,
+    invalid: report.filter((item) => item.status === 'invalid').length };
   return { repo, found, report, counts, lines: reportLines(report, counts) };
 }
 
-// 仓库模式：对账（reconcileRepo 共享件）→ --check 只报告；否则确认后批量发布“商店缺或待发布”，409 自动跳过。
+// 仓库模式：对账（reconcileRepo 共享件）→ --check 只报告；否则确认后批量发布“商店缺或待发布”，
+// 409 与元数据无效的目录都按“跳过并解释”处理（试点上架实测：全量视图优先于一病即断）。
 export async function publishRepo(ctx, repoArgument, { all, check, notes } = {}) {
   const { repo, found, report, counts, lines } = await reconcileRepo(ctx.client, repoArgument);
   if (check) {
     ctx.output.write({ repo, mode: 'check', skills: report, counts }, lines);
     return 0;
   }
+  // 无效目录与 409 同语义：不发布，进 skipped 与解释行（原因消息在报告里，这里只留原因码）。
+  const invalid = found.filter((item) => item.invalid);
+  const skipped = invalid.map((item) => ({ directory: item.base, reason: item.invalid.reason }));
+  const invalidLines = invalid.map((item) => t('publishInvalid', { directory: item.base, reason: item.invalid.message }));
   // 非交互且未显式 --yes 时批量发布会自动确认：输出提示行保持可见性。
   const auto = counts.publishable > 0 && !ctx.options.yes && !ctx.interactive;
   ctx.output.write({ repo, mode: all ? 'all' : 'repo', skills: report, counts, ...(auto ? { auto_confirmed: true } : {}) },
     [...lines, ...(auto ? [t('autoConfirmed')] : [])]);
   if (!counts.publishable) {
-    ctx.output.write({ published: [], skipped: [] }, [t('nothingToPublish')]);
+    ctx.output.write({ published: [], skipped }, [t('nothingToPublish'), ...invalidLines]);
     return 0;
   }
   if (!await ctx.confirm(t('publishConfirm', { count: counts.publishable }), ctx.options.yes, ctx.interactive, ctx.signal)) throw new CliError(t('canceled'), 1, 'cancelled');
-  const targets = found.filter((item) => ['missing', 'behind'].includes(report.find((entry) => entry.skill === item.name).status));
-  const published = [], skipped = [];
+  const targets = found.filter((item) => item.name && ['missing', 'behind'].includes(report.find((entry) => entry.skill === item.name).status));
+  const published = [];
   for (const item of targets) {
     try {
       const result = await publishSkill(ctx, item.directory, { notes });
@@ -317,6 +343,7 @@ export async function publishRepo(ctx, repoArgument, { all, check, notes } = {})
     }
   }
   ctx.output.write({ published, skipped }, [t('publishBatchSummary', { published: published.length, skipped: skipped.length }),
-    ...skipped.map((item) => t('skippedVersionExists', { name: item.skill, version: item.version }))]);
+    ...skipped.flatMap((item) => item.reason === 'version_exists' ? [t('skippedVersionExists', { name: item.skill, version: item.version })] : []),
+    ...invalidLines]);
   return 0;
 }
